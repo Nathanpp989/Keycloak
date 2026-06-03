@@ -276,3 +276,22 @@ def read_secure_data(current_user: TokenData = Depends(get_current_user)):
 
     # Use _auth0_token here to call downstream Auth0-protected APIs
     return {"message": "This is secure data", "user": current_user.username}
+
+# More endpoints that use verify_auth0_token can be added here as needed. Also add integration from auth0 to the main code
+def get_auth0_user_info(token: str) -> dict:
+    """Example function to get user info from Auth0 using the access token."""
+    domain = os.getenv("AUTH0_DOMAIN", "your-auth0-domain")
+    try:
+        response = requests.get(
+            f"https://{domain}/userinfo",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as exc:
+        logger.error("Failed to fetch Auth0 user info: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Auth0 service unavailable",
+        )
