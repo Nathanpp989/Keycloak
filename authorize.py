@@ -4,7 +4,9 @@
 
 import logging
 import os
+from random import random
 import threading
+from time import time
 # C1 FIX: removed unused `from functools import lru_cache`
 
 import requests
@@ -68,6 +70,11 @@ def verify_token(token: str) -> TokenData:
 
 def get_current_user(token: str = Depends(oauth2_scheme)) -> TokenData:
     return verify_token(token)
+
+def get_current_active_user(current_user: TokenData = Depends(get_current_user)) -> TokenData:
+    # Placeholder for additional checks (e.g., is_active flag in DB)
+    return current_user
+
 
 # ──────────────────────────────────────────────
 # Azure Key Vault — thread-safe singleton
@@ -314,6 +321,84 @@ def get_auth0_user_info_with_kv() -> dict:
         raise
     except Exception as exc:
         logger.error("Unexpected error in get_auth0_user_info_with_kv: %s", exc)
+        raise HTTPException(status_code=503, detail="Could not reach Auth0")
+    
+# Have the auth0 access the keyvault and then allow the secrets to be retrieved sucessfully and then use those secrets to call the get_auth0_user_info function to get the user info from auth0. This way we can ensure that the secrets are being retrieved successfully from the key vault and then used to call the auth0 API to get the user info.
+def get_auth0_user_info_securely() -> dict:
+    """Securely get Auth0 user info using secrets from Key Vault."""
+    try:
+        return get_auth0_user_info_with_kv()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Unexpected error in get_auth0_user_info_securely: %s", exc)
+        raise HTTPException(status_code=503, detail="Could not reach Auth0")
+def get_auth0_user_info_securely_with_retry(retries: int = 3) -> dict:
+    """Get Auth0 user info with retry logic for transient failures."""
+    for attempt in range(1, retries + 1):
+        try:
+            return get_auth0_user_info_securely()
+        except HTTPException as exc:
+            logger.warning("Attempt %d/%d failed: %s", attempt, retries, exc.detail)
+            if attempt == retries:
+                raise
+        except Exception as exc:
+            logger.error("Unexpected error on attempt %d/%d: %s", attempt, retries, exc)
+            if attempt == retries:
+                raise HTTPException(status_code=503, detail="Could not reach Auth0 after multiple attempts")
+def get_auth0_user_info_securely_with_exponential_backoff(retries: int = 3, backoff_factor: float = 0.5) -> dict:
+    """Get Auth0 user info with exponential backoff for transient failures."""
+    for attempt in range(1, retries + 1):
+        try:
+            return get_auth0_user_info_securely()
+        except HTTPException as exc:
+            logger.warning("Attempt %d/%d failed: %s", attempt, retries, exc.detail)
+            if attempt == retries:
+                raise
+            sleep_time = backoff_factor * (2 ** (attempt - 1))
+            logger.info("Sleeping for %.2f seconds before retrying...", sleep_time)
+            time.sleep(sleep_time)
+        except Exception as exc:
+            logger.error("Unexpected error on attempt %d/%d: %s", attempt, retries, exc)
+            if attempt == retries:
+                raise HTTPException(status_code=503, detail="Could not reach Auth0 after multiple attempts")
+def get_auth0_user_info_securely_with_jitter(retries: int = 3, backoff_factor: float = 0.5, jitter: float = 0.1) -> dict:
+    """Get Auth0 user info with exponential backoff and jitter for transient failures."""
+    for attempt in range(1, retries + 1):
+        try:
+            return get_auth0_user_info_securely()
+        except HTTPException as exc:
+            logger.warning("Attempt %d/%d failed: %s", attempt, retries, exc.detail)
+            if attempt == retries:
+                raise
+            sleep_time = backoff_factor * (2 ** (attempt - 1)) + random.uniform(0, jitter)
+            logger.info("Sleeping for %.2f seconds before retrying...", sleep_time)
+            time.sleep(sleep_time)
+        except Exception as exc:
+            logger.error("Unexpected error on attempt %d/%d: %s", attempt, retries, exc)
+            if attempt == retries:
+                raise HTTPException(status_code=503, detail="Could not reach Auth0 after multiple attempts")
+
+# Have the auth0 integrate into other things such as the main code and then use the get_auth0_user_info_securely_with_jitter function to get the user info from auth0 in a secure way with retry logic and exponential backoff with jitter to handle transient failures when calling the auth0 API to get the user info. This way we can ensure that we are getting the user info from auth0 in a secure way and also handling any transient failures that may occur when calling the auth0 API to get the user info.
+def get_auth0_user_info_securely_with_jitter_integration() -> dict:
+    """Example integration of secure Auth0 user info retrieval in main code."""
+    try:
+        return get_auth0_user_info_securely_with_jitter()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Unexpected error in get_auth0_user_info_securely_with_jitter_integration: %s", exc)
+        raise HTTPException(status_code=503, detail="Could not reach Auth0")
+    
+def get_auth0_user_info_securely_with_jitter_integration_endpoint(current_user: TokenData = Depends(get_current_user)) -> dict:
+    """Example FastAPI endpoint that securely retrieves Auth0 user info."""
+    try:
+        user_info = get_auth0_user_info_securely_with_jitter()
+        return {"user_info": user_info, "requested_by": current_user.username}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Unexpected error in get_auth0_user_info_securely_with_jitter_integration_endpoint: %s", exc)
         raise HTTPException(status_code=503, detail="Could not reach Auth0")
 
 # Make sure it works with the server
