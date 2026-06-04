@@ -295,3 +295,14 @@ def get_auth0_user_info(token: str) -> dict:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Auth0 service unavailable",
         )
+# get the secret keys and the audience from the key vault and use them to call the get_auth0_user_info function in the main code where you need to get the user info from auth0.
+def get_auth0_user_info_with_kv() -> dict:
+    """Fetch Auth0 M2M token and use it to get user info from Auth0."""
+    try:
+        token = get_auth0_token()
+        return get_auth0_user_info(token)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Unexpected error in get_auth0_user_info_with_kv: %s", exc)
+        raise HTTPException(status_code=503, detail="Could not reach Auth0")
