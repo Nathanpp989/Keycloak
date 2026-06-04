@@ -92,12 +92,18 @@ def test_hierarchy_endpoint():
 # More tests involving keyvault, auth0 and other functionalities can be added here as needed.
 def test_keyvault_integration():
     # This test would require mocking the Azure Key Vault client and its responses
+    response = client.get("/keyvault")
+    assert response.status_code == 200
     pass
 
 def test_auth0_integration():
     # This test would require mocking the requests.post call to the Auth0 token endpoint
+    response = client.post("/auth0-token", data={"username": "user", "password": "password"})
+    assert response.status_code == 200
     pass
 
 def test_auth0_integration_failure():
+    response = client.post("/auth0-token", data={"username": "user", "password": "wrong"})
+    assert response.status_code == 400
     # This test would require mocking the requests.post call to simulate an Auth0 authentication failure
     pass
