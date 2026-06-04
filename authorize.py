@@ -315,3 +315,8 @@ def get_auth0_user_info_with_kv() -> dict:
     except Exception as exc:
         logger.error("Unexpected error in get_auth0_user_info_with_kv: %s", exc)
         raise HTTPException(status_code=503, detail="Could not reach Auth0")
+
+# Make sure it works with the server
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("authorize:router", host="127.0.1", port=8000, log_level="info")
