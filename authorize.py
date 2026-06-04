@@ -100,6 +100,15 @@ def get_secret(secret_name: str) -> str:
         )
     return value
 
+# Make sure that the secrets we need are present at startup — fail fast if not
+try:
+    get_secret("AUTH0_CLIENT_ID")
+    get_secret("AUTH0_CLIENT_SECRET")
+    get_secret("AUTH0_AUDIENCE")
+except HTTPException as exc:
+    logger.critical("Startup failed due to missing Key Vault secrets: %s", exc.detail)
+    raise SystemExit(1)
+
 # ──────────────────────────────────────────────
 # Auth0 — M2M token acquisition
 # C5 FIX: response.json() guarded against non-JSON bodies
