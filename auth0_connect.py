@@ -6,6 +6,7 @@
 import logging
 import os
 import ipaddress
+import stat
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -208,7 +209,6 @@ def create_server_certificate(
         f.write(cert.public_bytes(serialization.Encoding.PEM))
 
     # F11 FIX: private key file written with 600 permissions (owner-only)
-    import stat
     key_bytes = private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.TraditionalOpenSSL,
@@ -366,6 +366,33 @@ if __name__ == "__main__":
         oidc_client_id=oidc_client_id,
         oidc_client_secret=oidc_client_secret,
     )
+
+    # now create the authorization flows to ensure that it uses signed certificates, has traffix setup to the ux using flask/TLS and connects the code to https://manage.auth0.com/dashboard/us/dev-5cgeft7q4xtq80h1/applications/d2m41aMOL1uEH0FWrqTVAY85Nvpxer3K/settings
+    default_callback = os.environ.get("AUTH0_CALLBACK_URL", "http://localhost:8080/callback")
+    default_client = auth0.get_client_by_name("keycloak-oidc-client")
+    if default_client:
+        logger.info("Default client '%s' found with client_id: %s", default_client.get("name"), default_client.get("client_id"))
+    else:
+        logger.warning("Default client 'keycloak-oidc-client' not found. Ensure it was created successfully.")
+    default_client_id = default_client.get("client_id") if default_client else "unknown"
+    logger.info("Ensure the Keycloak IdP is configured with client_id: %s and callback: %s", default_client_id, default_callback)
+    default_client_secret = default_client.get("client_secret") if default_client else "unknown"
+    logger.info("Ensure the Keycloak IdP is configured with client_secret: %s", default_client_secret)
+    default_client_callbacks = default_client.get("callbacks") if default_client else []
+    logger.info("Ensure the Keycloak IdP client has callbacks: %s", default_clientbacks)
+
+    ux_url = os.environ.get("UX_URL", "http://localhost:8080")
+    logger.info("Ensure the Keycloak IdP is configured with redirect URI: %s",
+                ux_url + "/realms/Premkey/broker/auth0/endpoint")
+    
+    flask_cert_path = os.environ.get("FLASK_CERT_PATH", "server.crt")
+    flask_key_path = os.environ.get("FLASK_KEY_PATH", "server.key")
+    logger.info("Ensure Flask is configured to use TLS with cert: %s and key: %s", flask_cert_path, flask_key_path)
+
+    tls_url = os.environ.get("TLS_URL", f"https://{domain}")
+    logger.info("Ensure Auth0 is configured to use TLS with URL: %s", tls_url)
+    logger.info("Ensure the Auth0 client has the correct callback URL: %s", default_callback)
+    
 
     # Print the login URL to begin the Authorization Code flow
     login_url = test_login_flow(auth0)
