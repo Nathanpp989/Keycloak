@@ -1,4 +1,3 @@
-# Improved version of main.py with better error handling, secure key management, and clearer structure. Keycloak setup is now more robust, and RSA keys are generated securely with proper permissions. The code also includes detailed logging for easier debugging and maintenance.
 import logging
 import os
 import stat
@@ -11,8 +10,6 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
 from fastapi import FastAPI, Depends, HTTPException, Form
 from fastapi.security import HTTPBearer
-# C2 FIX: removed unused `from jose import JWTError` — no JWT decoding in main.py
-# oauth2_scheme imported from authorize.py (single definition)
 from authorize import router as auth0_router, oauth2_scheme
 from keycloak import KeycloakOpenID, KeycloakAdmin
 from keycloak.exceptions import KeycloakAuthenticationError
@@ -48,10 +45,13 @@ def init_rsa_keys():
     private_key_path = os.path.join(KEY_DIR, "private.pem")
     public_key_path  = os.path.join(KEY_DIR, "public.pem")
 
-    if os.path.exists(private_key_path) and os.path.exists(public_key_path):
+    # E4 FIX: open directly instead of exists()-then-open (eliminates TOCTOU race)
+    try:
         with open(public_key_path, "rb") as f:
             public_pem = f.read()
-    else:
+        with open(private_key_path, "rb"):
+            pass   # confirm private key is also readable; don't load it into memory
+    except FileNotFoundError:
         _priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         private_bytes = _priv.private_bytes(
             encoding=serialization.Encoding.PEM,
@@ -117,9 +117,14 @@ def setup_keycloak():
 
 # ──────────────────────────────────────────────
 # Lifespan
+# E5 FIX: keycloak_oidc constructed inside lifespan so KEYCLOAK_CLIENT_SECRET
+# is read after the environment is fully populated (Docker/K8s late-inject safe)
 # ──────────────────────────────────────────────
+keycloak_oidc: KeycloakOpenID | None = None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global keycloak_oidc
     try:
         init_rsa_keys()
     except Exception as exc:
@@ -130,17 +135,18 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.error("Keycloak setup failed — check KEYCLOAK_URL and credentials: %s", exc)
         raise
+
+    # E5 FIX: construct after environment is fully available
+    keycloak_oidc = KeycloakOpenID(
+        server_url=os.environ.get("KEYCLOAK_URL", "http://localhost:8080/"),
+        client_id="Hello-World-app",
+        realm_name="Premkey",
+        client_secret_key=os.environ.get("KEYCLOAK_CLIENT_SECRET", "your-client-secret")
+    )
     yield
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(auth0_router)
-
-keycloak_oidc = KeycloakOpenID(
-    server_url=os.environ.get("KEYCLOAK_URL", "http://localhost:8080/"),
-    client_id="Hello-World-app",
-    realm_name="Premkey",
-    client_secret_key=os.environ.get("KEYCLOAK_CLIENT_SECRET", "your-client-secret")
-)
 
 http_bearer     = HTTPBearer()
 password_hasher = PasswordHasher(time_cost=2, memory_cost=102400, parallelism=8,
@@ -160,6 +166,8 @@ def read_hello(email: str, username: str):
 
 @app.post("/token")
 def login(username: str = Form(...), password: str = Form(...)):
+    if keycloak_oidc is None:
+        raise HTTPException(status_code=503, detail="Authentication service unavailable")
     try:
         token_response = keycloak_oidc.token(username, password)
         return {"access_token": token_response["access_token"], "token_type": "bearer"}
@@ -170,6 +178,8 @@ def login(username: str = Form(...), password: str = Form(...)):
 
 @app.get("/protected")
 def protected_route(credentials=Depends(http_bearer)):
+    if keycloak_oidc is None:
+        raise HTTPException(status_code=503, detail="Authentication service unavailable")
     try:
         token_info = keycloak_oidc.introspect(credentials.credentials)
     except Exception:
@@ -180,6 +190,8 @@ def protected_route(credentials=Depends(http_bearer)):
 
 @app.post("/oidc-token")
 def oidc_login(token: str = Depends(oauth2_scheme)):
+    if keycloak_oidc is None:
+        raise HTTPException(status_code=503, detail="Authentication service unavailable")
     try:
         token_info = keycloak_oidc.introspect(token)
         if not token_info.get("active"):
