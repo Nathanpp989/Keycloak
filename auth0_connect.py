@@ -379,7 +379,7 @@ if __name__ == "__main__":
     default_client_secret = default_client.get("client_secret") if default_client else "unknown"
     logger.info("Ensure the Keycloak IdP is configured with client_secret: %s", default_client_secret)
     default_client_callbacks = default_client.get("callbacks") if default_client else []
-    logger.info("Ensure the Keycloak IdP client has callbacks: %s", default_clientbacks)
+    logger.info("Ensure the Keycloak IdP client has callbacks: %s", default_client_callbacks)
 
     ux_url = os.environ.get("UX_URL", "http://localhost:8080")
     logger.info("Ensure the Keycloak IdP is configured with redirect URI: %s",
