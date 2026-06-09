@@ -3,17 +3,86 @@
 # inside Keycloak, and sets up social connections (Google, Facebook, etc.) in Auth0.
 # Integrates with main.py and authorize.py.
 
+from __future__ import annotations
+
 import logging
 import os
 import ipaddress
 import stat
 from datetime import datetime, timezone, timedelta
 
-import requests
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import NameOID
+try:
+    import requests
+except Exception:  # pragma: no cover - fallback when requests not installed
+    # Minimal requests-compatible fallback using urllib for environments
+    # where 'requests' is not available. Provides only the methods used
+    # in this module (get/post) with status_code, text and json().
+    import json as _json
+    from urllib import request as _urlreq, parse as _parse, error as _error
+
+    class _Response:
+        def __init__(self, status, body, headers=None):
+            self.status_code = status
+            self.text = body
+            self._body = body
+            self.headers = headers or {}
+
+        def json(self):
+            return _json.loads(self._body) if self._body else {}
+
+    class _RequestsFallback:
+        @staticmethod
+        def _build_request(method, url, **kwargs):
+            data = kwargs.get('data')
+            json_body = kwargs.get('json')
+            headers = kwargs.get('headers', {})
+            if json_body is not None:
+                body = _json.dumps(json_body).encode('utf-8')
+                headers.setdefault('Content-Type', 'application/json')
+            elif data is not None:
+                if isinstance(data, dict):
+                    body = _parse.urlencode(data).encode('utf-8')
+                    headers.setdefault('Content-Type', 'application/x-www-form-urlencoded')
+                else:
+                    body = data if isinstance(data, (bytes, bytearray)) else str(data).encode('utf-8')
+            else:
+                body = None
+
+            req = _urlreq.Request(url, data=body, headers=headers, method=method)
+            return req
+
+        @staticmethod
+        def get(url, **kwargs):
+            req = _RequestsFallback._build_request('GET', url, **kwargs)
+            try:
+                with _urlreq.urlopen(req, timeout=kwargs.get('timeout')) as resp:
+                    body = resp.read().decode('utf-8')
+                    return _Response(resp.getcode(), body, dict(resp.getheaders()))
+            except _error.HTTPError as e:
+                body = e.read().decode('utf-8') if hasattr(e, 'read') else ''
+                return _Response(e.code if hasattr(e, 'code') else 500, body)
+
+        @staticmethod
+        def post(url, **kwargs):
+            req = _RequestsFallback._build_request('POST', url, **kwargs)
+            try:
+                with _urlreq.urlopen(req, timeout=kwargs.get('timeout')) as resp:
+                    body = resp.read().decode('utf-8')
+                    return _Response(resp.getcode(), body, dict(resp.getheaders()))
+            except _error.HTTPError as e:
+                body = e.read().decode('utf-8') if hasattr(e, 'read') else ''
+                return _Response(e.code if hasattr(e, 'code') else 500, body)
+
+    requests = _RequestsFallback()
+
+try:
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+except ImportError:  # pragma: no cover
+    # cryptography is required for certificate operations
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -367,32 +436,12 @@ if __name__ == "__main__":
         oidc_client_secret=oidc_client_secret,
     )
 
-    # now create the authorization flows to ensure that it uses signed certificates, has traffix setup to the ux using flask/TLS and connects the code to https://manage.auth0.com/dashboard/us/dev-5cgeft7q4xtq80h1/applications/d2m41aMOL1uEH0FWrqTVAY85Nvpxer3K/settings
-    default_callback = os.environ.get("AUTH0_CALLBACK_URL", "http://localhost:8080/callback")
+    # Verify the client was created and log details
     default_client = auth0.get_client_by_name("keycloak-oidc-client")
     if default_client:
-        logger.info("Default client '%s' found with client_id: %s", default_client.get("name"), default_client.get("client_id"))
+        logger.info("Keycloak OIDC client found: %s", default_client.get("client_id"))
     else:
-        logger.warning("Default client 'keycloak-oidc-client' not found. Ensure it was created successfully.")
-    default_client_id = default_client.get("client_id") if default_client else "unknown"
-    logger.info("Ensure the Keycloak IdP is configured with client_id: %s and callback: %s", default_client_id, default_callback)
-    default_client_secret = default_client.get("client_secret") if default_client else "unknown"
-    logger.info("Ensure the Keycloak IdP is configured with client_secret: %s", default_client_secret)
-    default_client_callbacks = default_client.get("callbacks") if default_client else []
-    logger.info("Ensure the Keycloak IdP client has callbacks: %s", default_client_callbacks)
-
-    ux_url = os.environ.get("UX_URL", "http://localhost:8080")
-    logger.info("Ensure the Keycloak IdP is configured with redirect URI: %s",
-                ux_url + "/realms/Premkey/broker/auth0/endpoint")
-    
-    flask_cert_path = os.environ.get("FLASK_CERT_PATH", "server.crt")
-    flask_key_path = os.environ.get("FLASK_KEY_PATH", "server.key")
-    logger.info("Ensure Flask is configured to use TLS with cert: %s and key: %s", flask_cert_path, flask_key_path)
-
-    tls_url = os.environ.get("TLS_URL", f"https://{domain}")
-    logger.info("Ensure Auth0 is configured to use TLS with URL: %s", tls_url)
-    logger.info("Ensure the Auth0 client has the correct callback URL: %s", default_callback)
-    
+        logger.warning("Keycloak OIDC client 'keycloak-oidc-client' not found.")
 
     # Print the login URL to begin the Authorization Code flow
     login_url = test_login_flow(auth0)
