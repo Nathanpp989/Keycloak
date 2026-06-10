@@ -355,9 +355,15 @@ if __name__ == "__main__":
         format="%(asctime)s %(levelname)s %(name)s — %(message)s",
     )
 
-    domain        = os.environ["AUTH0_DOMAIN"]
-    client_id     = os.environ["AUTH0_CLIENT_ID"]
-    client_secret = os.environ["AUTH0_CLIENT_SECRET"]
+    domain        = os.environ.get("AUTH0_DOMAIN")
+    client_id     = os.environ.get("AUTH0_CLIENT_ID")
+    client_secret = os.environ.get("AUTH0_CLIENT_SECRET")
+    
+    if not all([domain, client_id, client_secret]):
+        raise RuntimeError(
+            "Missing required environment variables. Please set: "
+            "AUTH0_DOMAIN, AUTH0_CLIENT_ID, AUTH0_CLIENT_SECRET"
+        )
 
     auth0 = Auth0Connect(domain, client_id, client_secret)
     test_token_access(auth0)
