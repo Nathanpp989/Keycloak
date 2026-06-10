@@ -220,7 +220,8 @@ def test_token_access(auth0: Auth0Connect) -> None:
         )
         response.raise_for_status()
         clients = response.json()
-        logger.info("API response: %d clients returned", len(clients) if isinstance(clients, list) else 1)
+        client_count = len(clients) if isinstance(clients, list) else 1
+        logger.info("API response: %d clients returned", client_count)
     except requests.RequestException as exc:
         raise RuntimeError(f"test_token_access failed: {exc}") from exc
 
@@ -355,10 +356,9 @@ if __name__ == "__main__":
         format="%(asctime)s %(levelname)s %(name)s — %(message)s",
     )
 
-    domain        = os.environ.get("AUTH0_DOMAIN")
-    client_id     = os.environ.get("AUTH0_CLIENT_ID")
+    domain = os.environ.get("AUTH0_DOMAIN")
+    client_id = os.environ.get("AUTH0_CLIENT_ID")
     client_secret = os.environ.get("AUTH0_CLIENT_SECRET")
-    
     if not all([domain, client_id, client_secret]):
         raise RuntimeError(
             "Missing required environment variables. Please set: "
