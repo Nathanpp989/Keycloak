@@ -13,8 +13,8 @@ import stat
 from datetime import datetime, timezone, timedelta
 
 # Load .env file before reading any os.environ values
-from dotenv import load_dotenv
-load_dotenv()
+# from dotenv import load_dotenv
+# load_dotenv()
 
 # ──────────────────────────────────────────────
 # requests — use the real library; fall back to urllib only when unavailable.
