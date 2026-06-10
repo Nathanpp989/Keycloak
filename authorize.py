@@ -273,14 +273,36 @@ def read_secure_data(current_user: TokenData = Depends(get_current_user)):
     """
     Requires a valid Keycloak/local token. Obtains an Auth0 M2M token
     server-side only — never returned to the client.
+    Fetches additional user data from Auth0 API.
     """
     try:
-        _auth0_token = get_auth0_token()
+        auth0_token = get_auth0_token()
     except HTTPException:
         raise
     except Exception as exc:
         logger.error("Unexpected error obtaining Auth0 token: %s", exc)
         raise HTTPException(status_code=503, detail="Could not reach Auth0")
 
-    # Use _auth0_token here to call downstream Auth0-protected APIs
-    return {"message": "This is secure data", "user": current_user.username}
+    # Use auth0_token to call downstream Auth0-protected APIs
+    domain = os.getenv("AUTH0_DOMAIN", "your-auth0-domain")
+    headers = {"Authorization": f"Bearer {auth0_token}"}
+    
+    try:
+        # Example: fetch user metadata from Auth0
+        response = requests.get(
+            f"https://{domain}/api/v2/users/{current_user.username}",
+            headers=headers,
+            timeout=10
+        )
+        response.raise_for_status()
+        auth0_user_data = response.json()
+    except requests.RequestException:
+        # If Auth0 call fails, still return local data
+        logger.warning("Could not fetch Auth0 user data for %s", current_user.username)
+        auth0_user_data = {}
+    
+    return {
+        "message": "This is secure data",
+        "user": current_user.username,
+        "auth0_data": auth0_user_data.get("user_metadata", {})
+    }
