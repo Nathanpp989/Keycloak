@@ -13,7 +13,7 @@ import stat
 from datetime import datetime, timezone, timedelta
 
 # Load .env file before reading any os.environ values
-from dotenv import load_dotenv
+from dotenv import load_dotenv  # from python-dotenv package
 load_dotenv()
 
 # ──────────────────────────────────────────────
