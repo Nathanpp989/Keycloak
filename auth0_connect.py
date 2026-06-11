@@ -1,114 +1,30 @@
 # auth0_connect.py
-# Makes Auth0 talk to Keycloak by registering Auth0 as an OIDC Identity Provider
-# inside Keycloak, and sets up social connections (Google, Facebook, etc.) in Auth0.
+# Registers Auth0 as an OIDC Identity Provider inside Keycloak and sets up
+# social connections (Google, Facebook, etc.) in Auth0.
 # Integrates with main.py and authorize.py.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
-import ipaddress
 import stat
 from datetime import datetime, timezone, timedelta
-from urllib.parse import quote  # I5 FIX: for percent-encoding redirect_uri in URLs
+from urllib.parse import quote
 
+import requests
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
+
+# Optional: load a .env file from the current working directory if python-dotenv
+# is installed. If not installed, environment variables must be set manually.
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # dotenv optional; set env vars manually if not installed
-
-try:
-    import requests
-except ImportError:
-    import json as _json
-    from urllib import request as _urlreq, error as _error
-
-    class _RequestsException(Exception):
-        """Stand-in for requests.RequestException in the urllib fallback."""
-        pass
-
-    class _Response:
-        def __init__(self, status: int, body: str, headers: dict | None = None):
-            self.status_code = status
-            self.text = body
-            self.headers = headers or {}
-
-        @property
-        def ok(self) -> bool:
-            return 200 <= self.status_code < 300
-
-        def raise_for_status(self) -> None:
-            if not self.ok:
-                raise _RequestsException(f"HTTP {self.status_code}: {self.text}")
-
-        def json(self) -> dict:
-            try:
-                return _json.loads(self.text) if self.text else {}
-            except ValueError as exc:
-                raise ValueError("Response body is not valid JSON") from exc
-
-    class _RequestsFallback:
-        RequestException = _RequestsException
-
-        @staticmethod
-        def _send(method: str, url: str, **kwargs) -> _Response:
-            import json as _j
-            # I1 FIX: copy headers explicitly so the caller's dict is never mutated
-            headers: dict = {**(kwargs.get("headers") or {})}
-            json_body = kwargs.get("json")
-            data = kwargs.get("data")
-
-            if json_body is not None:
-                body = _j.dumps(json_body).encode()
-                headers.setdefault("Content-Type", "application/json")
-            elif data is not None:
-                from urllib import parse as _p
-                body = (
-                    _p.urlencode(data).encode()
-                    if isinstance(data, dict)
-                    else str(data).encode()
-                )
-                headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
-            else:
-                body = None
-
-            req = _urlreq.Request(url, data=body, headers=headers, method=method.upper())
-            try:
-                with _urlreq.urlopen(req, timeout=kwargs.get("timeout")) as resp:
-                    return _Response(
-                        resp.getcode(),
-                        resp.read().decode(),
-                        dict(resp.getheaders()),
-                    )
-            except _error.HTTPError as exc:
-                body_text = exc.read().decode() if hasattr(exc, "read") else ""
-                return _Response(getattr(exc, "code", 500), body_text)
-            except _error.URLError as exc:
-                raise _RequestsException(str(exc)) from exc
-
-        @classmethod
-        def get(cls, url: str, **kwargs) -> _Response:
-            return cls._send("GET", url, **kwargs)
-
-        @classmethod
-        def post(cls, url: str, **kwargs) -> _Response:
-            return cls._send("POST", url, **kwargs)
-
-        @classmethod
-        def request(cls, method: str, url: str, **kwargs) -> _Response:
-            return cls._send(method, url, **kwargs)
-
-    requests = _RequestsFallback()
-
-try:
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    from cryptography.x509.oid import NameOID
-    _CRYPTO_AVAILABLE = True
-except ImportError:
-    _CRYPTO_AVAILABLE = False
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +35,7 @@ class Auth0Connect:
         self.client_id = client_id
         self.client_secret = client_secret
         self._token: str | None = None
-        self._token_expiry: datetime = datetime.min.replace(tzinfo=timezone.utc)
+        self._token_expiry = datetime.min.replace(tzinfo=timezone.utc)
 
     @property
     def token(self) -> str:
@@ -129,7 +45,6 @@ class Auth0Connect:
         return self._token
 
     def _fetch_token(self) -> tuple[str, datetime]:
-        """Fetch a fresh M2M token from Auth0."""
         url = f"https://{self.domain}/oauth/token"
         payload = {
             "client_id":     self.client_id,
@@ -180,30 +95,48 @@ class Auth0Connect:
         except ValueError:
             return {}
 
+    def get_connection_by_name(self, name: str) -> dict | None:
+        """Retrieve an existing Auth0 connection by name (requires read:connections)."""
+        result = self._api("GET", "connections")
+        connections = result if isinstance(result, list) else []
+        return next((c for c in connections if c.get("name") == name), None)
+
     def create_connection(self, name: str, strategy: str) -> dict:
         """
-        Create a social or enterprise connection in Auth0.
+        Get-or-create a social connection in Auth0.
+        Returns the existing connection if one with this name already exists,
+        avoiding a 409 Conflict on repeated runs.
         Valid strategies: 'google-oauth2', 'facebook', 'github', etc.
-        'auth0' is NOT valid — it is the built-in database and cannot be created via API.
+        'auth0' is NOT valid here — it is the built-in database.
         """
+        existing = self.get_connection_by_name(name)
+        if existing:
+            logger.info("Connection '%s' already exists; reusing it", name)
+            return existing
         return self._api("POST", "connections", json={"name": name, "strategy": strategy})
-
-    def create_client(self, name: str, callbacks: list[str] | None = None) -> dict:
-        """Register a new application client in Auth0."""
-        if callbacks is None:
-            callbacks = [os.environ.get("AUTH0_CALLBACK_URL", "http://localhost:8080/callback")]
-        return self._api("POST", "clients", json={
-            "name":        name,
-            "app_type":    "regular_web",
-            "grant_types": ["authorization_code", "refresh_token"],
-            "callbacks":   callbacks,
-        })
 
     def get_client_by_name(self, name: str) -> dict | None:
         """Retrieve an existing Auth0 client by display name."""
         result = self._api("GET", "clients")
         clients = result if isinstance(result, list) else []
         return next((c for c in clients if c.get("name") == name), None)
+
+    def create_client(self, name: str, callbacks: list[str]) -> dict:
+        """
+        Get-or-create an Auth0 application client.
+        Returns the existing client if one with this name already exists,
+        avoiding a 409 Conflict on repeated runs.
+        """
+        existing = self.get_client_by_name(name)
+        if existing:
+            logger.info("Client '%s' already exists; reusing it", name)
+            return existing
+        return self._api("POST", "clients", json={
+            "name":        name,
+            "app_type":    "regular_web",
+            "grant_types": ["authorization_code", "refresh_token"],
+            "callbacks":   callbacks,
+        })
 
 
 def test_token_access(auth0: Auth0Connect) -> None:
@@ -222,14 +155,7 @@ def create_server_certificate(
     """
     Generate a self-signed TLS certificate for development/testing.
     WARNING: self-signed certificates must NOT be used in production.
-    Returns (cert_path, key_path).
     """
-    if not _CRYPTO_AVAILABLE:
-        raise RuntimeError(
-            "The 'cryptography' package is required for certificate generation. "
-            "Install it with: pip install cryptography"
-        )
-
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subject = issuer = x509.Name([
         x509.NameAttribute(NameOID.COMMON_NAME,       hostname),
@@ -281,10 +207,10 @@ def integrate_with_keycloak(
 ) -> None:
     """
     Register Auth0 as an OIDC Identity Provider inside Keycloak.
-    Tries the Keycloak 17+ path first, falls back to the pre-17 legacy path.
+    Tries the Keycloak 17+ path first, then the pre-17 legacy path.
     """
     base = keycloak_url.rstrip("/")
-    last_error: str = ""
+    last_error = ""
     for path_prefix in ("/admin/realms", "/auth/admin/realms"):
         url = f"{base}{path_prefix}/{realm_name}/identity-provider/instances"
         headers = {
@@ -316,6 +242,10 @@ def integrate_with_keycloak(
         if response.status_code == 201:
             logger.info("Auth0 IdP registered in Keycloak at %s", url)
             return
+        if response.status_code == 409:
+            # IdP alias already exists — treat as success so re-runs don't fail
+            logger.info("Auth0 IdP already exists in Keycloak; skipping creation")
+            return
         if response.status_code == 404 and path_prefix == "/admin/realms":
             last_error = response.text
             continue
@@ -329,19 +259,37 @@ def integrate_with_keycloak(
     )
 
 
-def test_login_flow(auth0: Auth0Connect, redirect_uri: str | None = None) -> str:
+def test_login_flow(auth0: Auth0Connect, redirect_uri: str) -> str:
     """Return the Auth0 authorization URL to initiate an Authorization Code flow."""
-    if redirect_uri is None:
-        redirect_uri = os.environ.get("AUTH0_CALLBACK_URL", "http://localhost:8080/callback")
     auth_url = (
         f"https://{auth0.domain}/authorize"
         f"?response_type=code"
-        f"&client_id={auth0.client_id}"
-        f"&redirect_uri={quote(redirect_uri, safe='')}"  # I5 FIX: percent-encode the URI
-        f"&scope=openid%20profile%20email"               # I5 FIX: encode spaces in scope too
+        f"&client_id={quote(auth0.client_id, safe='')}"
+        f"&redirect_uri={quote(redirect_uri, safe='')}"
+        f"&scope=openid%20profile%20email"
     )
     logger.info("Authorization URL: %s", auth_url)
     return auth_url
+
+
+def _require_env(*names: str) -> dict[str, str]:
+    """
+    Read required environment variables, collecting ALL missing ones so the user
+    sees a single clear message instead of crashing on the first KeyError.
+    """
+    values = {name: os.environ.get(name) for name in names}
+    missing = [name for name, val in values.items() if not val]
+    if missing:
+        raise SystemExit(
+            "Missing required environment variable(s): " + ", ".join(missing) + "\n"
+            "Set them in your shell or in a .env file in the directory you run this from.\n"
+            "Example:\n"
+            "  export AUTH0_DOMAIN=your-tenant.us.auth0.com\n"
+            "  export AUTH0_CLIENT_ID=...\n"
+            "  export AUTH0_CLIENT_SECRET=...\n"
+            "  export KEYCLOAK_ADMIN_TOKEN=...\n"
+        )
+    return values  # type: ignore[return-value]
 
 
 if __name__ == "__main__":
@@ -350,10 +298,10 @@ if __name__ == "__main__":
         format="%(asctime)s %(levelname)s %(name)s — %(message)s",
     )
 
-    domain               = os.environ["AUTH0_DOMAIN"]
-    client_id            = os.environ["AUTH0_CLIENT_ID"]
-    client_secret        = os.environ["AUTH0_CLIENT_SECRET"]
-    keycloak_admin_token = os.environ["KEYCLOAK_ADMIN_TOKEN"]
+    # Collect all missing required vars at once with a clear, actionable message
+    env = _require_env(
+        "AUTH0_DOMAIN", "AUTH0_CLIENT_ID", "AUTH0_CLIENT_SECRET", "KEYCLOAK_ADMIN_TOKEN"
+    )
 
     keycloak_url      = os.environ.get("KEYCLOAK_URL", "http://localhost:8080")
     auth0_callback    = os.environ.get("AUTH0_CALLBACK_URL", "http://localhost:8080/callback")
@@ -363,8 +311,8 @@ if __name__ == "__main__":
         f"http://localhost:8080/realms/{realm_name}/broker/auth0/endpoint",
     )
 
-    auth0 = Auth0Connect(domain, client_id, client_secret)
-    logger.info("Auth0 instance created for domain: %s", domain)
+    auth0 = Auth0Connect(env["AUTH0_DOMAIN"], env["AUTH0_CLIENT_ID"], env["AUTH0_CLIENT_SECRET"])
+    logger.info("Auth0 instance created for domain: %s", env["AUTH0_DOMAIN"])
     test_token_access(auth0)
 
     for strategy in ("google-oauth2", "facebook"):
@@ -374,13 +322,13 @@ if __name__ == "__main__":
     client = auth0.create_client("keycloak-oidc-client", callbacks=[keycloak_callback])
     logger.info("Client created: %s (client_id: %s)", client.get("name"), client.get("client_id"))
 
-    create_server_certificate(hostname=domain, cert_path="server.crt", key_path="server.key")
+    create_server_certificate(hostname=env["AUTH0_DOMAIN"])
 
     integrate_with_keycloak(
         auth0,
         keycloak_url=keycloak_url,
         realm_name=realm_name,
-        keycloak_admin_token=keycloak_admin_token,
+        keycloak_admin_token=env["KEYCLOAK_ADMIN_TOKEN"],
         oidc_client_id=client.get("client_id", ""),
         oidc_client_secret=client.get("client_secret", ""),
     )
@@ -393,4 +341,3 @@ if __name__ == "__main__":
 
     logger.info("Integration complete!")
     logger.info("Test login URL: %s", test_login_flow(auth0, auth0_callback))
-    
