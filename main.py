@@ -13,13 +13,15 @@ from fastapi.security import HTTPBearer
 from authorize import router as auth0_router, oauth2_scheme
 from keycloak import KeycloakOpenID, KeycloakAdmin
 from keycloak.exceptions import KeycloakAuthenticationError
-import uvicorn
 
+# I3 FIX: configure logging before anything else so all logger.* calls produce output
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+)
 logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────
-# RSA key management
-# ──────────────────────────────────────────────
+# ── RSA key management ────────────────────────────────────────────────────────
 public_pem: bytes = b""
 
 def _write_atomic(path: str, data: bytes, mode: int = 0o644):
@@ -44,13 +46,11 @@ def init_rsa_keys():
     os.makedirs(KEY_DIR, exist_ok=True)
     private_key_path = os.path.join(KEY_DIR, "private.pem")
     public_key_path  = os.path.join(KEY_DIR, "public.pem")
-
-    # E4 FIX: open directly instead of exists()-then-open (eliminates TOCTOU race)
     try:
         with open(public_key_path, "rb") as f:
             public_pem = f.read()
         with open(private_key_path, "rb"):
-            pass   # confirm private key is also readable; don't load it into memory
+            pass
     except FileNotFoundError:
         _priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         private_bytes = _priv.private_bytes(
@@ -66,22 +66,18 @@ def init_rsa_keys():
         _write_atomic(public_key_path, _pub_pem)
         public_pem = _pub_pem
 
-# ──────────────────────────────────────────────
-# Keycloak helpers
-# ──────────────────────────────────────────────
+# ── Keycloak helpers ──────────────────────────────────────────────────────────
 def create_keycloak_user(admin: KeycloakAdmin, username: str, password: str, group: str):
     existing = admin.get_users({"username": username, "exact": "true"})
     if existing:
         return existing[0]["id"]
-
     groups = admin.get_groups()
     group_id = next((g["id"] for g in groups if g["name"] == group), None)
     if not group_id:
         group_id = admin.create_group({"name": group})
-
     user_id = admin.create_user({
-        "username": username,
-        "enabled": True,
+        "username":    username,
+        "enabled":     True,
         "credentials": [{"type": "password", "value": password, "temporary": False}],
     })
     admin.group_user_add(user_id, group_id)
@@ -96,30 +92,23 @@ def setup_keycloak():
         user_realm_name="master",
         verify=True
     )
-
     flows = admin.get_authentication_flows()
     if not any(flow["alias"] == "Hello-World-flow" for flow in flows):
         admin.create_authentication_flow({
-            "alias": "Hello-World-flow",
+            "alias":       "Hello-World-flow",
             "description": "Authentication flow for Hello World app",
-            "providerId": "basic-flow",
-            "topLevel": True,
-            "builtIn": False
+            "providerId":  "basic-flow",
+            "topLevel":    True,
+            "builtIn":     False
         })
-
     default_password = os.environ.get("DEFAULT_USER_PASSWORD", "change-me")
     create_keycloak_user(admin, "user", default_password, "users")
-
-    client_uuid = admin.get_client_id("Hello-World-app")
+    client_uuid     = admin.get_client_id("Hello-World-app")
     existing_secret = admin.get_client_secrets(client_uuid)
     if existing_secret.get("value") is None:
         admin.create_client_secret(client_uuid)
 
-# ──────────────────────────────────────────────
-# Lifespan
-# E5 FIX: keycloak_oidc constructed inside lifespan so KEYCLOAK_CLIENT_SECRET
-# is read after the environment is fully populated (Docker/K8s late-inject safe)
-# ──────────────────────────────────────────────
+# ── Lifespan ──────────────────────────────────────────────────────────────────
 keycloak_oidc: KeycloakOpenID | None = None
 
 @asynccontextmanager
@@ -135,8 +124,6 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.error("Keycloak setup failed — check KEYCLOAK_URL and credentials: %s", exc)
         raise
-
-    # E5 FIX: construct after environment is fully available
     keycloak_oidc = KeycloakOpenID(
         server_url=os.environ.get("KEYCLOAK_URL", "http://localhost:8080/"),
         client_id="Hello-World-app",
@@ -152,9 +139,7 @@ http_bearer     = HTTPBearer()
 password_hasher = PasswordHasher(time_cost=2, memory_cost=102400, parallelism=8,
                                   hash_len=32, salt_len=16)
 
-# ──────────────────────────────────────────────
-# Endpoints
-# ──────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def read_root():
@@ -218,6 +203,7 @@ def get_keys():
     return {"public_key": public_pem.decode("utf-8")}
 
 if __name__ == "__main__":
+    import uvicorn  # I4 FIX: lazy import — only needed when run directly
     uvicorn.run(
         app,
         host=os.environ.get("HOST", "0.0.0.0"),

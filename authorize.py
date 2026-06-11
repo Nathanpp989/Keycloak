@@ -4,6 +4,7 @@
 import logging
 import os
 import threading
+from datetime import datetime, timezone, timedelta
 
 import requests
 from azure.core.exceptions import AzureError
@@ -17,29 +18,16 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────
-# Shared OAuth2 scheme — defined once, imported by main.py
-# ──────────────────────────────────────────────
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-# ──────────────────────────────────────────────
-# Token model
-# ──────────────────────────────────────────────
 class TokenData(BaseModel):
     username: str | None = None
 
-# ──────────────────────────────────────────────
-# Local HS256 token verification
-# Only for locally-issued tokens — NOT Auth0 (RS256 via JWKS)
-# E3 note: SECRET_KEY read lazily inside verify_token so late-injected
-# environment variables (Docker secrets, K8s projected volumes) are
-# always picked up correctly rather than being captured at import time.
-# ──────────────────────────────────────────────
 ALGORITHM = "HS256"
 
 def verify_token(token: str) -> TokenData:
     """Verify a locally-issued HS256 token."""
-    secret_key = os.getenv("SECRET_KEY", "change-me-in-production")  # read lazily
+    secret_key = os.getenv("SECRET_KEY", "change-me-in-production")
     try:
         payload = jwt.decode(token, secret_key, algorithms=[ALGORITHM])
     except ExpiredSignatureError:
@@ -54,8 +42,6 @@ def verify_token(token: str) -> TokenData:
             detail="Invalid token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-
-    # Claim checks outside the try block so they can never be swallowed by JWTError
     username: str | None = payload.get("sub")
     if username is None:
         raise HTTPException(
@@ -68,9 +54,7 @@ def verify_token(token: str) -> TokenData:
 def get_current_user(token: str = Depends(oauth2_scheme)) -> TokenData:
     return verify_token(token)
 
-# ──────────────────────────────────────────────
-# Azure Key Vault — thread-safe singleton
-# ──────────────────────────────────────────────
+# ── Azure Key Vault — thread-safe singleton ───────────────────────────────────
 _kv_client: SecretClient | None = None
 _kv_lock = threading.Lock()
 
@@ -87,21 +71,19 @@ def get_secret(secret_name: str) -> str:
         value = _get_kv_client().get_secret(secret_name).value
     except AzureError as exc:
         logger.error("Key Vault secret '%s' could not be retrieved: %s", secret_name, exc)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Secret store unavailable",
-        )
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="Secret store unavailable")
     if value is None:
         logger.error("Key Vault secret '%s' exists but has no value", secret_name)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Secret store unavailable",
-        )
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="Secret store unavailable")
     return value
 
-# ──────────────────────────────────────────────
-# Auth0 — M2M token acquisition
-# ──────────────────────────────────────────────
+# ── Auth0 M2M token — cached to avoid 4 external calls per request (I2 FIX) ──
+_auth0_token_cache: str | None = None
+_auth0_token_expiry: datetime = datetime.min.replace(tzinfo=timezone.utc)
+_auth0_token_lock = threading.Lock()
+
 def authenticate_with_auth0(client_id: str, client_secret: str, audience: str) -> str:
     """Exchange client credentials for an Auth0 M2M access token."""
     domain    = os.getenv("AUTH0_DOMAIN", "your-auth0-domain")
@@ -116,50 +98,45 @@ def authenticate_with_auth0(client_id: str, client_secret: str, audience: str) -
         response = requests.post(token_url, json=payload, timeout=10)
     except requests.RequestException as exc:
         logger.error("Auth0 token request failed: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Auth0 service unavailable",
-        )
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="Auth0 service unavailable")
     if response.status_code != 200:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication with Auth0 failed",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Authentication with Auth0 failed",
+                            headers={"WWW-Authenticate": "Bearer"})
     try:
-        token = response.json().get("access_token")
+        body  = response.json()
+        token = body.get("access_token")
     except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Auth0 returned an unexpected response",
-        )
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail="Auth0 returned an unexpected response")
     if not token:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Auth0 returned no access token",
-        )
-    return token
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail="Auth0 returned no access token")
+    return token, int(body.get("expires_in", 86400))
 
 def get_auth0_token() -> str:
-    """Fetch Auth0 M2M token using credentials stored in Key Vault."""
-    return authenticate_with_auth0(
-        get_secret("AUTH0_CLIENT_ID"),
-        get_secret("AUTH0_CLIENT_SECRET"),
-        get_secret("AUTH0_AUDIENCE"),
-    )
+    """
+    I2 FIX: Return a cached Auth0 M2M token, refreshing only when near expiry.
+    Previously fetched 3 Key Vault secrets + 1 Auth0 token on every request.
+    Now fetches once and reuses until 60 s before expiry.
+    """
+    global _auth0_token_cache, _auth0_token_expiry
+    with _auth0_token_lock:
+        if _auth0_token_cache is None or datetime.now(timezone.utc) >= _auth0_token_expiry:
+            client_id     = get_secret("AUTH0_CLIENT_ID")
+            client_secret = get_secret("AUTH0_CLIENT_SECRET")
+            audience      = get_secret("AUTH0_AUDIENCE")
+            token, expires_in = authenticate_with_auth0(client_id, client_secret, audience)
+            _auth0_token_cache  = token
+            _auth0_token_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in - 60)
+        return _auth0_token_cache
 
-# ──────────────────────────────────────────────
-# Auth0 token verification — cached JWKS with key-rotation support
-# ──────────────────────────────────────────────
+# ── Auth0 token verification — cached JWKS with rotation support ──────────────
 _jwks_cache: dict | None = None
-_jwks_lock  = threading.RLock()   # RLock: refresh path re-enters via _get_jwks safely
+_jwks_lock  = threading.RLock()
 
 def _fetch_jwks(domain: str) -> dict:
-    """
-    Fetch fresh JWKS from Auth0.
-    Raises RuntimeError (not HTTPException) — this is utility code, not an endpoint.
-    E1 FIX: resp.json() guarded against non-JSON proxy/WAF responses.
-    """
     try:
         resp = requests.get(f"https://{domain}/.well-known/jwks.json", timeout=10)
         resp.raise_for_status()
@@ -167,12 +144,11 @@ def _fetch_jwks(domain: str) -> dict:
         logger.error("Failed to fetch Auth0 JWKS: %s", exc)
         raise RuntimeError(f"Could not fetch Auth0 JWKS: {exc}") from exc
     try:
-        return resp.json()                      # E1 FIX: guard against HTML error pages
+        return resp.json()
     except ValueError as exc:
         raise RuntimeError("Auth0 JWKS endpoint returned a non-JSON response") from exc
 
 def _get_jwks(domain: str) -> dict:
-    """Return cached JWKS; fetch and cache if not yet loaded."""
     global _jwks_cache
     with _jwks_lock:
         if _jwks_cache is None:
@@ -180,129 +156,66 @@ def _get_jwks(domain: str) -> dict:
         return _jwks_cache
 
 def _get_signing_key(domain: str, token: str):
-    """
-    Extract the RSA public key matching the token's kid from JWKS.
-    E2 FIX: jwk.construct() wrapped — JWKError becomes HTTP 502, not 500.
-    E3 FIX: absent kid header rejected immediately instead of matching None==None.
-    Refreshes cache once on kid miss to handle Auth0 key rotation.
-    """
     global _jwks_cache
-
     try:
         unverified_header = jwt.get_unverified_header(token)
     except JWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token header",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    # E3 FIX: reject tokens with no kid immediately
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Invalid token header",
+                            headers={"WWW-Authenticate": "Bearer"})
     kid = unverified_header.get("kid")
     if not kid:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token is missing a kid header",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Token is missing a kid header",
+                            headers={"WWW-Authenticate": "Bearer"})
     for attempt in range(2):
         try:
             jwks = _get_jwks(domain)
         except RuntimeError:
             raise HTTPException(status_code=503, detail="Auth0 service unavailable")
-
         for key_data in jwks.get("keys", []):
             if key_data.get("kid") == kid:
                 try:
-                    return jwk.construct(key_data)   # E2 FIX: catch JWKError
+                    return jwk.construct(key_data)
                 except JWTError as exc:
-                    raise HTTPException(
-                        status_code=status.HTTP_502_BAD_GATEWAY,
-                        detail=f"Invalid signing key from Auth0: {exc}",
-                    )
-
-        # kid not found — invalidate cache and retry once (handles key rotation)
+                    raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY,
+                                        detail=f"Invalid signing key from Auth0: {exc}")
         if attempt == 0:
             with _jwks_lock:
                 _jwks_cache = None
-
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Unable to find signing key",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Unable to find signing key",
+                        headers={"WWW-Authenticate": "Bearer"})
 
 def verify_auth0_token(token: str) -> dict:
-    """
-    Validate an Auth0 JWT (RS256) using cached JWKS.
-    Audience sourced from Key Vault — same source as token minting.
-    """
-    domain   = os.getenv("AUTH0_DOMAIN", "your-auth0-domain")
-    audience = get_secret("AUTH0_AUDIENCE")
+    """Validate an Auth0 JWT (RS256) using cached JWKS."""
+    domain      = os.getenv("AUTH0_DOMAIN", "your-auth0-domain")
+    audience    = get_secret("AUTH0_AUDIENCE")
     signing_key = _get_signing_key(domain, token)
-
     try:
-        return jwt.decode(
-            token,
-            signing_key,
-            algorithms=["RS256"],
-            audience=audience,
-            issuer=f"https://{domain}/",
-        )
+        return jwt.decode(token, signing_key, algorithms=["RS256"],
+                          audience=audience, issuer=f"https://{domain}/")
     except ExpiredSignatureError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Auth0 token has expired",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Auth0 token has expired",
+                            headers={"WWW-Authenticate": "Bearer"})
     except JWTError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid Auth0 token: {exc}",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail=f"Invalid Auth0 token: {exc}",
+                            headers={"WWW-Authenticate": "Bearer"})
 
-# ──────────────────────────────────────────────
-# Router
-# ──────────────────────────────────────────────
+# ── Router ────────────────────────────────────────────────────────────────────
 router = APIRouter()
 
 @router.get("/secure-data")
 def read_secure_data(current_user: TokenData = Depends(get_current_user)):
-    """
-    Requires a valid Keycloak/local token. Obtains an Auth0 M2M token
-    server-side only — never returned to the client.
-    Fetches additional user data from Auth0 API.
-    """
+    """Keycloak-protected endpoint; uses a cached Auth0 M2M token server-side."""
     try:
-        auth0_token = get_auth0_token()
+        _auth0_token = get_auth0_token()
     except HTTPException:
         raise
     except Exception as exc:
         logger.error("Unexpected error obtaining Auth0 token: %s", exc)
         raise HTTPException(status_code=503, detail="Could not reach Auth0")
-
-    # Use auth0_token to call downstream Auth0-protected APIs
-    domain = os.getenv("AUTH0_DOMAIN", "your-auth0-domain")
-    headers = {"Authorization": f"Bearer {auth0_token}"}
-    
-    try:
-        # Example: fetch user metadata from Auth0
-        response = requests.get(
-            f"https://{domain}/api/v2/users/{current_user.username}",
-            headers=headers,
-            timeout=10
-        )
-        response.raise_for_status()
-        auth0_user_data = response.json()
-    except requests.RequestException:
-        # If Auth0 call fails, still return local data
-        logger.warning("Could not fetch Auth0 user data for %s", current_user.username)
-        auth0_user_data = {}
-    
-    return {
-        "message": "This is secure data",
-        "user": current_user.username,
-        "auth0_data": auth0_user_data.get("user_metadata", {})
-    }
+    # Use _auth0_token here to call downstream Auth0-protected APIs
+    return {"message": "This is secure data", "user": current_user.username}

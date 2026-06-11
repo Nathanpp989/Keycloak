@@ -3,7 +3,6 @@
 # inside Keycloak, and sets up social connections (Google, Facebook, etc.) in Auth0.
 # Integrates with main.py and authorize.py.
 
-# G5 FIX: from __future__ must be the very first statement after the docstring
 from __future__ import annotations
 
 import logging
@@ -11,25 +10,23 @@ import os
 import ipaddress
 import stat
 from datetime import datetime, timezone, timedelta
+from urllib.parse import quote  # I5 FIX: for percent-encoding redirect_uri in URLs
 
-# Load .env file before reading any os.environ values
-from dotenv import load_dotenv  # from python-dotenv package
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv optional; set env vars manually if not installed
 
-# ──────────────────────────────────────────────
-# requests — use the real library; fall back to urllib only when unavailable.
-# G1 FIX: _RequestsFallback now defines RequestException so that
-#         `except requests.RequestException` works identically in both paths.
-# G2 FIX: _RequestsFallback now implements request() so _api() works.
-# G3 FIX: _Response now implements raise_for_status().
-# G4 FIX: _Response now implements the ok property.
-# ──────────────────────────────────────────────
 try:
     import requests
-    from requests import RequestException  # noqa: F401 — re-exported for callers
-except ImportError:  # pragma: no cover
+except ImportError:
     import json as _json
     from urllib import request as _urlreq, error as _error
+
+    class _RequestsException(Exception):
+        """Stand-in for requests.RequestException in the urllib fallback."""
+        pass
 
     class _Response:
         def __init__(self, status: int, body: str, headers: dict | None = None):
@@ -38,14 +35,12 @@ except ImportError:  # pragma: no cover
             self.headers = headers or {}
 
         @property
-        def ok(self) -> bool:                          # G4 FIX
+        def ok(self) -> bool:
             return 200 <= self.status_code < 300
 
-        def raise_for_status(self) -> None:            # G3 FIX
+        def raise_for_status(self) -> None:
             if not self.ok:
-                raise _RequestsFallback.RequestException(
-                    f"HTTP {self.status_code}: {self.text}"
-                )
+                raise _RequestsException(f"HTTP {self.status_code}: {self.text}")
 
         def json(self) -> dict:
             try:
@@ -54,13 +49,13 @@ except ImportError:  # pragma: no cover
                 raise ValueError("Response body is not valid JSON") from exc
 
     class _RequestsFallback:
-        class RequestException(Exception):            # G1 FIX: exception class on the object
-            pass
+        RequestException = _RequestsException
 
         @staticmethod
         def _send(method: str, url: str, **kwargs) -> _Response:
             import json as _j
-            headers: dict = kwargs.get("headers", {})
+            # I1 FIX: copy headers explicitly so the caller's dict is never mutated
+            headers: dict = {**(kwargs.get("headers") or {})}
             json_body = kwargs.get("json")
             data = kwargs.get("data")
 
@@ -69,7 +64,11 @@ except ImportError:  # pragma: no cover
                 headers.setdefault("Content-Type", "application/json")
             elif data is not None:
                 from urllib import parse as _p
-                body = _p.urlencode(data).encode() if isinstance(data, dict) else str(data).encode()
+                body = (
+                    _p.urlencode(data).encode()
+                    if isinstance(data, dict)
+                    else str(data).encode()
+                )
                 headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
             else:
                 body = None
@@ -77,12 +76,16 @@ except ImportError:  # pragma: no cover
             req = _urlreq.Request(url, data=body, headers=headers, method=method.upper())
             try:
                 with _urlreq.urlopen(req, timeout=kwargs.get("timeout")) as resp:
-                    return _Response(resp.getcode(), resp.read().decode(), dict(resp.getheaders()))
+                    return _Response(
+                        resp.getcode(),
+                        resp.read().decode(),
+                        dict(resp.getheaders()),
+                    )
             except _error.HTTPError as exc:
                 body_text = exc.read().decode() if hasattr(exc, "read") else ""
                 return _Response(getattr(exc, "code", 500), body_text)
             except _error.URLError as exc:
-                raise _RequestsFallback.RequestException(str(exc)) from exc
+                raise _RequestsException(str(exc)) from exc
 
         @classmethod
         def get(cls, url: str, **kwargs) -> _Response:
@@ -93,15 +96,11 @@ except ImportError:  # pragma: no cover
             return cls._send("POST", url, **kwargs)
 
         @classmethod
-        def request(cls, method: str, url: str, **kwargs) -> _Response:  # G2 FIX
+        def request(cls, method: str, url: str, **kwargs) -> _Response:
             return cls._send(method, url, **kwargs)
 
     requests = _RequestsFallback()
 
-# ──────────────────────────────────────────────
-# cryptography — G6 FIX: fail loudly with a clear ImportError message
-# instead of silently passing and crashing later with NameError.
-# ──────────────────────────────────────────────
 try:
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
@@ -124,26 +123,26 @@ class Auth0Connect:
 
     @property
     def token(self) -> str:
-        """Return a valid M2M token, refreshing if expired or absent."""
+        """Return a valid M2M token, refreshing automatically when near expiry."""
         if self._token is None or datetime.now(timezone.utc) >= self._token_expiry:
             self._token, self._token_expiry = self._fetch_token()
         return self._token
 
     def _fetch_token(self) -> tuple[str, datetime]:
-        """Fetch a fresh M2M token from Auth0 and return (token, expiry)."""
+        """Fetch a fresh M2M token from Auth0."""
         url = f"https://{self.domain}/oauth/token"
-        data = {
+        payload = {
             "client_id":     self.client_id,
             "client_secret": self.client_secret,
             "audience":      f"https://{self.domain}/api/v2/",
             "grant_type":    "client_credentials",
         }
         try:
-            response = requests.post(url, json=data, timeout=10)
+            response = requests.post(url, json=payload, timeout=10)
         except requests.RequestException as exc:
             raise RuntimeError(f"Auth0 token request failed: {exc}") from exc
 
-        if response.status_code != 200:
+        if not response.ok:
             raise RuntimeError(
                 f"Auth0 token endpoint returned {response.status_code}: {response.text}"
             )
@@ -160,8 +159,8 @@ class Auth0Connect:
         expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in - 60)
         return token, expiry
 
-    def _api(self, method: str, path: str, **kwargs) -> dict:
-        """Centralised Auth0 Management API helper with auth header and error checking."""
+    def _api(self, method: str, path: str, **kwargs) -> dict | list:
+        """Centralised Auth0 Management API helper."""
         url = f"https://{self.domain}/api/v2/{path.lstrip('/')}"
         headers = {
             "content-type":  "application/json",
@@ -170,7 +169,7 @@ class Auth0Connect:
         try:
             response = requests.request(method, url, headers=headers, timeout=10, **kwargs)
         except requests.RequestException as exc:
-            raise RuntimeError(f"Auth0 API request to {path} failed: {exc}") from exc
+            raise RuntimeError(f"Auth0 API {method} {path} failed: {exc}") from exc
 
         if not response.ok:
             raise RuntimeError(
@@ -185,7 +184,7 @@ class Auth0Connect:
         """
         Create a social or enterprise connection in Auth0.
         Valid strategies: 'google-oauth2', 'facebook', 'github', etc.
-        Note: 'auth0' is NOT valid here — it is the built-in database.
+        'auth0' is NOT valid — it is the built-in database and cannot be created via API.
         """
         return self._api("POST", "connections", json={"name": name, "strategy": strategy})
 
@@ -201,29 +200,17 @@ class Auth0Connect:
         })
 
     def get_client_by_name(self, name: str) -> dict | None:
-        """Retrieve an existing Auth0 client by its display name."""
-        clients = self._api("GET", "clients")
-        if isinstance(clients, list):
-            return next((c for c in clients if c.get("name") == name), None)
-        return None
+        """Retrieve an existing Auth0 client by display name."""
+        result = self._api("GET", "clients")
+        clients = result if isinstance(result, list) else []
+        return next((c for c in clients if c.get("name") == name), None)
 
 
 def test_token_access(auth0: Auth0Connect) -> None:
     """Verify the M2M token works against the Auth0 Management API."""
-    token = auth0.token
-    logger.info("Access token obtained (first 20 chars): %s...", token[:20])
-    try:
-        response = requests.get(
-            f"https://{auth0.domain}/api/v2/clients",
-            headers={"authorization": f"Bearer {token}"},
-            timeout=10,
-        )
-        response.raise_for_status()
-        clients = response.json()
-        client_count = len(clients) if isinstance(clients, list) else 1
-        logger.info("API response: %d clients returned", client_count)
-    except requests.RequestException as exc:
-        raise RuntimeError(f"test_token_access failed: {exc}") from exc
+    result = auth0._api("GET", "clients")
+    count = len(result) if isinstance(result, list) else 1
+    logger.info("Token validated: %d client(s) visible", count)
 
 
 def create_server_certificate(
@@ -237,7 +224,6 @@ def create_server_certificate(
     WARNING: self-signed certificates must NOT be used in production.
     Returns (cert_path, key_path).
     """
-    # G6 FIX: raise clearly instead of crashing later with NameError
     if not _CRYPTO_AVAILABLE:
         raise RuntimeError(
             "The 'cryptography' package is required for certificate generation. "
@@ -295,9 +281,10 @@ def integrate_with_keycloak(
 ) -> None:
     """
     Register Auth0 as an OIDC Identity Provider inside Keycloak.
-    Tries the Keycloak 17+ path first, falls back to the legacy path.
+    Tries the Keycloak 17+ path first, falls back to the pre-17 legacy path.
     """
     base = keycloak_url.rstrip("/")
+    last_error: str = ""
     for path_prefix in ("/admin/realms", "/auth/admin/realms"):
         url = f"{base}{path_prefix}/{realm_name}/identity-provider/instances"
         headers = {
@@ -330,21 +317,28 @@ def integrate_with_keycloak(
             logger.info("Auth0 IdP registered in Keycloak at %s", url)
             return
         if response.status_code == 404 and path_prefix == "/admin/realms":
-            continue  # retry with legacy path
+            last_error = response.text
+            continue
         raise RuntimeError(
             f"Keycloak IdP registration returned {response.status_code}: {response.text}"
         )
 
+    raise RuntimeError(
+        f"Keycloak realm '{realm_name}' not found at {base}. "
+        f"Check KEYCLOAK_URL and realm name. Last error: {last_error}"
+    )
 
-def test_login_flow(auth0: Auth0Connect) -> str:
+
+def test_login_flow(auth0: Auth0Connect, redirect_uri: str | None = None) -> str:
     """Return the Auth0 authorization URL to initiate an Authorization Code flow."""
-    redirect_uri = os.environ.get("AUTH0_CALLBACK_URL", "http://localhost:8080/callback")
+    if redirect_uri is None:
+        redirect_uri = os.environ.get("AUTH0_CALLBACK_URL", "http://localhost:8080/callback")
     auth_url = (
         f"https://{auth0.domain}/authorize"
         f"?response_type=code"
         f"&client_id={auth0.client_id}"
-        f"&redirect_uri={redirect_uri}"
-        f"&scope=openid profile email"
+        f"&redirect_uri={quote(redirect_uri, safe='')}"  # I5 FIX: percent-encode the URI
+        f"&scope=openid%20profile%20email"               # I5 FIX: encode spaces in scope too
     )
     logger.info("Authorization URL: %s", auth_url)
     return auth_url
@@ -352,40 +346,40 @@ def test_login_flow(auth0: Auth0Connect) -> str:
 
 if __name__ == "__main__":
     logging.basicConfig(
-        level=logging.INFO,
+        level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s — %(message)s",
     )
 
-    domain = os.environ.get("AUTH0_DOMAIN")
-    client_id = os.environ.get("AUTH0_CLIENT_ID")
-    client_secret = os.environ.get("AUTH0_CLIENT_SECRET")
-    if not all([domain, client_id, client_secret]):
-        raise RuntimeError(
-            "Missing required environment variables. Please set: "
-            "AUTH0_DOMAIN, AUTH0_CLIENT_ID, AUTH0_CLIENT_SECRET"
-        )
+    domain               = os.environ["AUTH0_DOMAIN"]
+    client_id            = os.environ["AUTH0_CLIENT_ID"]
+    client_secret        = os.environ["AUTH0_CLIENT_SECRET"]
+    keycloak_admin_token = os.environ["KEYCLOAK_ADMIN_TOKEN"]
+
+    keycloak_url      = os.environ.get("KEYCLOAK_URL", "http://localhost:8080")
+    auth0_callback    = os.environ.get("AUTH0_CALLBACK_URL", "http://localhost:8080/callback")
+    realm_name        = os.environ.get("KEYCLOAK_REALM", "Premkey")
+    keycloak_callback = os.environ.get(
+        "KEYCLOAK_REDIRECT_URI",
+        f"http://localhost:8080/realms/{realm_name}/broker/auth0/endpoint",
+    )
 
     auth0 = Auth0Connect(domain, client_id, client_secret)
+    logger.info("Auth0 instance created for domain: %s", domain)
     test_token_access(auth0)
 
     for strategy in ("google-oauth2", "facebook"):
         conn = auth0.create_connection(f"keycloak-{strategy}", strategy)
         logger.info("Connection created: %s", conn.get("name"))
 
-    keycloak_callback = os.environ.get(
-        "KEYCLOAK_REDIRECT_URI",
-        "http://localhost:8080/realms/Premkey/broker/auth0/endpoint",
-    )
     client = auth0.create_client("keycloak-oidc-client", callbacks=[keycloak_callback])
     logger.info("Client created: %s (client_id: %s)", client.get("name"), client.get("client_id"))
 
     create_server_certificate(hostname=domain, cert_path="server.crt", key_path="server.key")
 
-    keycloak_admin_token = os.environ["KEYCLOAK_ADMIN_TOKEN"]
     integrate_with_keycloak(
         auth0,
-        keycloak_url=os.environ.get("KEYCLOAK_URL", "http://localhost:8080"),
-        realm_name="Premkey",
+        keycloak_url=keycloak_url,
+        realm_name=realm_name,
         keycloak_admin_token=keycloak_admin_token,
         oidc_client_id=client.get("client_id", ""),
         oidc_client_secret=client.get("client_secret", ""),
@@ -393,8 +387,10 @@ if __name__ == "__main__":
 
     found = auth0.get_client_by_name("keycloak-oidc-client")
     if found:
-        logger.info("Keycloak OIDC client confirmed: %s", found.get("client_id"))
+        logger.info("Client verified: %s", found.get("client_id"))
     else:
-        logger.warning("Keycloak OIDC client 'keycloak-oidc-client' not found after creation")
+        logger.warning("Client 'keycloak-oidc-client' not found after creation")
 
-    logger.info("To test login, open: %s", test_login_flow(auth0))
+    logger.info("Integration complete!")
+    logger.info("Test login URL: %s", test_login_flow(auth0, auth0_callback))
+    
