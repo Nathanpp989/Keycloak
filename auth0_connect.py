@@ -329,8 +329,8 @@ if __name__ == "__main__":
         keycloak_url=keycloak_url,
         realm_name=realm_name,
         keycloak_admin_token=env["KEYCLOAK_ADMIN_TOKEN"],
-        oidc_client_id=client.get("client_id", ""),
-        oidc_client_secret=client.get("client_secret", ""),
+        oidc_client_id=client.get("client_id", "Hello-World-app"),
+        oidc_client_secret=client.get("client_secret", "WzUyAZTUHOVadVszbi1AaS1idiU46P7y"),
     )
 
     found = auth0.get_client_by_name("keycloak-oidc-client")
