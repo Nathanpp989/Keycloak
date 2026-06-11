@@ -212,7 +212,7 @@ def integrate_with_keycloak(
     base = keycloak_url.rstrip("/")
     last_error = ""
     for path_prefix in ("/admin/realms", "/auth/admin/realms"):
-        url = f"{base}{path_prefix}/{realm_name}/identity-provider/instances"
+        url = f"{base}{path_prefix}/Premkey/identity-provider/instances"
         headers = {
             "content-type":  "application/json",
             "authorization": f"Bearer {keycloak_admin_token}",
@@ -254,7 +254,7 @@ def integrate_with_keycloak(
         )
 
     raise RuntimeError(
-        f"Keycloak realm '{realm_name}' not found at {base}. "
+        f"Keycloak realm 'Premkey' not found at {base}. "
         f"Check KEYCLOAK_URL and realm name. Last error: {last_error}"
     )
 
@@ -327,7 +327,7 @@ if __name__ == "__main__":
     integrate_with_keycloak(
         auth0,
         keycloak_url=keycloak_url,
-        realm_name=realm_name,
+        realm_name="Premkey",
         keycloak_admin_token=env["KEYCLOAK_ADMIN_TOKEN"],
         oidc_client_id=client.get("client_id", "Hello-World-app"),
         oidc_client_secret=client.get("client_secret", "WzUyAZTUHOVadVszbi1AaS1idiU46P7y"),
