@@ -308,7 +308,7 @@ if __name__ == "__main__":
     realm_name        = os.environ.get("KEYCLOAK_REALM", "Premkey")
     keycloak_callback = os.environ.get(
         "KEYCLOAK_REDIRECT_URI",
-        f"http://localhost:8080/realms/{realm_name}/broker/auth0/endpoint",
+        f"http://localhost:8080/realms/Premkey/broker/auth0/endpoint",
     )
 
     auth0 = Auth0Connect(env["AUTH0_DOMAIN"], env["AUTH0_CLIENT_ID"], env["AUTH0_CLIENT_SECRET"])
