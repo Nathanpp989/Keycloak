@@ -9,7 +9,7 @@ def talk_to_api():
     access_token = get_access_token()
     
     # Define the API endpoint you want to talk to
-    api_endpoint = "http://localhost:8080/realms/{realm_name}/broker/auth0/endpoint"
+    api_endpoint = "http://localhost:8080/realms/Premkey/broker/auth0/endpoint"
     # Set up the headers with the access token
     headers = {headers: {"Authorization": f"Bearer {access_token}"}}
     # Make a GET request to the API endpoint
@@ -67,7 +67,7 @@ def talk_to_api():
 
     # Do the same thing for the auth0 endpoint
     def talk_to_auth0():
-        auth0_api_endpoint = "https://{your_auth0_domain}/api/v2/users"
+        auth0_api_endpoint = "https://keycloak-oidc-client/api/v2/users"
         response = requests.get(auth0_api_endpoint, headers=headers)
         if response.status_code == 200:
             print("Successfully talked to the Auth0 API!")
