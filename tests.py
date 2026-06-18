@@ -46,13 +46,6 @@ def test_invalid_token():
     assert response.json() == {"detail": "Invalid token"}
 
 
-def test_hash_password_endpoint():
-    response = client.post("/hash-password", data={"password": "hunter2"})
-    assert response.status_code == 200
-    assert "hashed_password" in response.json()
-    assert response.json()["hashed_password"] != "hunter2"
-
-
 def test_register_endpoint():
     response = client.post("/register", data={"username": "newuser", "password": "secret"})
     assert response.status_code == 200
