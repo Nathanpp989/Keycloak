@@ -7,6 +7,7 @@
 #   - a fresh Keycloak admin token  -> Keycloak Admin API
 #   - the Auth0 M2M token           -> Auth0 Management API
 # They are not interchangeable.
+# Then creaate a username type and then add the username, password and email
 
 from __future__ import annotations
 
@@ -117,7 +118,6 @@ class KeycloakAdminAPI:
         else:
             logger.error("Failed to delete Keycloak user: %d %s", resp.status_code, resp.text)
             resp.raise_for_status()
-
 
 # ──────────────────────────────────────────────
 # Auth0 Management API — user management
