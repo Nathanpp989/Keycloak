@@ -209,13 +209,15 @@ router = APIRouter()
 
 @router.get("/secure-data")
 def read_secure_data(current_user: TokenData = Depends(get_current_user)):
-    """Keycloak-protected endpoint; uses a cached Auth0 M2M token server-side."""
+    """Keycloak-protected endpoint; verifies an Auth0 M2M token is obtainable."""
     try:
-        _auth0_token = get_auth0_token()
+        # Confirm we can obtain an Auth0 M2M token (used for downstream Auth0
+        # calls). Assign to a clearly-named var to signal it's intentionally
+        # fetched here; wire real downstream calls in below.
+        get_auth0_token()
     except HTTPException:
         raise
     except Exception as exc:
         logger.error("Unexpected error obtaining Auth0 token: %s", exc)
         raise HTTPException(status_code=503, detail="Could not reach Auth0")
-    # Use _auth0_token here to call downstream Auth0-protected APIs
     return {"message": "This is secure data", "user": current_user.username}

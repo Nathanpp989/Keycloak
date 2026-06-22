@@ -4,8 +4,6 @@ import stat
 import tempfile
 from contextlib import asynccontextmanager
 
-from argon2 import PasswordHasher
-from argon2.exceptions import HashingError
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
 from fastapi import FastAPI, Depends, HTTPException, Form
@@ -13,6 +11,11 @@ from fastapi.security import HTTPBearer
 from authorize import router as auth0_router, oauth2_scheme
 from keycloak import KeycloakOpenID, KeycloakAdmin
 from keycloak.exceptions import KeycloakAuthenticationError
+
+# User-flow integration (auth0_connect.py / auth0_talk.py / auth0_type.py)
+from auth0_connect import Auth0Connect, get_keycloak_admin_token
+from auth0_talk import KeycloakAdminAPI, Auth0UsersAPI
+from auth0_type import UserManager
 
 # I3 FIX: configure logging before anything else so all logger.* calls produce output
 logging.basicConfig(
@@ -110,10 +113,44 @@ def setup_keycloak():
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 keycloak_oidc: KeycloakOpenID | None = None
+user_manager: UserManager | None = None
+
+def _build_user_manager() -> UserManager | None:
+    """
+    Wire up the UserManager from auth0_type using a fresh Keycloak admin token
+    and an Auth0 M2M client. Returns None (with a warning) if the required
+    Auth0 env vars are missing, so the rest of the app can still start.
+    """
+    keycloak_url = os.environ.get("KEYCLOAK_URL", "http://localhost:8080")
+    realm        = os.environ.get("KEYCLOAK_REALM", "Premkey")
+    admin_user   = os.environ.get("KEYCLOAK_ADMIN_USER", "admin")
+    admin_pass   = os.environ.get("KEYCLOAK_ADMIN_PASSWORD", "admin")
+
+    auth0_domain = os.environ.get("AUTH0_DOMAIN")
+    auth0_id     = os.environ.get("AUTH0_CLIENT_ID")
+    auth0_secret = os.environ.get("AUTH0_CLIENT_SECRET")
+    if not (auth0_domain and auth0_id and auth0_secret):
+        logger.warning(
+            "Auth0 env vars missing — user-management endpoints will be disabled. "
+            "Set AUTH0_DOMAIN, AUTH0_CLIENT_ID, AUTH0_CLIENT_SECRET to enable them."
+        )
+        return None
+
+    # Provide a token-getter so KeycloakAdminAPI always uses a FRESH admin token.
+    # Keycloak admin tokens expire in ~60s, so a one-time token would break the
+    # endpoints a minute after startup.
+    def kc_token_getter() -> str:
+        return get_keycloak_admin_token(keycloak_url, admin_user, admin_pass)
+
+    keycloak_api   = KeycloakAdminAPI(keycloak_url, kc_token_getter, realm)
+    auth0_conn     = Auth0Connect(auth0_domain, auth0_id, auth0_secret)
+    auth0_users    = Auth0UsersAPI(auth0_conn)
+    return UserManager(keycloak_api, auth0_users)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global keycloak_oidc
+    global keycloak_oidc, user_manager
     try:
         init_rsa_keys()
     except Exception as exc:
@@ -130,14 +167,18 @@ async def lifespan(app: FastAPI):
         realm_name="Premkey",
         client_secret_key=os.environ.get("KEYCLOAK_CLIENT_SECRET", "your-client-secret")
     )
+    # Build the user manager; don't let its failure crash the whole app
+    try:
+        user_manager = _build_user_manager()
+    except Exception as exc:
+        logger.error("Could not initialise user manager: %s", exc)
+        user_manager = None
     yield
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(auth0_router)
 
 http_bearer     = HTTPBearer()
-password_hasher = PasswordHasher(time_cost=2, memory_cost=102400, parallelism=8,
-                                  hash_len=32, salt_len=16)
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
@@ -188,13 +229,55 @@ def oidc_login(token: str = Depends(oauth2_scheme)):
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
 
 @app.post("/register")
-def register(username: str = Form(...), password: str = Form(...)):
+def register(
+    email: str = Form(...),
+    password: str = Form(...),
+    username: str | None = Form(default=None),
+):
+    """
+    Register a new user in BOTH Keycloak and Auth0 via the UserManager.
+    If 'username' is omitted, one is derived from the email address.
+    """
+    if user_manager is None:
+        raise HTTPException(
+            status_code=503,
+            detail="User management is unavailable (Auth0 not configured).",
+        )
     try:
-        hashed_password = password_hasher.hash(password)
-    except HashingError:
+        result = user_manager.add_user(email=email, password=password, username=username)
+    except RuntimeError as exc:
+        # Surfaced for things like missing Auth0 scopes
+        logger.error("Registration failed: %s", exc)
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.error("Unexpected registration error: %s", exc)
         raise HTTPException(status_code=500, detail="Registration failed")
-    # Persist username + hashed_password to your database here
-    return {"message": f"User {username} registered successfully!"}
+
+    return {
+        "message": f"User '{result['username']}' registered.",
+        "username": result["username"],
+        "email": result["email"],
+        "keycloak_id": result["keycloak_id"],
+        "auth0_id": result["auth0_id"],
+        "pre_existing": result["pre_existing"],
+    }
+
+@app.get("/users/lookup")
+def users_lookup(username: str, email: str):
+    """Report which system(s) a user already belongs to (keycloak/auth0/both/neither)."""
+    if user_manager is None:
+        raise HTTPException(
+            status_code=503,
+            detail="User management is unavailable (Auth0 not configured).",
+        )
+    try:
+        system = user_manager.determine_user_system(username, email)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.error("User lookup failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Lookup failed")
+    return {"username": username, "email": email, "system": system.value}
 
 @app.get("/keys")
 def get_keys():

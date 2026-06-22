@@ -7,7 +7,6 @@
 #   - a fresh Keycloak admin token  -> Keycloak Admin API
 #   - the Auth0 M2M token           -> Auth0 Management API
 # They are not interchangeable.
-# Then creaate a username type and then add the username, password and email
 
 from __future__ import annotations
 
@@ -38,12 +37,25 @@ def _explain_403(resp: requests.Response, needed_scope: str) -> None:
 # Keycloak Admin API — user management
 # ──────────────────────────────────────────────
 class KeycloakAdminAPI:
-    def __init__(self, keycloak_url: str, admin_token: str, realm: str):
+    def __init__(self, keycloak_url: str, admin_token, realm: str):
+        """
+        admin_token may be either:
+          - a string (a fixed token — simplest, but expires in ~60s), or
+          - a zero-arg callable returning a fresh token string (recommended for
+            long-running apps, since Keycloak admin tokens expire quickly).
+        """
         self.base = keycloak_url.rstrip("/")
         self.realm = realm
-        self.headers = {
+        self._token_source = admin_token
+
+    @property
+    def headers(self) -> dict:
+        # Resolve the token fresh on each access so a long-lived server never
+        # uses an expired admin token (Keycloak tokens live ~60s).
+        token = self._token_source() if callable(self._token_source) else self._token_source
+        return {
             "Content-Type":  "application/json",
-            "Authorization": f"Bearer {admin_token}",
+            "Authorization": f"Bearer {token}",
         }
 
     def _users_url(self, user_id: str | None = None) -> str:
@@ -118,6 +130,7 @@ class KeycloakAdminAPI:
         else:
             logger.error("Failed to delete Keycloak user: %d %s", resp.status_code, resp.text)
             resp.raise_for_status()
+
 
 # ──────────────────────────────────────────────
 # Auth0 Management API — user management
