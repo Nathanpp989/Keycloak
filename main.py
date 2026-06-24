@@ -180,6 +180,23 @@ app.include_router(auth0_router)
 
 http_bearer     = HTTPBearer()
 
+# ── Auth dependency ───────────────────────────────────────────────────────────
+def require_keycloak_auth(credentials=Depends(http_bearer)) -> dict:
+    """
+    FastAPI dependency: validate the bearer token via Keycloak introspection.
+    Returns the token info dict on success; raises 401/503 otherwise.
+    Used to protect endpoints that must only be reachable by authenticated users.
+    """
+    if keycloak_oidc is None:
+        raise HTTPException(status_code=503, detail="Authentication service unavailable")
+    try:
+        token_info = keycloak_oidc.introspect(credentials.credentials)
+    except Exception:
+        raise HTTPException(status_code=503, detail="Authentication service unavailable")
+    if not token_info.get("active"):
+        raise HTTPException(status_code=401, detail="Token is inactive or expired")
+    return token_info
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -203,15 +220,7 @@ def login(username: str = Form(...), password: str = Form(...)):
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
 
 @app.get("/protected")
-def protected_route(credentials=Depends(http_bearer)):
-    if keycloak_oidc is None:
-        raise HTTPException(status_code=503, detail="Authentication service unavailable")
-    try:
-        token_info = keycloak_oidc.introspect(credentials.credentials)
-    except Exception:
-        raise HTTPException(status_code=503, detail="Authentication service unavailable")
-    if not token_info.get("active"):
-        raise HTTPException(status_code=401, detail="Token is inactive or expired")
+def protected_route(token_info: dict = Depends(require_keycloak_auth)):
     return {"message": f"Hello, {token_info.get('preferred_username', 'user')}!"}
 
 @app.post("/oidc-token")
@@ -263,8 +272,16 @@ def register(
     }
 
 @app.get("/users/lookup")
-def users_lookup(username: str, email: str):
-    """Report which system(s) a user already belongs to (keycloak/auth0/both/neither)."""
+def users_lookup(
+    username: str,
+    email: str,
+    token_info: dict = Depends(require_keycloak_auth),
+):
+    """
+    Report which system(s) a user belongs to (keycloak/auth0/both/neither).
+    Protected: requires a valid Keycloak bearer token, because this endpoint
+    reveals whether an account exists (a user-enumeration vector if left open).
+    """
     if user_manager is None:
         raise HTTPException(
             status_code=503,

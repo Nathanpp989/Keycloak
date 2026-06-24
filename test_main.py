@@ -153,30 +153,55 @@ def test_register_unexpected_error_becomes_500(client, monkeypatch):
 
 
 # ──────────────────────────────────────────────
-# /users/lookup  (UserManager.determine_user_system)
+# /users/lookup  (UserManager.determine_user_system) — now AUTH-PROTECTED
 # ──────────────────────────────────────────────
-def test_lookup_unavailable_when_manager_none(client, monkeypatch):
-    monkeypatch.setattr(main, "user_manager", None)
+def _auth_override():
+    """Dependency override that simulates a valid authenticated Keycloak token."""
+    return {"active": True, "preferred_username": "caller"}
+
+def test_lookup_requires_authentication(client, monkeypatch):
+    # No auth override and no keycloak_oidc -> request must be rejected, NOT served.
+    monkeypatch.setattr(main, "keycloak_oidc", None)
+    mgr = MagicMock()
+    monkeypatch.setattr(main, "user_manager", mgr)
     r = client.get("/users/lookup", params={"username": "u", "email": "e@x.com"})
-    assert r.status_code == 503
+    assert r.status_code in (401, 403, 503)
+    # Crucially, the lookup logic must NOT have run for an unauthenticated caller
+    mgr.determine_user_system.assert_not_called()
+
+def test_lookup_unavailable_when_manager_none(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        monkeypatch.setattr(main, "user_manager", None)
+        r = client.get("/users/lookup", params={"username": "u", "email": "e@x.com"})
+        assert r.status_code == 503
+    finally:
+        main.app.dependency_overrides.clear()
 
 def test_lookup_success(client, monkeypatch):
-    # Use the real enum so .value works exactly as in production
     from auth0_type import UserSystem
-    mgr = MagicMock()
-    mgr.determine_user_system.return_value = UserSystem.BOTH
-    monkeypatch.setattr(main, "user_manager", mgr)
-    r = client.get("/users/lookup", params={"username": "u", "email": "e@x.com"})
-    assert r.status_code == 200
-    assert r.json()["system"] == "both"
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        mgr.determine_user_system.return_value = UserSystem.BOTH
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.get("/users/lookup", params={"username": "u", "email": "e@x.com"})
+        assert r.status_code == 200
+        assert r.json()["system"] == "both"
+    finally:
+        main.app.dependency_overrides.clear()
 
 def test_lookup_runtime_error_becomes_502(client, monkeypatch):
-    mgr = MagicMock()
-    mgr.determine_user_system.side_effect = RuntimeError("missing read:users scope")
-    monkeypatch.setattr(main, "user_manager", mgr)
-    r = client.get("/users/lookup", params={"username": "u", "email": "e@x.com"})
-    assert r.status_code == 502
-    assert "read:users" in r.json()["detail"]
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        mgr.determine_user_system.side_effect = RuntimeError("missing read:users scope")
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.get("/users/lookup", params={"username": "u", "email": "e@x.com"})
+        assert r.status_code == 502
+        assert "read:users" in r.json()["detail"]
+    finally:
+        main.app.dependency_overrides.clear()
 
 
 if __name__ == "__main__":

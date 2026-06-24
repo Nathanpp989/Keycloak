@@ -238,7 +238,7 @@ def _make_manager(in_kc: bool, in_a0: bool):
     kc = create_autospec(KeycloakAdminAPI, instance=True)
     a0 = create_autospec(Auth0UsersAPI, instance=True)
     mgr = UserManager(kc, a0)
-    mgr._in_keycloak = lambda username: in_kc
+    mgr._in_keycloak = lambda username, email: in_kc
     mgr._in_auth0 = lambda email: in_a0
     return mgr, kc, a0
 
@@ -288,6 +288,22 @@ def test_add_user_derives_username_when_omitted():
     a0.create_user.return_value = {"user_id": "a0"}
     result = mgr.add_user("derived@example.com", password="pw")
     assert result["username"].startswith("derived-")
+
+@responses.activate
+def test_in_keycloak_checks_email_not_just_username():
+    # N1 regression: _in_keycloak must detect an existing account by EMAIL,
+    # because the derived username carries a random suffix that would never match.
+    users_url = f"{KC_URL}/admin/realms/{REALM}/users"
+    # Email query returns a hit (user exists under this email)
+    responses.add(responses.GET, users_url,
+                  json=[{"id": "u-1", "email": "taken@x.com"}], status=200)
+    kc = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    mgr = UserManager(kc, a0)
+    # A brand-new random username, but the email is already taken
+    assert mgr._in_keycloak("brand-new-9f9f9f", "taken@x.com") is True
+    # The first query must have filtered by email
+    assert "email=taken" in responses.calls[0].request.url
 
 
 # ──────────────────────────────────────────────

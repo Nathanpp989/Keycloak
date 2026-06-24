@@ -60,9 +60,27 @@ class UserManager:
         self.auth0_users = auth0_users
 
     # ── detection ──────────────────────────────────────────────
-    def _in_keycloak(self, username: str) -> bool:
-        # Keycloak supports a username query filter
+    def _in_keycloak(self, username: str, email: str) -> bool:
+        """
+        Check whether a user already exists in Keycloak.
+
+        N1 FIX: match on BOTH username and email. The username passed in is
+        derived with a random suffix, so checking username alone would never
+        detect an existing account for the same email — leading to duplicate
+        Keycloak users on repeated registration. Email is the stable identity.
+        """
         import requests
+        # Email is the stable key; check it first.
+        resp = requests.get(
+            self.keycloak._users_url(),
+            headers=self.keycloak.headers,
+            params={"email": email, "exact": "true"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        if len(resp.json()) > 0:
+            return True
+        # Fall back to an exact username match (covers username-only accounts).
         resp = requests.get(
             self.keycloak._users_url(),
             headers=self.keycloak.headers,
@@ -92,7 +110,7 @@ class UserManager:
 
     def determine_user_system(self, username: str, email: str) -> UserSystem:
         """Detect which system(s) the user already belongs to."""
-        in_kc = self._in_keycloak(username)
+        in_kc = self._in_keycloak(username, email)
         in_a0 = self._in_auth0(email)
         if in_kc and in_a0:
             return UserSystem.BOTH
