@@ -514,6 +514,32 @@ def test_rotate_client_secret_missing_secret_raises():
     with pytest.raises(RuntimeError, match="no client_secret"):
         a.rotate_client_secret("cid")
 
+@responses.activate
+def test_rotate_updates_own_instance_secret():
+    # P1 regression: rotating this instance's own client must update the stored
+    # secret, so a later token refresh uses the new one (not the invalidated old).
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.POST,
+                  f"https://{DOMAIN}/api/v2/clients/cid/rotate-secret",
+                  json={"client_id": "cid", "client_secret": "fresh"}, status=200)
+    a = Auth0Connect(DOMAIN, "cid", "old-secret")
+    _ = a.token  # prime the token cache
+    a.rotate_client_secret("cid")
+    assert a.client_secret == "fresh"  # instance secret was updated
+
+@responses.activate
+def test_rotate_other_client_does_not_touch_instance_secret():
+    # Rotating a DIFFERENT client must NOT change this instance's secret.
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.POST,
+                  f"https://{DOMAIN}/api/v2/clients/other-id/rotate-secret",
+                  json={"client_id": "other-id", "client_secret": "fresh"}, status=200)
+    a = Auth0Connect(DOMAIN, "cid", "my-secret")
+    a.rotate_client_secret("other-id")
+    assert a.client_secret == "my-secret"  # unchanged
+
 
 # ──────────────────────────────────────────────
 # login_flow — broker login URL builder

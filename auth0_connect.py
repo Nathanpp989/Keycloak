@@ -155,8 +155,14 @@ class Auth0Connect:
             raise RuntimeError(
                 f"Secret rotation for client {client_id} returned no client_secret"
             )
+        new_secret = result["client_secret"]
+        # P1 FIX: if we rotated THIS instance's own client, update the stored
+        # secret so a future token refresh (after the cached token expires) uses
+        # the new secret instead of the now-invalid old one.
+        if client_id == self.client_id:
+            self.client_secret = new_secret
         logger.info("Rotated client secret for %s", client_id)
-        return result["client_secret"]
+        return new_secret
 
 
 def test_token_access(auth0: Auth0Connect) -> None:
