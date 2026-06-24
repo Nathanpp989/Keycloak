@@ -140,6 +140,24 @@ class Auth0Connect:
             "callbacks":   callbacks,
         })
 
+    def rotate_client_secret(self, client_id: str) -> str:
+        """
+        Rotate (regenerate) the secret for an Auth0 client.
+        Calls POST /api/v2/clients/{id}/rotate-secret and returns the NEW secret.
+        Requires the 'update:client_keys' scope on the M2M application.
+
+        NOTE: rotating invalidates the old secret immediately. Any service still
+        configured with the old secret (e.g. the Keycloak IdP) must be updated
+        with the returned value, or authentication through it will break.
+        """
+        result = self._api("POST", f"clients/{client_id}/rotate-secret")
+        if not isinstance(result, dict) or not result.get("client_secret"):
+            raise RuntimeError(
+                f"Secret rotation for client {client_id} returned no client_secret"
+            )
+        logger.info("Rotated client secret for %s", client_id)
+        return result["client_secret"]
+
 
 def test_token_access(auth0: Auth0Connect) -> None:
     """Verify the M2M token works against the Auth0 Management API."""

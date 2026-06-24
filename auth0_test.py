@@ -27,6 +27,7 @@ from auth0_connect import (
     integrate_with_keycloak,
     test_login_flow as build_login_url,   # aliased: avoid pytest collecting it as a test
 )
+from login_flow import build_broker_login_url
 from auth0_talk import KeycloakAdminAPI, Auth0UsersAPI
 from auth0_type import (
     UserSystem,
@@ -485,6 +486,57 @@ def test_auth0_delete_user():
     responses.add(responses.DELETE, f"https://{DOMAIN}/api/v2/users/auth0|1", status=204)
     api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
     api.delete_user("auth0|1")  # should not raise
+
+
+# ──────────────────────────────────────────────
+# auth0_connect — rotate_client_secret
+# ──────────────────────────────────────────────
+@responses.activate
+def test_rotate_client_secret_returns_new_secret():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.POST,
+                  f"https://{DOMAIN}/api/v2/clients/cid/rotate-secret",
+                  json={"client_id": "cid", "client_secret": "brand-new-secret"},
+                  status=200)
+    a = Auth0Connect(DOMAIN, "cid", "old-secret")
+    new = a.rotate_client_secret("cid")
+    assert new == "brand-new-secret"
+
+@responses.activate
+def test_rotate_client_secret_missing_secret_raises():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.POST,
+                  f"https://{DOMAIN}/api/v2/clients/cid/rotate-secret",
+                  json={"client_id": "cid"}, status=200)  # no client_secret
+    a = Auth0Connect(DOMAIN, "cid", "old")
+    with pytest.raises(RuntimeError, match="no client_secret"):
+        a.rotate_client_secret("cid")
+
+
+# ──────────────────────────────────────────────
+# login_flow — broker login URL builder
+# ──────────────────────────────────────────────
+def test_build_broker_login_url_includes_idp_hint():
+    url = build_broker_login_url(
+        "http://localhost:8080", "Premkey", "Hello-World-app",
+        "http://localhost:8000/protected",
+    )
+    assert url.startswith("http://localhost:8080/realms/Premkey/protocol/openid-connect/auth?")
+    assert "kc_idp_hint=auth0" in url
+    assert "response_type=code" in url
+    assert "client_id=Hello-World-app" in url
+    # redirect_uri must be URL-encoded
+    assert "redirect_uri=http%3A%2F%2Flocalhost%3A8000%2Fprotected" in url
+
+def test_build_broker_login_url_strips_trailing_slash():
+    url = build_broker_login_url(
+        "http://localhost:8080/", "R", "C", "http://x/cb", idp_alias="auth0",
+    )
+    # No double slash before /realms
+    assert "8080//realms" not in url
+    assert "/realms/R/" in url
 
 
 if __name__ == "__main__":
