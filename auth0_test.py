@@ -5,22 +5,28 @@
 # Run with:   pytest auth0_test.py -v
 # Requires:   pip install pytest responses
 #
-# Note: auth0_connect.py / auth0_talk.py contain helper functions literally
-# named test_token_access / test_login_flow. Pytest would try to collect those
-# as tests. We prevent that in two ways: (1) we never `from x import *`, and
-# (2) a conftest-style collect filter below ignores non-test modules. To keep
-# everything in one file, we simply only define test_* functions here and rely
-# on running `pytest auth0_test.py` (collecting this file only).
+# Only test_* functions are defined here, and we import specific names (never
+# `import *`), so pytest never collects the helper functions named
+# test_token_access / test_login_flow that live in the application modules.
 
 from __future__ import annotations
 
+import json
+import os
 import re
-from unittest.mock import MagicMock
+import tempfile
+from unittest.mock import create_autospec
 
 import pytest
 import responses
 
-from auth0_connect import Auth0Connect, get_keycloak_admin_token
+from auth0_connect import (
+    Auth0Connect,
+    get_keycloak_admin_token,
+    create_server_certificate,
+    integrate_with_keycloak,
+    test_login_flow as build_login_url,   # aliased: avoid pytest collecting it as a test
+)
 from auth0_talk import KeycloakAdminAPI, Auth0UsersAPI
 from auth0_type import (
     UserSystem,
@@ -39,22 +45,23 @@ REALM = "Premkey"
 # ──────────────────────────────────────────────
 def test_derive_username_basic():
     u = derive_username_from_email("John.Doe@example.com")
-    assert u.startswith("john.doe-")
-    # suffix is 6 hex chars
     assert re.fullmatch(r"john\.doe-[0-9a-f]{6}", u)
 
-def test_use_real_username():
-    n = derive_username_from_email("nathan.katzman@premalytics.com")
-    assert n.startswith("nathan")
-
 def test_derive_username_sanitises_plus_and_symbols():
+    # T6 FIX: assert the exact sanitised stem, not a loose 'or'
     u = derive_username_from_email("a+b!c@example.com")
-    assert u.startswith("a-b-c-") or u.startswith("a-b-c")
+    stem = u.rsplit("-", 1)[0]            # strip the random hex suffix
+    assert stem == "a-b-c"
     assert "+" not in u and "!" not in u
 
 def test_derive_username_rejects_non_email():
     with pytest.raises(ValueError):
         derive_username_from_email("not-an-email")
+
+def test_derive_username_empty_local_part_falls_back():
+    # '@example.com' has an empty local part -> should fall back to 'user'
+    u = derive_username_from_email("@example.com")
+    assert u.startswith("user-")
 
 def test_generate_password_is_strong():
     pw = generate_password()
@@ -65,7 +72,7 @@ def test_generate_password_is_strong():
 def test_usernames_are_unique():
     a = derive_username_from_email("same@example.com")
     b = derive_username_from_email("same@example.com")
-    assert a != b  # random suffix prevents collision
+    assert a != b
 
 
 # ──────────────────────────────────────────────
@@ -73,57 +80,58 @@ def test_usernames_are_unique():
 # ──────────────────────────────────────────────
 @responses.activate
 def test_auth0_token_fetch_and_cache():
-    responses.add(
-        responses.POST,
-        f"https://{DOMAIN}/oauth/token",
-        json={"access_token": "tok-123", "expires_in": 86400},
-        status=200,
-    )
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "tok-123", "expires_in": 86400}, status=200)
     a = Auth0Connect(DOMAIN, "cid", "secret")
     assert a.token == "tok-123"
-    # Second access should reuse the cached token (no second HTTP call)
     assert a.token == "tok-123"
     assert len(responses.calls) == 1  # cached, not re-fetched
 
 @responses.activate
 def test_auth0_token_missing_access_token_raises():
-    responses.add(
-        responses.POST,
-        f"https://{DOMAIN}/oauth/token",
-        json={"not_a_token": "x"},
-        status=200,
-    )
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"not_a_token": "x"}, status=200)
     a = Auth0Connect(DOMAIN, "cid", "secret")
     with pytest.raises(RuntimeError, match="missing access_token"):
         _ = a.token
 
 @responses.activate
-def test_auth0_create_connection_get_or_create():
-    # token
+def test_auth0_token_non_200_raises():
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                json={"access_token": "t", "expires_in": 999}, status=200)
-    # existing connections list (empty) -> triggers a create
+                  json={"error": "access_denied"}, status=401)
+    a = Auth0Connect(DOMAIN, "cid", "secret")
+    with pytest.raises(RuntimeError, match="401"):
+        _ = a.token
+
+@responses.activate
+def test_auth0_create_connection_get_or_create():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
     responses.add(responses.GET, f"https://{DOMAIN}/api/v2/connections",
-                json=[], status=200)
+                  json=[], status=200)
     responses.add(responses.POST, f"https://{DOMAIN}/api/v2/connections",
-                json={"name": "keycloak-google-oauth2", "strategy": "google-oauth2"},
-                status=201)
+                  json={"name": "keycloak-google-oauth2", "strategy": "google-oauth2"},
+                  status=201)
     a = Auth0Connect(DOMAIN, "cid", "secret")
     result = a.create_connection("keycloak-google-oauth2", "google-oauth2")
     assert result["name"] == "keycloak-google-oauth2"
+    # A POST to /connections must have happened
+    assert any(c.request.method == "POST" and "/connections" in c.request.url
+               for c in responses.calls)
 
 @responses.activate
 def test_auth0_create_connection_reuses_existing():
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                json={"access_token": "t", "expires_in": 999}, status=200)
+                  json={"access_token": "t", "expires_in": 999}, status=200)
     responses.add(responses.GET, f"https://{DOMAIN}/api/v2/connections",
-                json=[{"name": "keycloak-google-oauth2", "id": "con_1"}], status=200)
+                  json=[{"name": "keycloak-google-oauth2", "id": "con_1"}], status=200)
     a = Auth0Connect(DOMAIN, "cid", "secret")
     result = a.create_connection("keycloak-google-oauth2", "google-oauth2")
     assert result["id"] == "con_1"
-    # No POST should have happened (reused existing)
-    assert not any(c.request.method == "POST" and c.request.url.endswith("/connections")
-                for c in responses.calls)
+    # T3 FIX: robust check — no POST to the connections collection at all
+    posted = [c for c in responses.calls
+              if c.request.method == "POST" and "/api/v2/connections" in c.request.url]
+    assert posted == []
 
 
 # ──────────────────────────────────────────────
@@ -131,23 +139,16 @@ def test_auth0_create_connection_reuses_existing():
 # ──────────────────────────────────────────────
 @responses.activate
 def test_get_keycloak_admin_token():
-    responses.add(
-        responses.POST,
-        f"{KC_URL}/realms/master/protocol/openid-connect/token",
-        json={"access_token": "kc-admin-tok"},
-        status=200,
-    )
-    tok = get_keycloak_admin_token(KC_URL, "admin", "admin")
-    assert tok == "kc-admin-tok"
+    responses.add(responses.POST,
+                  f"{KC_URL}/realms/master/protocol/openid-connect/token",
+                  json={"access_token": "kc-admin-tok"}, status=200)
+    assert get_keycloak_admin_token(KC_URL, "admin", "admin") == "kc-admin-tok"
 
 @responses.activate
 def test_get_keycloak_admin_token_bad_creds():
-    responses.add(
-        responses.POST,
-        f"{KC_URL}/realms/master/protocol/openid-connect/token",
-        json={"error": "invalid_grant"},
-        status=401,
-    )
+    responses.add(responses.POST,
+                  f"{KC_URL}/realms/master/protocol/openid-connect/token",
+                  json={"error": "invalid_grant"}, status=401)
     with pytest.raises(RuntimeError, match="401"):
         get_keycloak_admin_token(KC_URL, "admin", "wrong")
 
@@ -158,13 +159,10 @@ def test_get_keycloak_admin_token_bad_creds():
 @responses.activate
 def test_keycloak_create_user_returns_id_from_location():
     users_url = f"{KC_URL}/admin/realms/{REALM}/users"
-    responses.add(
-        responses.POST, users_url, status=201,
-        headers={"Location": f"{users_url}/abc-123"},
-    )
+    responses.add(responses.POST, users_url, status=201,
+                  headers={"Location": f"{users_url}/abc-123"})
     api = KeycloakAdminAPI(KC_URL, "static-token", REALM)
-    uid = api.create_user("alice", "alice@example.com", "pw")
-    assert uid == "abc-123"
+    assert api.create_user("alice", "alice@example.com", "pw") == "abc-123"
 
 @responses.activate
 def test_keycloak_create_user_conflict_returns_none():
@@ -172,6 +170,26 @@ def test_keycloak_create_user_conflict_returns_none():
     responses.add(responses.POST, users_url, status=409)
     api = KeycloakAdminAPI(KC_URL, "static-token", REALM)
     assert api.create_user("alice", "alice@example.com", "pw") is None
+
+@responses.activate
+def test_keycloak_update_user_read_modify_write():
+    # T4 FIX: cover the read-modify-write path of update_user.
+    user_url = f"{KC_URL}/admin/realms/{REALM}/users/u-1"
+    # First the GET (read) returns the existing representation
+    responses.add(responses.GET, user_url,
+                  json={"id": "u-1", "username": "alice", "email": "old@x.com",
+                        "enabled": True}, status=200)
+    # Then the PUT (write) succeeds
+    responses.add(responses.PUT, user_url, status=204)
+    api = KeycloakAdminAPI(KC_URL, "static-token", REALM)
+    api.update_user("u-1", email="new@x.com")
+    # The PUT body must contain the merged representation: original fields kept,
+    # email overwritten.
+    put_call = [c for c in responses.calls if c.request.method == "PUT"][0]
+    body = json.loads(put_call.request.body)
+    assert body["username"] == "alice"      # preserved
+    assert body["email"] == "new@x.com"     # updated
+    assert body["enabled"] is True          # preserved
 
 def test_keycloak_admin_api_token_getter_refreshes():
     # K1 regression test: a callable token source must refresh each request
@@ -194,32 +212,34 @@ def test_keycloak_admin_api_accepts_static_string():
 @responses.activate
 def test_auth0_users_list():
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                json={"access_token": "t", "expires_in": 999}, status=200)
+                  json={"access_token": "t", "expires_in": 999}, status=200)
     responses.add(responses.GET, f"https://{DOMAIN}/api/v2/users",
-    api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec")))
+                  json=[{"email": "a@x.com"}, {"email": "b@x.com"}], status=200)
+    api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
     assert len(api.list_users()) == 2
 
 @responses.activate
 def test_auth0_users_list_403_gives_clear_message():
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                json={"access_token": "t", "expires_in": 999}, status=200)
+                  json={"access_token": "t", "expires_in": 999}, status=200)
     responses.add(responses.GET, f"https://{DOMAIN}/api/v2/users",
-                json={"error": "Forbidden"}, status=403)
+                  json={"error": "Forbidden"}, status=403)
     api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
     with pytest.raises(RuntimeError, match="read:users"):
         api.list_users()
 
 
 # ──────────────────────────────────────────────
-# auth0_type — UserManager (mock the two API objects directly)
+# auth0_type — UserManager
+# T1 FIX: use create_autospec so calls are validated against REAL signatures.
+# Wrong-arity calls now fail the test instead of silently passing.
 # ──────────────────────────────────────────────
 def _make_manager(in_kc: bool, in_a0: bool):
-    kc = MagicMock(spec=KeycloakAdminAPI)
-    a0 = MagicMock(spec=Auth0UsersAPI)
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
     mgr = UserManager(kc, a0)
-    # Patch the private detection helpers to avoid HTTP
-    mgr._in_keycloak = MagicMock(return_value=in_kc)
-    mgr._in_auth0 = MagicMock(return_value=in_a0)
+    mgr._in_keycloak = lambda username: in_kc
+    mgr._in_auth0 = lambda email: in_a0
     return mgr, kc, a0
 
 def test_determine_user_system_both():
@@ -234,6 +254,10 @@ def test_determine_user_system_keycloak_only():
     mgr, _, _ = _make_manager(True, False)
     assert mgr.determine_user_system("u", "e@x.com") == UserSystem.KEYCLOAK
 
+def test_determine_user_system_auth0_only():
+    mgr, _, _ = _make_manager(False, True)
+    assert mgr.determine_user_system("u", "e@x.com") == UserSystem.AUTH0
+
 def test_add_user_creates_in_both_when_neither_exists():
     mgr, kc, a0 = _make_manager(False, False)
     kc.create_user.return_value = "kc-id-1"
@@ -242,13 +266,19 @@ def test_add_user_creates_in_both_when_neither_exists():
     assert result["keycloak_id"] == "kc-id-1"
     assert result["auth0_id"] == "auth0|abc"
     assert result["pre_existing"] == "neither"
-    kc.create_user.assert_called_once()
-    a0.create_user.assert_called_once()
+    # T1 FIX: assert the EXACT call arguments, not just that it was called
+    kc.create_user.assert_called_once_with("newuser", "new@example.com", "pw")
+    a0.create_user.assert_called_once_with("new@example.com", "pw")
 
 def test_add_user_skips_systems_where_user_exists():
     mgr, kc, a0 = _make_manager(True, True)
     result = mgr.add_user("new@example.com", password="pw", username="newuser")
     assert result["pre_existing"] == "both"
+    # T2 FIX: verify the summary is still well-formed even when nothing is created
+    assert result["username"] == "newuser"
+    assert result["email"] == "new@example.com"
+    assert result["keycloak_id"] is None
+    assert result["auth0_id"] is None
     kc.create_user.assert_not_called()
     a0.create_user.assert_not_called()
 
@@ -258,6 +288,187 @@ def test_add_user_derives_username_when_omitted():
     a0.create_user.return_value = {"user_id": "a0"}
     result = mgr.add_user("derived@example.com", password="pw")
     assert result["username"].startswith("derived-")
+
+
+# ──────────────────────────────────────────────
+# auth0_connect — create_client secret-refetch path
+# ──────────────────────────────────────────────
+@responses.activate
+def test_auth0_create_client_new():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.GET, f"https://{DOMAIN}/api/v2/clients",
+                  json=[], status=200)
+    responses.add(responses.POST, f"https://{DOMAIN}/api/v2/clients",
+                  json={"client_id": "new-id", "client_secret": "new-sec"}, status=201)
+    a = Auth0Connect(DOMAIN, "cid", "sec")
+    result = a.create_client("my-app", ["http://localhost/cb"])
+    assert result["client_id"] == "new-id"
+    assert result["client_secret"] == "new-sec"
+
+@responses.activate
+def test_auth0_create_client_refetches_secret_when_existing():
+    # Regression for the documented bug: GET /clients omits client_secret, so an
+    # existing client must be re-fetched individually to obtain the secret.
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    # List (no secret present)
+    responses.add(responses.GET, f"https://{DOMAIN}/api/v2/clients",
+                  json=[{"name": "my-app", "client_id": "exist-id"}], status=200)
+    # Single-client fetch (includes secret)
+    responses.add(responses.GET, f"https://{DOMAIN}/api/v2/clients/exist-id",
+                  json={"client_id": "exist-id", "client_secret": "real-sec"}, status=200)
+    a = Auth0Connect(DOMAIN, "cid", "sec")
+    result = a.create_client("my-app", ["http://localhost/cb"])
+    assert result["client_secret"] == "real-sec"
+    # And it must NOT have POSTed a new client
+    assert not any(c.request.method == "POST" and c.request.url.endswith("/api/v2/clients")
+                   for c in responses.calls)
+
+
+# ──────────────────────────────────────────────
+# auth0_connect — login URL builder (test_login_flow)
+# ──────────────────────────────────────────────
+def test_build_login_url_encodes_redirect():
+    a = Auth0Connect(DOMAIN, "cid", "sec")
+    url = build_login_url(a, "http://localhost:8080/callback")
+    assert url.startswith(f"https://{DOMAIN}/authorize?")
+    assert "response_type=code" in url
+    assert "client_id=cid" in url
+    # redirect_uri must be percent-encoded
+    assert "redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcallback" in url
+    assert "scope=openid%20profile%20email" in url
+
+
+# ──────────────────────────────────────────────
+# auth0_connect — self-signed certificate generation
+# ──────────────────────────────────────────────
+def test_create_server_certificate_writes_files_with_600_key():
+    with tempfile.TemporaryDirectory() as d:
+        cert_path = os.path.join(d, "s.crt")
+        key_path = os.path.join(d, "s.key")
+        c, k = create_server_certificate("example.com", cert_path, key_path)
+        assert os.path.exists(c) and os.path.exists(k)
+        # Cert is PEM
+        with open(c, "rb") as f:
+            assert b"BEGIN CERTIFICATE" in f.read()
+        # Private key file must be 0600 (owner read/write only)
+        assert oct(os.stat(k).st_mode)[-3:] == "600"
+
+
+# ──────────────────────────────────────────────
+# auth0_connect — integrate_with_keycloak status handling
+# ──────────────────────────────────────────────
+def _auth0_for_kc():
+    # No token endpoint needed: integrate_with_keycloak only reads auth0.domain
+    return Auth0Connect(DOMAIN, "cid", "sec")
+
+@responses.activate
+def test_integrate_with_keycloak_created():
+    url = f"{KC_URL}/admin/realms/{REALM}/identity-provider/instances"
+    responses.add(responses.POST, url, status=201)
+    integrate_with_keycloak(_auth0_for_kc(), KC_URL, REALM, "kc-tok", "oid", "osec")
+    assert len(responses.calls) == 1
+
+@responses.activate
+def test_integrate_with_keycloak_conflict_is_ok():
+    url = f"{KC_URL}/admin/realms/{REALM}/identity-provider/instances"
+    responses.add(responses.POST, url, status=409)
+    # 409 should be treated as success (idempotent re-run) — no exception
+    integrate_with_keycloak(_auth0_for_kc(), KC_URL, REALM, "kc-tok", "oid", "osec")
+
+@responses.activate
+def test_integrate_with_keycloak_falls_back_to_legacy_path():
+    modern = f"{KC_URL}/admin/realms/{REALM}/identity-provider/instances"
+    legacy = f"{KC_URL}/auth/admin/realms/{REALM}/identity-provider/instances"
+    responses.add(responses.POST, modern, status=404)   # modern path missing
+    responses.add(responses.POST, legacy, status=201)   # legacy path works
+    integrate_with_keycloak(_auth0_for_kc(), KC_URL, REALM, "kc-tok", "oid", "osec")
+    assert len(responses.calls) == 2  # tried modern, then legacy
+
+@responses.activate
+def test_integrate_with_keycloak_realm_not_found():
+    modern = f"{KC_URL}/admin/realms/{REALM}/identity-provider/instances"
+    legacy = f"{KC_URL}/auth/admin/realms/{REALM}/identity-provider/instances"
+    responses.add(responses.POST, modern, status=404)
+    responses.add(responses.POST, legacy, status=404)
+    with pytest.raises(RuntimeError, match="not found"):
+        integrate_with_keycloak(_auth0_for_kc(), KC_URL, REALM, "kc-tok", "oid", "osec")
+
+
+# ──────────────────────────────────────────────
+# auth0_talk — remaining KeycloakAdminAPI methods
+# ──────────────────────────────────────────────
+@responses.activate
+def test_keycloak_read_user():
+    url = f"{KC_URL}/admin/realms/{REALM}/users/u-9"
+    responses.add(responses.GET, url, json={"id": "u-9", "username": "bob"}, status=200)
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    assert api.read_user("u-9")["username"] == "bob"
+
+@responses.activate
+def test_keycloak_list_users_passes_pagination_params():
+    url = f"{KC_URL}/admin/realms/{REALM}/users"
+    responses.add(responses.GET, url, json=[{"id": "1"}], status=200)
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    api.list_users(first=10, max_results=25)
+    q = responses.calls[0].request.url
+    assert "first=10" in q and "max=25" in q
+
+@responses.activate
+def test_keycloak_delete_user():
+    url = f"{KC_URL}/admin/realms/{REALM}/users/u-3"
+    responses.add(responses.DELETE, url, status=204)
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    api.delete_user("u-3")  # should not raise
+
+@responses.activate
+def test_keycloak_delete_user_error_raises():
+    url = f"{KC_URL}/admin/realms/{REALM}/users/u-3"
+    responses.add(responses.DELETE, url, status=500)
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    with pytest.raises(Exception):
+        api.delete_user("u-3")
+
+
+# ──────────────────────────────────────────────
+# auth0_talk — remaining Auth0UsersAPI methods
+# ──────────────────────────────────────────────
+@responses.activate
+def test_auth0_create_user():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.POST, f"https://{DOMAIN}/api/v2/users",
+                  json={"user_id": "auth0|new"}, status=201)
+    api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    assert api.create_user("x@y.com", "pw")["user_id"] == "auth0|new"
+
+@responses.activate
+def test_auth0_create_user_403_names_scope():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.POST, f"https://{DOMAIN}/api/v2/users",
+                  json={"error": "Forbidden"}, status=403)
+    api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    with pytest.raises(RuntimeError, match="create:users"):
+        api.create_user("x@y.com", "pw")
+
+@responses.activate
+def test_auth0_update_user():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.PATCH, f"https://{DOMAIN}/api/v2/users/auth0|1",
+                  json={"user_id": "auth0|1", "name": "New"}, status=200)
+    api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    assert api.update_user("auth0|1", name="New")["name"] == "New"
+
+@responses.activate
+def test_auth0_delete_user():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.DELETE, f"https://{DOMAIN}/api/v2/users/auth0|1", status=204)
+    api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    api.delete_user("auth0|1")  # should not raise
 
 
 if __name__ == "__main__":

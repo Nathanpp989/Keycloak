@@ -296,9 +296,14 @@ def integrate_with_keycloak(
         if response.status_code == 409:
             logger.info("Auth0 IdP already exists in Keycloak; skipping creation")
             return
-        if response.status_code == 404 and path_prefix == "/admin/realms":
+        if response.status_code == 404:
+            # Modern path 404 -> try legacy path. Legacy path 404 -> realm
+            # genuinely missing; record and let the loop fall through to the
+            # clear "realm not found" message below.
             last_error = response.text
-            continue
+            if path_prefix == "/admin/realms":
+                continue
+            break
         raise RuntimeError(
             f"Keycloak IdP registration returned {response.status_code}: {response.text}"
         )
@@ -355,7 +360,7 @@ if __name__ == "__main__":
     realm_name          = os.environ.get("KEYCLOAK_REALM", "Premkey")
     keycloak_callback   = os.environ.get(
         "KEYCLOAK_REDIRECT_URI",
-        f"http://localhost:8080/realms/Premkey/broker/auth0/endpoint",
+        f"http://localhost:8080/realms/{realm_name}/broker/auth0/endpoint",
     )
 
     auth0 = Auth0Connect(env["AUTH0_DOMAIN"], env["AUTH0_CLIENT_ID"], env["AUTH0_CLIENT_SECRET"])

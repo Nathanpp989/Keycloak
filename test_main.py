@@ -1,0 +1,184 @@
+# test_main.py
+# Endpoint tests for main.py using FastAPI's TestClient.
+#
+# The app's lifespan reaches out to Keycloak/Auth0 on startup, so we DON'T run
+# it. Instead we import the app, bypass the lifespan, and monkeypatch the
+# module-level globals (keycloak_oidc, user_manager, public_pem) that the
+# endpoints read. This isolates each route's logic from any live services.
+#
+# Run with:   pytest test_main.py -v
+# Requires:   pip install pytest fastapi httpx
+
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+from unittest.mock import MagicMock
+
+import pytest
+from fastapi.testclient import TestClient
+
+import main
+
+
+# Replace the real lifespan with a no-op so importing the app for tests does
+# not try to contact Keycloak/Auth0. We patch globals per-test instead.
+@asynccontextmanager
+async def _noop_lifespan(app):
+    yield
+
+
+@pytest.fixture
+def client(monkeypatch):
+    monkeypatch.setattr(main.app.router, "lifespan_context", _noop_lifespan)
+    with TestClient(main.app) as c:
+        yield c
+
+
+# ──────────────────────────────────────────────
+# Static / always-on endpoints
+# ──────────────────────────────────────────────
+def test_root(client):
+    r = client.get("/")
+    assert r.status_code == 200
+    assert r.json() == {"message": "Hello, World!"}
+
+def test_hello(client):
+    r = client.get("/hello", params={"email": "a@x.com", "username": "alice"})
+    assert r.status_code == 200
+    assert r.json() == {"email": "a@x.com", "username": "alice"}
+
+def test_keys_uninitialised_returns_503(client, monkeypatch):
+    monkeypatch.setattr(main, "public_pem", b"")
+    r = client.get("/keys")
+    assert r.status_code == 503
+
+def test_keys_initialised(client, monkeypatch):
+    monkeypatch.setattr(main, "public_pem", b"PEMDATA")
+    r = client.get("/keys")
+    assert r.status_code == 200
+    assert r.json() == {"public_key": "PEMDATA"}
+
+
+# ──────────────────────────────────────────────
+# /token  (Keycloak login)
+# ──────────────────────────────────────────────
+def test_token_service_unavailable_when_oidc_none(client, monkeypatch):
+    monkeypatch.setattr(main, "keycloak_oidc", None)
+    r = client.post("/token", data={"username": "u", "password": "p"})
+    assert r.status_code == 503
+
+def test_token_success(client, monkeypatch):
+    fake = MagicMock()
+    fake.token.return_value = {"access_token": "abc"}
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.post("/token", data={"username": "u", "password": "p"})
+    assert r.status_code == 200
+    assert r.json() == {"access_token": "abc", "token_type": "bearer"}
+
+def test_token_invalid_credentials(client, monkeypatch):
+    from keycloak.exceptions import KeycloakAuthenticationError
+    fake = MagicMock()
+    fake.token.side_effect = KeycloakAuthenticationError("bad")
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.post("/token", data={"username": "u", "password": "wrong"})
+    assert r.status_code == 401
+
+
+# ──────────────────────────────────────────────
+# /protected  (Keycloak introspection)
+# ──────────────────────────────────────────────
+def test_protected_active_token(client, monkeypatch):
+    fake = MagicMock()
+    fake.introspect.return_value = {"active": True, "preferred_username": "bob"}
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.get("/protected", headers={"Authorization": "Bearer good"})
+    assert r.status_code == 200
+    assert "bob" in r.json()["message"]
+
+def test_protected_inactive_token(client, monkeypatch):
+    fake = MagicMock()
+    fake.introspect.return_value = {"active": False}
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.get("/protected", headers={"Authorization": "Bearer stale"})
+    assert r.status_code == 401
+
+def test_protected_requires_credentials(client, monkeypatch):
+    fake = MagicMock()
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.get("/protected")  # no Authorization header
+    # HTTPBearer returns 401 when the Authorization header is absent
+    assert r.status_code == 401
+
+
+# ──────────────────────────────────────────────
+# /register  (UserManager.add_user)
+# ──────────────────────────────────────────────
+def test_register_unavailable_when_manager_none(client, monkeypatch):
+    monkeypatch.setattr(main, "user_manager", None)
+    r = client.post("/register", data={"email": "a@x.com", "password": "pw"})
+    assert r.status_code == 503
+
+def test_register_success(client, monkeypatch):
+    mgr = MagicMock()
+    mgr.add_user.return_value = {
+        "username": "alice-ab12cd",
+        "email": "alice@x.com",
+        "keycloak_id": "kc-1",
+        "auth0_id": "auth0|1",
+        "pre_existing": "neither",
+    }
+    monkeypatch.setattr(main, "user_manager", mgr)
+    r = client.post("/register", data={"email": "alice@x.com", "password": "pw"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["username"] == "alice-ab12cd"
+    assert body["keycloak_id"] == "kc-1"
+    assert body["auth0_id"] == "auth0|1"
+    mgr.add_user.assert_called_once_with(email="alice@x.com", password="pw", username=None)
+
+def test_register_runtime_error_becomes_502(client, monkeypatch):
+    mgr = MagicMock()
+    mgr.add_user.side_effect = RuntimeError("missing read:users scope")
+    monkeypatch.setattr(main, "user_manager", mgr)
+    r = client.post("/register", data={"email": "a@x.com", "password": "pw"})
+    assert r.status_code == 502
+    assert "read:users" in r.json()["detail"]
+
+def test_register_unexpected_error_becomes_500(client, monkeypatch):
+    mgr = MagicMock()
+    mgr.add_user.side_effect = ValueError("boom")
+    monkeypatch.setattr(main, "user_manager", mgr)
+    r = client.post("/register", data={"email": "a@x.com", "password": "pw"})
+    assert r.status_code == 500
+
+
+# ──────────────────────────────────────────────
+# /users/lookup  (UserManager.determine_user_system)
+# ──────────────────────────────────────────────
+def test_lookup_unavailable_when_manager_none(client, monkeypatch):
+    monkeypatch.setattr(main, "user_manager", None)
+    r = client.get("/users/lookup", params={"username": "u", "email": "e@x.com"})
+    assert r.status_code == 503
+
+def test_lookup_success(client, monkeypatch):
+    # Use the real enum so .value works exactly as in production
+    from auth0_type import UserSystem
+    mgr = MagicMock()
+    mgr.determine_user_system.return_value = UserSystem.BOTH
+    monkeypatch.setattr(main, "user_manager", mgr)
+    r = client.get("/users/lookup", params={"username": "u", "email": "e@x.com"})
+    assert r.status_code == 200
+    assert r.json()["system"] == "both"
+
+def test_lookup_runtime_error_becomes_502(client, monkeypatch):
+    mgr = MagicMock()
+    mgr.determine_user_system.side_effect = RuntimeError("missing read:users scope")
+    monkeypatch.setattr(main, "user_manager", mgr)
+    r = client.get("/users/lookup", params={"username": "u", "email": "e@x.com"})
+    assert r.status_code == 502
+    assert "read:users" in r.json()["detail"]
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(pytest.main([__file__, "-v"]))
