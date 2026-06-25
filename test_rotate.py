@@ -55,11 +55,15 @@ def test_rotate_and_sync_end_to_end():
     responses.add(responses.POST,
                   f"https://{DOMAIN}/api/v2/clients/cid/rotate-secret",
                   json={"client_id": "cid", "client_secret": "rotated-xyz"}, status=200)
-    # Keycloak IdP GET + PUT
+    # Keycloak IdP GET (read for update) + PUT + GET (read for verify)
     idp_url = f"{KC_URL}/admin/realms/{REALM}/identity-provider/instances/auth0"
-    responses.add(responses.GET, idp_url,
+    # responses consumes registered responses in order:
+    responses.add(responses.GET, idp_url,                       # read-modify-write read
                   json={"alias": "auth0", "config": {"clientSecret": "old"}}, status=200)
     responses.add(responses.PUT, idp_url, status=204)
+    responses.add(responses.GET, idp_url,                       # verification read
+                  json={"alias": "auth0", "config": {"clientSecret": "rotated-xyz"}},
+                  status=200)
 
     auth0 = Auth0Connect(DOMAIN, "cid", "old-secret")
     new = rotate_and_sync(auth0, KC_URL, REALM, "kc-tok", update_env=False)
@@ -67,6 +71,24 @@ def test_rotate_and_sync_end_to_end():
     # Confirm Keycloak got the rotated secret
     put_call = [c for c in responses.calls if c.request.method == "PUT"][0]
     assert json.loads(put_call.request.body)["config"]["clientSecret"] == "rotated-xyz"
+
+
+@responses.activate
+def test_verify_keycloak_idp_secret_match():
+    from rotate_secret import verify_keycloak_idp_secret
+    idp_url = f"{KC_URL}/admin/realms/{REALM}/identity-provider/instances/auth0"
+    responses.add(responses.GET, idp_url,
+                  json={"config": {"clientSecret": "abc"}}, status=200)
+    assert verify_keycloak_idp_secret(KC_URL, REALM, "tok", "auth0", "abc") is True
+
+@responses.activate
+def test_verify_keycloak_idp_secret_masked_returns_false():
+    # Keycloak masks the secret on read -> cannot positively verify -> False
+    from rotate_secret import verify_keycloak_idp_secret
+    idp_url = f"{KC_URL}/admin/realms/{REALM}/identity-provider/instances/auth0"
+    responses.add(responses.GET, idp_url,
+                  json={"config": {"clientSecret": "**********"}}, status=200)
+    assert verify_keycloak_idp_secret(KC_URL, REALM, "tok", "auth0", "abc") is False
 
 
 if __name__ == "__main__":

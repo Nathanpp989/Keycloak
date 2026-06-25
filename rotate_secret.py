@@ -87,6 +87,36 @@ def update_keycloak_idp_secret(
     )
 
 
+def verify_keycloak_idp_secret(
+    keycloak_url: str,
+    realm_name: str,
+    admin_token: str,
+    alias: str,
+    expected_secret: str,
+) -> bool:
+    """
+    Read back the IdP config and confirm its clientSecret matches expected.
+    Note: Keycloak may mask the secret in GET responses (returning '**********'),
+    in which case we cannot positively confirm and return False to signal
+    'unverifiable' rather than 'wrong'.
+    """
+    base = keycloak_url.rstrip("/")
+    for prefix in ("/admin/realms", "/auth/admin/realms"):
+        url = f"{base}{prefix}/{realm_name}/identity-provider/instances/{alias}"
+        headers = {"authorization": f"Bearer {admin_token}"}
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+        except requests.RequestException:
+            return False
+        if resp.status_code == 404 and prefix == "/admin/realms":
+            continue
+        if not resp.ok:
+            return False
+        stored = resp.json().get("config", {}).get("clientSecret", "")
+        return stored == expected_secret
+    return False
+
+
 def rotate_and_sync(
     auth0: Auth0Connect,
     keycloak_url: str,
@@ -98,13 +128,46 @@ def rotate_and_sync(
     """
     Rotate the Auth0 client secret, then update the Keycloak IdP (and optionally
     the local .env) with the new value. Returns the new secret.
+
+    IMPORTANT — about "dual secret" / zero-downtime:
+    Auth0's client_secret model allows only ONE active secret per application;
+    rotating invalidates the old secret immediately. There is therefore an
+    unavoidable brief window between the Auth0 rotation and the Keycloak update
+    during which brokered logins through this IdP would fail.
+
+    This function minimises and validates that window:
+      1. Rotate the Auth0 secret.
+      2. Immediately push the new secret to Keycloak (no work in between).
+      3. Verify Keycloak accepted it (best-effort; Keycloak may mask the value).
+      4. Only then update the local .env.
+
+    For TRUE zero-downtime you need either a standby second Auth0 application
+    (swap the IdP to it, rotate the idle one) or Auth0's private-key-JWT client
+    authentication with multiple keys — both are larger architectural changes
+    documented in the README.
     """
+    # 1. Rotate at Auth0 (old secret dies here)
     new_secret = auth0.rotate_client_secret(auth0.client_id)
 
+    # 2. Push to Keycloak immediately to close the window as fast as possible
     update_keycloak_idp_secret(
         keycloak_url, realm_name, keycloak_admin_token, idp_alias, new_secret
     )
 
+    # 3. Best-effort verification that Keycloak holds the new secret
+    if verify_keycloak_idp_secret(
+        keycloak_url, realm_name, keycloak_admin_token, idp_alias, new_secret
+    ):
+        logger.info("Verified Keycloak IdP '%s' holds the new secret", idp_alias)
+    else:
+        # Keycloak commonly masks secrets on read, so this is a soft warning,
+        # not a hard failure — the PUT in step 2 already returned success.
+        logger.warning(
+            "Could not positively verify the Keycloak IdP secret (Keycloak may "
+            "mask it on read). The update PUT succeeded; verify a login manually."
+        )
+
+    # 4. Persist locally last, so .env only changes after Keycloak is updated
     if update_env and _HAVE_DOTENV:
         env_path = os.environ.get("DOTENV_PATH", ".env")
         if os.path.exists(env_path):
