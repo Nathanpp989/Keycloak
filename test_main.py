@@ -109,6 +109,46 @@ def test_protected_requires_credentials(client, monkeypatch):
     # HTTPBearer returns 401 when the Authorization header is absent
     assert r.status_code == 401
 
+def test_protected_introspect_returns_none(client, monkeypatch):
+    # P2 regression: introspect returning None must yield 401, not an unhandled 500
+    fake = MagicMock()
+    fake.introspect.return_value = None
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.get("/protected", headers={"Authorization": "Bearer x"})
+    assert r.status_code == 401
+
+
+# ──────────────────────────────────────────────
+# /oidc-token  (Keycloak introspection via OAuth2 scheme)
+# ──────────────────────────────────────────────
+def test_oidc_token_unavailable_when_oidc_none(client, monkeypatch):
+    monkeypatch.setattr(main, "keycloak_oidc", None)
+    r = client.post("/oidc-token", headers={"Authorization": "Bearer x"})
+    assert r.status_code == 503
+
+def test_oidc_token_active(client, monkeypatch):
+    fake = MagicMock()
+    fake.introspect.return_value = {"active": True, "preferred_username": "carol"}
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.post("/oidc-token", headers={"Authorization": "Bearer good"})
+    assert r.status_code == 200
+    assert "carol" in r.json()["message"]
+
+def test_oidc_token_inactive(client, monkeypatch):
+    fake = MagicMock()
+    fake.introspect.return_value = {"active": False}
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.post("/oidc-token", headers={"Authorization": "Bearer stale"})
+    assert r.status_code == 401
+
+def test_oidc_token_introspect_returns_none(client, monkeypatch):
+    # P2 regression for the /oidc-token path
+    fake = MagicMock()
+    fake.introspect.return_value = None
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.post("/oidc-token", headers={"Authorization": "Bearer x"})
+    assert r.status_code == 401
+
 
 # ──────────────────────────────────────────────
 # /register  (UserManager.add_user)
@@ -150,6 +190,13 @@ def test_register_unexpected_error_becomes_500(client, monkeypatch):
     monkeypatch.setattr(main, "user_manager", mgr)
     r = client.post("/register", data={"email": "a@x.com", "password": "pw"})
     assert r.status_code == 500
+
+def test_register_missing_email_is_422(client, monkeypatch):
+    # Migrated from tests.py: posting the OLD username/password shape (no email)
+    # is now a FastAPI validation error, documenting the breaking signature change.
+    monkeypatch.setattr(main, "user_manager", MagicMock())
+    r = client.post("/register", data={"username": "newuser", "password": "secret"})
+    assert r.status_code == 422
 
 
 # ──────────────────────────────────────────────
@@ -207,3 +254,45 @@ def test_lookup_runtime_error_becomes_502(client, monkeypatch):
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ──────────────────────────────────────────────
+# setup_keycloak secret wiring (regression for the "secret never wired" bug)
+# ──────────────────────────────────────────────
+def test_setup_keycloak_returns_existing_secret(monkeypatch):
+    import main as m
+    fake_admin = MagicMock()
+    fake_admin.get_authentication_flows.return_value = [{"alias": "Hello-World-flow"}]
+    fake_admin.get_client_id.return_value = "uuid-1"
+    fake_admin.get_client_secrets.return_value = {"value": "real-kc-secret"}
+    monkeypatch.setattr(m, "KeycloakAdmin", lambda **kw: fake_admin)
+    monkeypatch.setattr(m, "create_keycloak_user", lambda *a, **k: "uid")
+    monkeypatch.delenv("KEYCLOAK_CLIENT_SECRET", raising=False)
+    secret = m.setup_keycloak()
+    assert secret == "real-kc-secret"   # the REAL secret, not a placeholder
+
+def test_setup_keycloak_creates_secret_when_missing(monkeypatch):
+    import main as m
+    fake_admin = MagicMock()
+    fake_admin.get_authentication_flows.return_value = [{"alias": "Hello-World-flow"}]
+    fake_admin.get_client_id.return_value = "uuid-1"
+    fake_admin.get_client_secrets.return_value = {"value": None}
+    fake_admin.create_client_secret.return_value = {"value": "newly-created"}
+    monkeypatch.setattr(m, "KeycloakAdmin", lambda **kw: fake_admin)
+    monkeypatch.setattr(m, "create_keycloak_user", lambda *a, **k: "uid")
+    monkeypatch.delenv("KEYCLOAK_CLIENT_SECRET", raising=False)
+    secret = m.setup_keycloak()
+    assert secret == "newly-created"
+    fake_admin.create_client_secret.assert_called_once()
+
+def test_setup_keycloak_env_override_wins(monkeypatch):
+    import main as m
+    fake_admin = MagicMock()
+    fake_admin.get_authentication_flows.return_value = [{"alias": "Hello-World-flow"}]
+    fake_admin.get_client_id.return_value = "uuid-1"
+    fake_admin.get_client_secrets.return_value = {"value": "kc-secret"}
+    monkeypatch.setattr(m, "KeycloakAdmin", lambda **kw: fake_admin)
+    monkeypatch.setattr(m, "create_keycloak_user", lambda *a, **k: "uid")
+    monkeypatch.setenv("KEYCLOAK_CLIENT_SECRET", "env-override")
+    secret = m.setup_keycloak()
+    assert secret == "env-override"   # explicit env var takes precedence

@@ -84,8 +84,11 @@ _auth0_token_cache: str | None = None
 _auth0_token_expiry: datetime = datetime.min.replace(tzinfo=timezone.utc)
 _auth0_token_lock = threading.Lock()
 
-def authenticate_with_auth0(client_id: str, client_secret: str, audience: str) -> str:
-    """Exchange client credentials for an Auth0 M2M access token."""
+def authenticate_with_auth0(client_id: str, client_secret: str, audience: str) -> tuple[str, int]:
+    """
+    Exchange client credentials for an Auth0 M2M access token.
+    Returns (access_token, expires_in_seconds).
+    """
     domain    = os.getenv("AUTH0_DOMAIN", "your-auth0-domain")
     token_url = f"https://{domain}/oauth/token"
     payload   = {

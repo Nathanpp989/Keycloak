@@ -24,6 +24,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ── Configuration (single source of truth) ────────────────────────────────────
+# Fix #3: realm and client id are read once here so setup, the OIDC client, and
+# the user manager all operate on the SAME realm/client. Previously the realm was
+# hardcoded "Premkey" in some places and read from KEYCLOAK_REALM in others.
+KEYCLOAK_URL       = os.environ.get("KEYCLOAK_URL", "http://localhost:8080/")
+KEYCLOAK_REALM     = os.environ.get("KEYCLOAK_REALM", "Premkey")
+KEYCLOAK_CLIENT_ID = os.environ.get("KEYCLOAK_CLIENT_ID", "Hello-World-app")
+
 # ── RSA key management ────────────────────────────────────────────────────────
 public_pem: bytes = b""
 
@@ -86,12 +94,17 @@ def create_keycloak_user(admin: KeycloakAdmin, username: str, password: str, gro
     admin.group_user_add(user_id, group_id)
     return user_id
 
-def setup_keycloak():
+def setup_keycloak() -> str:
+    """
+    Ensure the realm's auth flow, default user, and client secret exist.
+    Returns the client's actual secret so the app can authenticate as a
+    confidential client (fixes the secret never being wired into keycloak_oidc).
+    """
     admin = KeycloakAdmin(
         server_url=os.environ.get("KEYCLOAK_URL", "http://localhost:8080/"),
         username=os.environ.get("KEYCLOAK_ADMIN_USER", "admin"),
         password=os.environ.get("KEYCLOAK_ADMIN_PASSWORD", "admin"),
-        realm_name="Premkey",
+        realm_name=KEYCLOAK_REALM,
         user_realm_name="master",
         verify=True
     )
@@ -106,10 +119,16 @@ def setup_keycloak():
         })
     default_password = os.environ.get("DEFAULT_USER_PASSWORD", "change-me")
     create_keycloak_user(admin, "user", default_password, "users")
-    client_uuid     = admin.get_client_id("Hello-World-app")
+
+    client_uuid     = admin.get_client_id(KEYCLOAK_CLIENT_ID)
     existing_secret = admin.get_client_secrets(client_uuid)
-    if existing_secret.get("value") is None:
-        admin.create_client_secret(client_uuid)
+    secret_value    = existing_secret.get("value")
+    if secret_value is None:
+        # create_client_secret returns the new secret representation
+        created = admin.create_client_secret(client_uuid)
+        secret_value = created.get("value") if isinstance(created, dict) else None
+    # Fix #2: return the real secret (env override wins if explicitly set)
+    return os.environ.get("KEYCLOAK_CLIENT_SECRET") or secret_value or ""
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 keycloak_oidc: KeycloakOpenID | None = None
@@ -121,8 +140,8 @@ def _build_user_manager() -> UserManager | None:
     and an Auth0 M2M client. Returns None (with a warning) if the required
     Auth0 env vars are missing, so the rest of the app can still start.
     """
-    keycloak_url = os.environ.get("KEYCLOAK_URL", "http://localhost:8080")
-    realm        = os.environ.get("KEYCLOAK_REALM", "Premkey")
+    keycloak_url = KEYCLOAK_URL
+    realm        = KEYCLOAK_REALM
     admin_user   = os.environ.get("KEYCLOAK_ADMIN_USER", "admin")
     admin_pass   = os.environ.get("KEYCLOAK_ADMIN_PASSWORD", "admin")
 
@@ -157,15 +176,21 @@ async def lifespan(app: FastAPI):
         logger.error("RSA key initialisation failed: %s", exc)
         raise
     try:
-        setup_keycloak()
+        client_secret = setup_keycloak()
     except Exception as exc:
         logger.error("Keycloak setup failed — check KEYCLOAK_URL and credentials: %s", exc)
         raise
+    if not client_secret:
+        logger.warning(
+            "No Keycloak client secret available for '%s'. Confidential-client "
+            "operations (/token, introspection) will fail. Set KEYCLOAK_CLIENT_SECRET "
+            "or ensure the client has a secret in Keycloak.", KEYCLOAK_CLIENT_ID
+        )
     keycloak_oidc = KeycloakOpenID(
-        server_url=os.environ.get("KEYCLOAK_URL", "http://localhost:8080/"),
-        client_id="Hello-World-app",
-        realm_name="Premkey",
-        client_secret_key=os.environ.get("KEYCLOAK_CLIENT_SECRET", "your-client-secret")
+        server_url=KEYCLOAK_URL,
+        client_id=KEYCLOAK_CLIENT_ID,
+        realm_name=KEYCLOAK_REALM,
+        client_secret_key=client_secret,   # Fix #2: real secret, not a placeholder
     )
     # Build the user manager; don't let its failure crash the whole app
     try:
@@ -193,7 +218,9 @@ def require_keycloak_auth(credentials=Depends(http_bearer)) -> dict:
         token_info = keycloak_oidc.introspect(credentials.credentials)
     except Exception:
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
-    if not token_info.get("active"):
+    # P2 FIX: introspect can return None / a non-dict on some error responses;
+    # guard before calling .get() so this surfaces as 401, not an unhandled 500.
+    if not isinstance(token_info, dict) or not token_info.get("active"):
         raise HTTPException(status_code=401, detail="Token is inactive or expired")
     return token_info
 
@@ -229,7 +256,7 @@ def oidc_login(token: str = Depends(oauth2_scheme)):
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
     try:
         token_info = keycloak_oidc.introspect(token)
-        if not token_info.get("active"):
+        if not isinstance(token_info, dict) or not token_info.get("active"):
             raise HTTPException(status_code=401, detail="Token is inactive or expired")
         return {"message": f"Hello, {token_info.get('preferred_username', 'user')}!"}
     except HTTPException:
