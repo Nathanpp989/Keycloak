@@ -14,7 +14,7 @@ from keycloak.exceptions import KeycloakAuthenticationError
 
 # User-flow integration (auth0_connect.py / auth0_talk.py / auth0_type.py)
 from auth0_connect import Auth0Connect, get_keycloak_admin_token
-from auth0_talk import KeycloakAdminAPI, Auth0UsersAPI
+from auth0_talk import KeycloakAdminAPI, Auth0UsersAPI, Auth0AuthzExtensionAPI
 from auth0_type import UserManager
 
 # I3 FIX: configure logging before anything else so all logger.* calls produce output
@@ -164,7 +164,12 @@ def _build_user_manager() -> UserManager | None:
     keycloak_api   = KeycloakAdminAPI(keycloak_url, kc_token_getter, realm)
     auth0_conn     = Auth0Connect(auth0_domain, auth0_id, auth0_secret)
     auth0_users    = Auth0UsersAPI(auth0_conn)
-    return UserManager(keycloak_api, auth0_users)
+    # Optional Auth0 Authorization Extension (groups) — only if its URL is set.
+    authz = None
+    authz_url = os.environ.get("AUTH0_AUTHZ_EXTENSION_URL")
+    if authz_url:
+        authz = Auth0AuthzExtensionAPI(auth0_conn, authz_url)
+    return UserManager(keycloak_api, auth0_users, auth0_authz=authz)
 
 
 @asynccontextmanager
@@ -322,6 +327,80 @@ def users_lookup(
         logger.error("User lookup failed: %s", exc)
         raise HTTPException(status_code=500, detail="Lookup failed")
     return {"username": username, "email": email, "system": system.value}
+
+@app.get("/users/membership")
+def users_membership(
+    username: str,
+    email: str,
+    token_info: dict = Depends(require_keycloak_auth),
+):
+    """
+    Return a user's groups and roles from BOTH Keycloak and Auth0, correlated.
+    Protected: requires a valid Keycloak bearer token (same enumeration concern
+    as /users/lookup).
+    """
+    if user_manager is None:
+        raise HTTPException(
+            status_code=503,
+            detail="User management is unavailable (Auth0 not configured).",
+        )
+    try:
+        return user_manager.get_membership(username, email)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.error("Membership lookup failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Membership lookup failed")
+
+@app.post("/groups")
+def create_group(
+    name: str = Form(...),
+    parent_path: str | None = Form(default=None),
+    token_info: dict = Depends(require_keycloak_auth),
+):
+    """
+    Create a group (or subgroup if parent_path is given) in Keycloak and, if the
+    Authorization Extension is configured, in Auth0. Protected.
+    """
+    if user_manager is None:
+        raise HTTPException(status_code=503,
+                            detail="User management is unavailable (Auth0 not configured).")
+    try:
+        return user_manager.create_group(name, parent_path=parent_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.error("Group creation failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Group creation failed")
+
+@app.post("/users/groups")
+def modify_group_membership(
+    username: str = Form(...),
+    email: str = Form(...),
+    group_name: str = Form(...),
+    action: str = Form(...),  # "add" or "revoke"
+    token_info: dict = Depends(require_keycloak_auth),
+):
+    """
+    Add or revoke a user's membership in a group across systems. Protected.
+    `action` must be 'add' or 'revoke'.
+    """
+    if user_manager is None:
+        raise HTTPException(status_code=503,
+                            detail="User management is unavailable (Auth0 not configured).")
+    if action not in ("add", "revoke"):
+        raise HTTPException(status_code=422, detail="action must be 'add' or 'revoke'")
+    try:
+        return user_manager.set_group_membership(
+            username, email, group_name, add=(action == "add")
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.error("Group membership change failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Group membership change failed")
 
 @app.get("/keys")
 def get_keys():

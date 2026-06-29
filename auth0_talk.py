@@ -131,6 +131,135 @@ class KeycloakAdminAPI:
             logger.error("Failed to delete Keycloak user: %d %s", resp.status_code, resp.text)
             resp.raise_for_status()
 
+    def get_user_groups(self, user_id: str) -> list[dict]:
+        """
+        Return the groups a Keycloak user belongs to. Each entry is normalised to:
+            {"name": str, "path": str, "is_subgroup": bool}
+        Keycloak group paths look like "/parent/child"; a path with more than one
+        segment means the group is a subgroup.
+        """
+        url = f"{self.base}/admin/realms/{self.realm}/users/{user_id}/groups"
+        resp = requests.get(url, headers=self.headers, timeout=10)
+        resp.raise_for_status()
+        groups = []
+        for g in resp.json():
+            path = g.get("path", "/" + g.get("name", ""))
+            # "/a" -> 1 segment (top-level); "/a/b" -> 2 segments (subgroup)
+            depth = len([seg for seg in path.split("/") if seg])
+            groups.append({
+                "name": g.get("name", ""),
+                "path": path,
+                "is_subgroup": depth > 1,
+            })
+        return groups
+
+    def get_user_roles(self, user_id: str) -> dict[str, list[str]]:
+        """
+        Return a Keycloak user's effective realm and client role names:
+            {"realm": [...], "client": [...]}
+        """
+        base = f"{self.base}/admin/realms/{self.realm}/users/{user_id}/role-mappings"
+        # Realm roles
+        realm_resp = requests.get(f"{base}/realm", headers=self.headers, timeout=10)
+        realm_resp.raise_for_status()
+        realm_roles = [r.get("name", "") for r in realm_resp.json()]
+        # Client roles (across all clients) — the composite view lists them
+        client_roles: list[str] = []
+        all_resp = requests.get(base, headers=self.headers, timeout=10)
+        if all_resp.ok:
+            data = all_resp.json()
+            for client_entry in (data.get("clientMappings") or {}).values():
+                client_roles.extend(m.get("name", "") for m in client_entry.get("mappings", []))
+        return {"realm": realm_roles, "client": client_roles}
+
+    # ── group management ───────────────────────────────────────
+    def _groups_url(self, group_id: str | None = None) -> str:
+        url = f"{self.base}/admin/realms/{self.realm}/groups"
+        return f"{url}/{group_id}" if group_id else url
+
+    def list_groups(self) -> list[dict]:
+        """Return top-level realm groups (each may contain subGroups)."""
+        resp = requests.get(self._groups_url(), headers=self.headers, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    def find_group_by_path(self, path: str) -> dict | None:
+        """
+        Find a group by its full path (e.g. '/finance/billing'), searching the
+        nested group tree. Returns the group dict (with 'id') or None.
+        """
+        wanted = "/" + path.strip("/")
+
+        def walk(groups: list[dict]) -> dict | None:
+            for g in groups:
+                if g.get("path") == wanted:
+                    return g
+                found = walk(g.get("subGroups") or [])
+                if found:
+                    return found
+            return None
+
+        return walk(self.list_groups())
+
+    def create_group(self, name: str, parent_id: str | None = None) -> str:
+        """
+        Create a top-level group, or a subgroup if parent_id is given.
+        Returns the new group's id. Idempotent: if the group already exists at
+        that location, returns the existing id instead of failing.
+        """
+        if parent_id:
+            url = f"{self._groups_url(parent_id)}/children"
+        else:
+            url = self._groups_url()
+        resp = requests.post(url, headers=self.headers, json={"name": name}, timeout=10)
+        if resp.status_code == 201:
+            # Keycloak returns the new group's URL in Location
+            location = resp.headers.get("Location", "")
+            gid = location.rstrip("/").split("/")[-1] if location else None
+            # Some Keycloak versions return the representation in the body instead
+            if not gid:
+                try:
+                    gid = resp.json().get("id")
+                except ValueError:
+                    gid = None
+            logger.info("Created Keycloak group '%s' (id=%s)", name, gid)
+            return gid or ""
+        if resp.status_code == 409:
+            logger.info("Keycloak group '%s' already exists; reusing", name)
+            # Resolve existing id: build the expected path
+            if parent_id:
+                parent = requests.get(self._groups_url(parent_id),
+                                      headers=self.headers, timeout=10)
+                parent.raise_for_status()
+                existing = next((s for s in (parent.json().get("subGroups") or [])
+                                 if s.get("name") == name), None)
+            else:
+                existing = next((g for g in self.list_groups() if g.get("name") == name), None)
+            return existing.get("id", "") if existing else ""
+        logger.error("Failed to create Keycloak group: %d %s", resp.status_code, resp.text)
+        resp.raise_for_status()
+        return ""
+
+    def add_user_to_group(self, user_id: str, group_id: str) -> None:
+        """Add a Keycloak user to a group (idempotent)."""
+        url = f"{self._users_url(user_id)}/groups/{group_id}"
+        resp = requests.put(url, headers=self.headers, timeout=10)
+        if resp.status_code in (201, 204):
+            logger.info("Added Keycloak user %s to group %s", user_id, group_id)
+        else:
+            logger.error("Failed to add user to group: %d %s", resp.status_code, resp.text)
+            resp.raise_for_status()
+
+    def remove_user_from_group(self, user_id: str, group_id: str) -> None:
+        """Revoke a Keycloak user's membership in a group (idempotent)."""
+        url = f"{self._users_url(user_id)}/groups/{group_id}"
+        resp = requests.delete(url, headers=self.headers, timeout=10)
+        if resp.status_code in (204, 404):
+            logger.info("Removed Keycloak user %s from group %s", user_id, group_id)
+        else:
+            logger.error("Failed to remove user from group: %d %s", resp.status_code, resp.text)
+            resp.raise_for_status()
+
 
 # ──────────────────────────────────────────────
 # Auth0 Management API — user management
@@ -190,6 +319,157 @@ class Auth0UsersAPI:
         else:
             logger.error("Failed to delete Auth0 user: %d %s", resp.status_code, resp.text)
             resp.raise_for_status()
+
+    def get_user_roles(self, user_id: str) -> list[str]:
+        """
+        Return the names of Auth0 Authorization Core roles assigned to a user.
+        Requires the 'read:roles' scope on the M2M application.
+        """
+        url = f"{self.base}/{user_id}/roles"
+        resp = requests.get(url, headers=self.headers, timeout=10)
+        _explain_403(resp, "read:roles")
+        resp.raise_for_status()
+        return [r.get("name", "") for r in resp.json()]
+
+
+# ──────────────────────────────────────────────
+# Auth0 Authorization Extension — groups
+# The Authorization Extension is a SEPARATE service with its own base URL and
+# its own access token (audience = "urn:auth0-authz-api"), NOT the Management
+# API. Configure its URL via AUTH0_AUTHZ_EXTENSION_URL, e.g.
+#   https://<tenant>.<region>.webtask.io/adf6e2f2b84784b57522e3b19dfc9201/api
+# ──────────────────────────────────────────────
+class Auth0AuthzExtensionAPI:
+    def __init__(self, auth0: Auth0Connect, extension_url: str):
+        self.auth0 = auth0
+        self.base = extension_url.rstrip("/")
+
+    def _token(self) -> str:
+        """
+        Get an access token for the Authorization Extension API. Its audience
+        differs from the Management API, so we request it explicitly.
+        """
+        url = f"https://{self.auth0.domain}/oauth/token"
+        payload = {
+            "client_id":     self.auth0.client_id,
+            "client_secret": self.auth0.client_secret,
+            "audience":      "urn:auth0-authz-api",
+            "grant_type":    "client_credentials",
+        }
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Authz Extension token request failed: {exc}") from exc
+        if not resp.ok:
+            raise RuntimeError(
+                f"Authz Extension token returned {resp.status_code}: {resp.text}"
+            )
+        token = resp.json().get("access_token")
+        if not token:
+            raise RuntimeError("Authz Extension token response missing access_token")
+        return token
+
+    def get_user_groups(self, user_id: str) -> list[dict]:
+        """
+        Return the Authorization Extension groups for a user, normalised to:
+            {"name": str, "is_subgroup": bool}
+        The extension represents nesting via a 'parent' reference / nested array;
+        a group that appears nested under another is treated as a subgroup.
+        """
+        headers = {
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {self._token()}",
+        }
+        url = f"{self.base}/users/{user_id}/groups"
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Authz Extension groups request failed: {exc}") from exc
+        if resp.status_code == 403:
+            raise RuntimeError(
+                "403 from the Auth0 Authorization Extension — the client is not "
+                "authorised for the extension API."
+            )
+        resp.raise_for_status()
+        groups = []
+        for g in resp.json():
+            # The extension marks nesting with a 'parent' field or by nesting.
+            groups.append({
+                "name": g.get("name", ""),
+                "is_subgroup": bool(g.get("parent") or g.get("parentGroupId")),
+            })
+        return groups
+
+    def _ext_headers(self) -> dict:
+        return {
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {self._token()}",
+        }
+
+    def _ext_request(self, method: str, path: str, **kwargs):
+        url = f"{self.base}/{path.lstrip('/')}"
+        try:
+            resp = requests.request(method, url, headers=self._ext_headers(), timeout=10, **kwargs)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Authz Extension {method} {path} failed: {exc}") from exc
+        if resp.status_code == 403:
+            raise RuntimeError(
+                "403 from the Auth0 Authorization Extension — the client is not "
+                "authorised for the extension API."
+            )
+        return resp
+
+    def list_groups(self) -> list[dict]:
+        """Return all Authorization Extension groups (raw representations)."""
+        resp = self._ext_request("GET", "groups")
+        resp.raise_for_status()
+        data = resp.json()
+        # The extension returns either a list or {"groups": [...]}
+        return data.get("groups", data) if isinstance(data, dict) else data
+
+    def find_group_by_name(self, name: str) -> dict | None:
+        """Find an extension group by name (case-insensitive). Returns it or None."""
+        lname = name.lower()
+        return next((g for g in self.list_groups()
+                     if g.get("name", "").lower() == lname), None)
+
+    def create_group(self, name: str, description: str = "",
+                     parent_group_id: str | None = None) -> dict:
+        """
+        Create an Authorization Extension group, or a nested group if
+        parent_group_id is given. Idempotent on name. Returns the group dict.
+        """
+        existing = self.find_group_by_name(name)
+        if existing:
+            logger.info("Authz Extension group '%s' already exists; reusing", name)
+            return existing
+        resp = self._ext_request("POST", "groups",
+                                 json={"name": name, "description": description or name})
+        resp.raise_for_status()
+        group = resp.json()
+        group_id = group.get("_id") or group.get("id")
+        # Nest under a parent if requested. The extension nests by POSTing the
+        # child id under the parent's /nested endpoint.
+        if parent_group_id and group_id:
+            nest = self._ext_request("PATCH", f"groups/{parent_group_id}/nested",
+                                     json=[group_id])
+            nest.raise_for_status()
+            logger.info("Nested group '%s' under %s", name, parent_group_id)
+        logger.info("Created Authz Extension group '%s' (id=%s)", name, group_id)
+        return group
+
+    def add_user_to_group(self, group_id: str, user_id: str) -> None:
+        """Add a user to an Authorization Extension group (members endpoint)."""
+        resp = self._ext_request("PATCH", f"groups/{group_id}/members", json=[user_id])
+        resp.raise_for_status()
+        logger.info("Added user %s to Authz Extension group %s", user_id, group_id)
+
+    def remove_user_from_group(self, group_id: str, user_id: str) -> None:
+        """Revoke a user's membership in an Authorization Extension group."""
+        resp = self._ext_request("DELETE", f"groups/{group_id}/members", json=[user_id])
+        if resp.status_code not in (200, 204):
+            resp.raise_for_status()
+        logger.info("Removed user %s from Authz Extension group %s", user_id, group_id)
 
 
 def main() -> None:

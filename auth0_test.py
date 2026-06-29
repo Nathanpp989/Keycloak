@@ -15,7 +15,7 @@ import json
 import os
 import re
 import tempfile
-from unittest.mock import create_autospec
+from unittest.mock import create_autospec, MagicMock
 
 import pytest
 import responses
@@ -568,3 +568,327 @@ def test_build_broker_login_url_strips_trailing_slash():
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ──────────────────────────────────────────────
+# Group + role membership (KeycloakAdminAPI / Auth0UsersAPI / Authz Extension)
+# ──────────────────────────────────────────────
+@responses.activate
+def test_keycloak_get_user_groups_marks_subgroups():
+    from auth0_talk import KeycloakAdminAPI
+    url = f"{KC_URL}/admin/realms/{REALM}/users/u-1/groups"
+    responses.add(responses.GET, url, json=[
+        {"name": "admins", "path": "/admins"},
+        {"name": "billing", "path": "/finance/billing"},
+    ], status=200)
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    groups = api.get_user_groups("u-1")
+    by_name = {g["name"]: g for g in groups}
+    assert by_name["admins"]["is_subgroup"] is False     # top-level
+    assert by_name["billing"]["is_subgroup"] is True      # nested under /finance
+
+@responses.activate
+def test_keycloak_get_user_roles_realm_and_client():
+    from auth0_talk import KeycloakAdminAPI
+    base = f"{KC_URL}/admin/realms/{REALM}/users/u-1/role-mappings"
+    responses.add(responses.GET, f"{base}/realm",
+                  json=[{"name": "offline_access"}, {"name": "admin"}], status=200)
+    responses.add(responses.GET, base, json={
+        "realmMappings": [{"name": "admin"}],
+        "clientMappings": {
+            "account": {"mappings": [{"name": "view-profile"}, {"name": "manage-account"}]}
+        },
+    }, status=200)
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    roles = api.get_user_roles("u-1")
+    assert "admin" in roles["realm"]
+    assert "manage-account" in roles["client"]
+
+@responses.activate
+def test_auth0_get_user_roles():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.GET, f"https://{DOMAIN}/api/v2/users/auth0|1/roles",
+                  json=[{"name": "editor"}, {"name": "viewer"}], status=200)
+    api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    assert api.get_user_roles("auth0|1") == ["editor", "viewer"]
+
+@responses.activate
+def test_auth0_get_user_roles_403_names_scope():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.GET, f"https://{DOMAIN}/api/v2/users/auth0|1/roles",
+                  json={"error": "Forbidden"}, status=403)
+    api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    with pytest.raises(RuntimeError, match="read:roles"):
+        api.get_user_roles("auth0|1")
+
+@responses.activate
+def test_authz_extension_get_user_groups():
+    from auth0_talk import Auth0AuthzExtensionAPI
+    ext_url = "https://tenant.us.webtask.io/abc/api"
+    # The extension fetches its own token (audience urn:auth0-authz-api)
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "ext-tok", "expires_in": 999}, status=200)
+    responses.add(responses.GET, f"{ext_url}/users/auth0|1/groups", json=[
+        {"name": "engineering"},
+        {"name": "backend", "parent": "engineering"},
+    ], status=200)
+    ext = Auth0AuthzExtensionAPI(Auth0Connect(DOMAIN, "cid", "sec"), ext_url)
+    groups = ext.get_user_groups("auth0|1")
+    by_name = {g["name"]: g for g in groups}
+    assert by_name["engineering"]["is_subgroup"] is False
+    assert by_name["backend"]["is_subgroup"] is True
+
+
+# ──────────────────────────────────────────────
+# UserManager.get_membership — cross-system correlation
+# ──────────────────────────────────────────────
+def test_get_membership_correlates_groups_and_roles(monkeypatch):
+    from auth0_type import UserManager
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    authz = MagicMock()
+    mgr = UserManager(kc, a0, auth0_authz=authz)
+
+    # Resolve ids
+    mgr._keycloak_user_id = lambda u, e: "kc-1"
+    mgr._auth0_user_id = lambda e: "auth0|1"
+
+    kc.get_user_groups.return_value = [
+        {"name": "Admins", "path": "/Admins", "is_subgroup": False},
+        {"name": "KCOnly", "path": "/KCOnly", "is_subgroup": False},
+    ]
+    kc.get_user_roles.return_value = {"realm": ["editor"], "client": ["view-profile"]}
+    a0.get_user_roles.return_value = ["editor", "auth0only"]
+    authz.get_user_groups.return_value = [
+        {"name": "admins", "is_subgroup": False},     # same as KC "Admins" (case-insensitive)
+        {"name": "A0Only", "is_subgroup": False},
+    ]
+
+    m = mgr.get_membership("user", "user@example.com")
+    assert m["keycloak"]["found"] is True
+    assert m["auth0"]["found"] is True
+    corr = m["correlation"]
+    assert "admins" in corr["groups_in_both"]          # Admins == admins
+    assert "kconly" in corr["groups_keycloak_only"]
+    assert "a0only" in corr["groups_auth0_only"]
+    assert "editor" in corr["roles_in_both"]
+    assert "auth0only" in corr["roles_auth0_only"]
+    assert "view-profile" in corr["roles_keycloak_only"]
+
+def test_get_membership_user_missing_in_auth0(monkeypatch):
+    from auth0_type import UserManager
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    mgr = UserManager(kc, a0)  # no authz extension
+    mgr._keycloak_user_id = lambda u, e: "kc-1"
+    mgr._auth0_user_id = lambda e: None  # not in Auth0
+    kc.get_user_groups.return_value = [{"name": "g", "path": "/g", "is_subgroup": False}]
+    kc.get_user_roles.return_value = {"realm": ["r"], "client": []}
+    m = mgr.get_membership("user", "user@example.com")
+    assert m["auth0"]["found"] is False
+    assert m["auth0"]["groups"] == []          # no authz extension -> empty
+    assert "g" in m["correlation"]["groups_keycloak_only"]
+
+def test_get_membership_without_authz_extension_skips_groups():
+    from auth0_type import UserManager
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    mgr = UserManager(kc, a0, auth0_authz=None)
+    mgr._keycloak_user_id = lambda u, e: "kc-1"
+    mgr._auth0_user_id = lambda e: "auth0|1"
+    kc.get_user_groups.return_value = []
+    kc.get_user_roles.return_value = {"realm": [], "client": []}
+    a0.get_user_roles.return_value = ["x"]
+    m = mgr.get_membership("user", "user@example.com")
+    # Auth0 found, roles present, but groups empty because no extension configured
+    assert m["auth0"]["found"] is True
+    assert m["auth0"]["groups"] == []
+    assert m["auth0"]["roles"] == ["x"]
+
+
+# ──────────────────────────────────────────────
+# Keycloak group management (create / subgroup / add / revoke)
+# ──────────────────────────────────────────────
+@responses.activate
+def test_keycloak_create_top_level_group():
+    from auth0_talk import KeycloakAdminAPI
+    url = f"{KC_URL}/admin/realms/{REALM}/groups"
+    responses.add(responses.POST, url, status=201,
+                  headers={"Location": f"{url}/grp-1"})
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    assert api.create_group("admins") == "grp-1"
+
+@responses.activate
+def test_keycloak_create_subgroup_uses_children_endpoint():
+    from auth0_talk import KeycloakAdminAPI
+    children_url = f"{KC_URL}/admin/realms/{REALM}/groups/parent-1/children"
+    responses.add(responses.POST, children_url, status=201,
+                  headers={"Location": f"{children_url}/sub-1"})
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    assert api.create_group("billing", parent_id="parent-1") == "sub-1"
+
+@responses.activate
+def test_keycloak_create_group_conflict_reuses_existing():
+    from auth0_talk import KeycloakAdminAPI
+    url = f"{KC_URL}/admin/realms/{REALM}/groups"
+    responses.add(responses.POST, url, status=409)
+    responses.add(responses.GET, url,
+                  json=[{"name": "admins", "id": "existing-1"}], status=200)
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    assert api.create_group("admins") == "existing-1"
+
+@responses.activate
+def test_keycloak_find_group_by_path_nested():
+    from auth0_talk import KeycloakAdminAPI
+    url = f"{KC_URL}/admin/realms/{REALM}/groups"
+    responses.add(responses.GET, url, json=[
+        {"name": "finance", "id": "f-1", "path": "/finance", "subGroups": [
+            {"name": "billing", "id": "b-1", "path": "/finance/billing", "subGroups": []},
+        ]},
+    ], status=200)
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    found = api.find_group_by_path("/finance/billing")
+    assert found["id"] == "b-1"
+
+@responses.activate
+def test_keycloak_add_user_to_group():
+    from auth0_talk import KeycloakAdminAPI
+    url = f"{KC_URL}/admin/realms/{REALM}/users/u-1/groups/g-1"
+    responses.add(responses.PUT, url, status=204)
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    api.add_user_to_group("u-1", "g-1")  # no raise
+
+@responses.activate
+def test_keycloak_remove_user_from_group():
+    from auth0_talk import KeycloakAdminAPI
+    url = f"{KC_URL}/admin/realms/{REALM}/users/u-1/groups/g-1"
+    responses.add(responses.DELETE, url, status=204)
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    api.remove_user_from_group("u-1", "g-1")  # no raise
+
+
+# ──────────────────────────────────────────────
+# Auth0 Authorization Extension group management
+# ──────────────────────────────────────────────
+EXT_URL = "https://tenant.us.webtask.io/abc/api"
+
+def _ext_token():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "ext-tok", "expires_in": 999}, status=200)
+
+@responses.activate
+def test_authz_create_group_new():
+    from auth0_talk import Auth0AuthzExtensionAPI
+    _ext_token()
+    responses.add(responses.GET, f"{EXT_URL}/groups", json={"groups": []}, status=200)
+    responses.add(responses.POST, f"{EXT_URL}/groups",
+                  json={"_id": "eg-1", "name": "engineering"}, status=200)
+    ext = Auth0AuthzExtensionAPI(Auth0Connect(DOMAIN, "cid", "sec"), EXT_URL)
+    g = ext.create_group("engineering")
+    assert g["_id"] == "eg-1"
+
+@responses.activate
+def test_authz_create_group_reuses_existing():
+    from auth0_talk import Auth0AuthzExtensionAPI
+    _ext_token()
+    responses.add(responses.GET, f"{EXT_URL}/groups",
+                  json={"groups": [{"_id": "eg-1", "name": "Engineering"}]}, status=200)
+    ext = Auth0AuthzExtensionAPI(Auth0Connect(DOMAIN, "cid", "sec"), EXT_URL)
+    g = ext.create_group("engineering")  # case-insensitive match
+    assert g["_id"] == "eg-1"
+
+@responses.activate
+def test_authz_create_nested_group():
+    from auth0_talk import Auth0AuthzExtensionAPI
+    _ext_token()
+    responses.add(responses.GET, f"{EXT_URL}/groups", json={"groups": []}, status=200)
+    responses.add(responses.POST, f"{EXT_URL}/groups",
+                  json={"_id": "child-1", "name": "backend"}, status=200)
+    responses.add(responses.PATCH, f"{EXT_URL}/groups/parent-1/nested", json={}, status=200)
+    ext = Auth0AuthzExtensionAPI(Auth0Connect(DOMAIN, "cid", "sec"), EXT_URL)
+    g = ext.create_group("backend", parent_group_id="parent-1")
+    assert g["_id"] == "child-1"
+    # The nested PATCH must have been called
+    assert any(c.request.method == "PATCH" and "/nested" in c.request.url
+               for c in responses.calls)
+
+@responses.activate
+def test_authz_add_and_remove_member():
+    from auth0_talk import Auth0AuthzExtensionAPI
+    _ext_token()
+    responses.add(responses.PATCH, f"{EXT_URL}/groups/g-1/members", status=204)
+    responses.add(responses.DELETE, f"{EXT_URL}/groups/g-1/members", status=204)
+    ext = Auth0AuthzExtensionAPI(Auth0Connect(DOMAIN, "cid", "sec"), EXT_URL)
+    ext.add_user_to_group("g-1", "auth0|1")     # no raise
+    ext.remove_user_from_group("g-1", "auth0|1")  # no raise
+
+
+# ──────────────────────────────────────────────
+# UserManager cross-system group ops
+# ──────────────────────────────────────────────
+def test_manager_create_group_both_systems():
+    from auth0_type import UserManager
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    authz = MagicMock()
+    kc.create_group.return_value = "kc-grp-1"
+    authz.create_group.return_value = {"_id": "a0-grp-1", "name": "admins"}
+    mgr = UserManager(kc, a0, auth0_authz=authz)
+    result = mgr.create_group("admins")
+    assert result["keycloak_id"] == "kc-grp-1"
+    assert result["auth0_group"]["_id"] == "a0-grp-1"
+    kc.create_group.assert_called_once_with("admins", parent_id=None)
+
+def test_manager_create_subgroup_resolves_parent():
+    from auth0_type import UserManager
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    kc.find_group_by_path.return_value = {"id": "parent-1", "path": "/finance"}
+    kc.create_group.return_value = "sub-1"
+    mgr = UserManager(kc, a0)  # no authz
+    result = mgr.create_group("billing", parent_path="/finance")
+    assert result["keycloak_id"] == "sub-1"
+    kc.create_group.assert_called_once_with("billing", parent_id="parent-1")
+
+def test_manager_create_subgroup_missing_parent_raises():
+    from auth0_type import UserManager
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    kc.find_group_by_path.return_value = None
+    mgr = UserManager(kc, a0)
+    with pytest.raises(ValueError, match="parent group"):
+        mgr.create_group("billing", parent_path="/nonexistent")
+
+def test_manager_set_group_membership_add():
+    from auth0_type import UserManager
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    mgr = UserManager(kc, a0)
+    mgr._keycloak_user_id = lambda u, e: "kc-1"
+    kc.find_group_by_path.return_value = {"id": "g-1"}
+    summary = mgr.set_group_membership("user", "u@x.com", "admins", add=True)
+    assert summary["keycloak"] == "added"
+    kc.add_user_to_group.assert_called_once_with("kc-1", "g-1")
+
+def test_manager_set_group_membership_revoke():
+    from auth0_type import UserManager
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    mgr = UserManager(kc, a0)
+    mgr._keycloak_user_id = lambda u, e: "kc-1"
+    kc.find_group_by_path.return_value = {"id": "g-1"}
+    summary = mgr.set_group_membership("user", "u@x.com", "admins", add=False)
+    assert summary["keycloak"] == "removed"
+    kc.remove_user_from_group.assert_called_once_with("kc-1", "g-1")
+
+def test_manager_set_group_membership_user_not_found():
+    from auth0_type import UserManager
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    mgr = UserManager(kc, a0)
+    mgr._keycloak_user_id = lambda u, e: None
+    summary = mgr.set_group_membership("ghost", "ghost@x.com", "admins", add=True)
+    assert summary["keycloak"] == "user-not-found"
+    kc.add_user_to_group.assert_not_called()

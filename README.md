@@ -73,8 +73,14 @@ mocked test suite.
    read:connections   create:connections
    read:clients       create:clients
    read:users         create:users   update:users   delete:users
+   read:roles         (for membership/role lookup)
    update:client_keys   (for secret rotation)
    ```
+
+   For Auth0 **group** membership, the tenant must have the Authorization
+   Extension installed; set its API URL via `AUTH0_AUTHZ_EXTENSION_URL`
+   (e.g. `https://<tenant>.<region>.webtask.io/<id>/api`). Without it, group
+   lookup is skipped and only Auth0 roles are reported.
 
 4. **Start Keycloak** (from your Keycloak distribution directory):
    ```bash
@@ -125,6 +131,9 @@ python login_flow.py
 | POST | `/oidc-token` | Bearer | Validate a token via Keycloak introspection |
 | POST | `/register` | none | Create a user in Keycloak + Auth0 |
 | GET | `/users/lookup` | Bearer | Which system(s) a user belongs to |
+| GET | `/users/membership` | Bearer | A user's groups + roles in both systems, correlated |
+| POST | `/groups` | Bearer | Create a group/subgroup in Keycloak (+ Auth0 if configured) |
+| POST | `/users/groups` | Bearer | Add or revoke a user's group membership (`action=add\|revoke`) |
 | GET | `/secure-data` | depends | Uses a server-side Auth0 M2M token |
 | GET | `/keys` | none | Public RSA key |
 

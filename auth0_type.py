@@ -12,7 +12,7 @@ import secrets
 from enum import Enum
 
 from auth0_connect import Auth0Connect, get_keycloak_admin_token, _require_env
-from auth0_talk import KeycloakAdminAPI, Auth0UsersAPI
+from auth0_talk import KeycloakAdminAPI, Auth0UsersAPI, Auth0AuthzExtensionAPI
 
 logger = logging.getLogger(__name__)
 
@@ -55,50 +55,38 @@ def generate_password(length: int = 16) -> str:
 class UserManager:
     """Detects user presence across systems and creates users in both."""
 
-    def __init__(self, keycloak: KeycloakAdminAPI, auth0_users: Auth0UsersAPI):
+    def __init__(self, keycloak: KeycloakAdminAPI, auth0_users: Auth0UsersAPI,
+                 auth0_authz=None):
         self.keycloak = keycloak
         self.auth0_users = auth0_users
+        # Optional Auth0AuthzExtensionAPI; group lookup is skipped if not provided.
+        self.auth0_authz = auth0_authz
 
-    # ── detection ──────────────────────────────────────────────
-    def _in_keycloak(self, username: str, email: str) -> bool:
-        """
-        Check whether a user already exists in Keycloak.
-
-        N1 FIX: match on BOTH username and email. The username passed in is
-        derived with a random suffix, so checking username alone would never
-        detect an existing account for the same email — leading to duplicate
-        Keycloak users on repeated registration. Email is the stable identity.
-        """
+    # ── id resolution ──────────────────────────────────────────
+    def _keycloak_user_id(self, username: str, email: str) -> str | None:
+        """Return the Keycloak user id for an email (preferred) or username."""
         import requests
-        # Email is the stable key; check it first.
-        resp = requests.get(
-            self.keycloak._users_url(),
-            headers=self.keycloak.headers,
-            params={"email": email, "exact": "true"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        if len(resp.json()) > 0:
-            return True
-        # Fall back to an exact username match (covers username-only accounts).
-        resp = requests.get(
-            self.keycloak._users_url(),
-            headers=self.keycloak.headers,
-            params={"username": username, "exact": "true"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        return len(resp.json()) > 0
+        for params in ({"email": email, "exact": "true"},
+                       {"username": username, "exact": "true"}):
+            resp = requests.get(
+                self.keycloak._users_url(),
+                headers=self.keycloak.headers,
+                params=params,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            results = resp.json()
+            if results:
+                return results[0].get("id")
+        return None
 
-    def _in_auth0(self, email: str) -> bool:
-        # Auth0 lookup by email via the users-by-email endpoint
+    def _auth0_user_id(self, email: str) -> str | None:
+        """Return the Auth0 user_id for an email, or None if not found."""
         import requests
         base = f"https://{self.auth0_users.auth0.domain}/api/v2/users-by-email"
         resp = requests.get(
-            base,
-            headers=self.auth0_users.headers,
-            params={"email": email},
-            timeout=10,
+            base, headers=self.auth0_users.headers,
+            params={"email": email}, timeout=10,
         )
         if resp.status_code == 403:
             raise RuntimeError(
@@ -106,7 +94,20 @@ class UserManager:
                 "'read:users' scope. Grant it to your M2M app and retry."
             )
         resp.raise_for_status()
-        return len(resp.json()) > 0
+        results = resp.json()
+        return results[0].get("user_id") if results else None
+
+    # ── detection ──────────────────────────────────────────────
+    def _in_keycloak(self, username: str, email: str) -> bool:
+        """
+        Check whether a user already exists in Keycloak (by email, then username).
+        N1 FIX: email is the stable identity; the derived username has a random
+        suffix so username-only checks would miss existing accounts.
+        """
+        return self._keycloak_user_id(username, email) is not None
+
+    def _in_auth0(self, email: str) -> bool:
+        return self._auth0_user_id(email) is not None
 
     def determine_user_system(self, username: str, email: str) -> UserSystem:
         """Detect which system(s) the user already belongs to."""
@@ -119,6 +120,156 @@ class UserManager:
         if in_a0:
             return UserSystem.AUTH0
         return UserSystem.NEITHER
+
+    # ── membership (groups + roles) ────────────────────────────
+    def get_membership(self, username: str, email: str) -> dict:
+        """
+        Collect a user's group membership and roles from BOTH systems and
+        correlate them.
+
+        Returns:
+        {
+          "username": ..., "email": ...,
+          "keycloak": {
+              "found": bool,
+              "groups": [{"name","path","is_subgroup"}],
+              "roles":  {"realm": [...], "client": [...]},
+          },
+          "auth0": {
+              "found": bool,
+              "groups": [{"name","is_subgroup"}],   # [] if no Authz Extension
+              "roles":  [...],
+          },
+          "correlation": {
+              "groups_in_both":      [names present in both systems],
+              "groups_keycloak_only":[...],
+              "groups_auth0_only":   [...],
+              "roles_in_both":       [...],
+              "roles_keycloak_only": [...],
+              "roles_auth0_only":    [...],
+          }
+        }
+        Group/role correlation is by case-insensitive name match.
+        """
+        result: dict = {
+            "username": username,
+            "email": email,
+            "keycloak": {"found": False, "groups": [], "roles": {"realm": [], "client": []}},
+            "auth0": {"found": False, "groups": [], "roles": []},
+            "correlation": {},
+        }
+
+        # --- Keycloak side ---
+        kc_id = self._keycloak_user_id(username, email)
+        if kc_id:
+            result["keycloak"]["found"] = True
+            result["keycloak"]["groups"] = self.keycloak.get_user_groups(kc_id)
+            result["keycloak"]["roles"] = self.keycloak.get_user_roles(kc_id)
+
+        # --- Auth0 side ---
+        a0_id = self._auth0_user_id(email)
+        if a0_id:
+            result["auth0"]["found"] = True
+            result["auth0"]["roles"] = self.auth0_users.get_user_roles(a0_id)
+            if self.auth0_authz is not None:
+                result["auth0"]["groups"] = self.auth0_authz.get_user_groups(a0_id)
+
+        # --- Correlation (case-insensitive name match) ---
+        kc_group_names = {g["name"].lower() for g in result["keycloak"]["groups"]}
+        a0_group_names = {g["name"].lower() for g in result["auth0"]["groups"]}
+        kc_role_names = {r.lower() for r in
+                         result["keycloak"]["roles"]["realm"] + result["keycloak"]["roles"]["client"]}
+        a0_role_names = {r.lower() for r in result["auth0"]["roles"]}
+
+        result["correlation"] = {
+            "groups_in_both":       sorted(kc_group_names & a0_group_names),
+            "groups_keycloak_only": sorted(kc_group_names - a0_group_names),
+            "groups_auth0_only":    sorted(a0_group_names - kc_group_names),
+            "roles_in_both":        sorted(kc_role_names & a0_role_names),
+            "roles_keycloak_only":  sorted(kc_role_names - a0_role_names),
+            "roles_auth0_only":     sorted(a0_role_names - kc_role_names),
+        }
+        return result
+
+    # ── group management (cross-system) ────────────────────────
+    def create_group(self, name: str, parent_path: str | None = None) -> dict:
+        """
+        Create a group (or subgroup) in Keycloak, and in the Auth0 Authorization
+        Extension if configured. For Keycloak subgroups, parent_path is the
+        parent's full path (e.g. '/finance'); the parent must already exist.
+        Returns {"keycloak_id": ..., "auth0_group": ...}.
+        """
+        result: dict = {"keycloak_id": None, "auth0_group": None}
+
+        # Keycloak
+        parent_id = None
+        if parent_path:
+            parent = self.keycloak.find_group_by_path(parent_path)
+            if not parent:
+                raise ValueError(f"Keycloak parent group '{parent_path}' not found")
+            parent_id = parent.get("id")
+        result["keycloak_id"] = self.keycloak.create_group(name, parent_id=parent_id)
+
+        # Auth0 Authorization Extension (optional)
+        if self.auth0_authz is not None:
+            parent_group_id = None
+            if parent_path:
+                parent_name = parent_path.strip("/").split("/")[-1]
+                parent_group = self.auth0_authz.find_group_by_name(parent_name)
+                parent_group_id = (parent_group or {}).get("_id") or (parent_group or {}).get("id")
+            result["auth0_group"] = self.auth0_authz.create_group(
+                name, parent_group_id=parent_group_id
+            )
+        return result
+
+    def set_group_membership(self, username: str, email: str, group_name: str,
+                             add: bool = True) -> dict:
+        """
+        Add (add=True) or revoke (add=False) a user's membership in a group named
+        `group_name`, in whichever systems the user and group exist.
+        Returns a per-system summary of what changed.
+        """
+        summary: dict = {"keycloak": "skipped", "auth0": "skipped"}
+
+        # Keycloak
+        kc_uid = self._keycloak_user_id(username, email)
+        if kc_uid:
+            group = self.keycloak.find_group_by_path("/" + group_name.strip("/"))
+            # Fall back: a bare name may be a top-level group
+            if not group:
+                group = next((g for g in self.keycloak.list_groups()
+                              if g.get("name", "").lower() == group_name.lower()), None)
+            if group:
+                gid = group.get("id")
+                if add:
+                    self.keycloak.add_user_to_group(kc_uid, gid)
+                    summary["keycloak"] = "added"
+                else:
+                    self.keycloak.remove_user_from_group(kc_uid, gid)
+                    summary["keycloak"] = "removed"
+            else:
+                summary["keycloak"] = "group-not-found"
+        else:
+            summary["keycloak"] = "user-not-found"
+
+        # Auth0 Authorization Extension
+        if self.auth0_authz is not None:
+            a0_uid = self._auth0_user_id(email)
+            if a0_uid:
+                group = self.auth0_authz.find_group_by_name(group_name)
+                if group:
+                    gid = group.get("_id") or group.get("id")
+                    if add:
+                        self.auth0_authz.add_user_to_group(gid, a0_uid)
+                        summary["auth0"] = "added"
+                    else:
+                        self.auth0_authz.remove_user_from_group(gid, a0_uid)
+                        summary["auth0"] = "removed"
+                else:
+                    summary["auth0"] = "group-not-found"
+            else:
+                summary["auth0"] = "user-not-found"
+        return summary
 
     # ── creation ───────────────────────────────────────────────
     def add_user(self, email: str, password: str | None = None,
@@ -182,7 +333,13 @@ def main() -> None:
     auth0 = Auth0Connect(env["AUTH0_DOMAIN"], env["AUTH0_CLIENT_ID"], env["AUTH0_CLIENT_SECRET"])
     auth0_users = Auth0UsersAPI(auth0)
 
-    manager = UserManager(keycloak, auth0_users)
+    # Optional: Auth0 Authorization Extension for groups (separate API).
+    authz = None
+    authz_url = os.environ.get("AUTH0_AUTHZ_EXTENSION_URL")
+    if authz_url:
+        authz = Auth0AuthzExtensionAPI(auth0, authz_url)
+
+    manager = UserManager(keycloak, auth0_users, auth0_authz=authz)
 
     # Example: add a new user from an email address
     target_email = os.environ.get("NEW_USER_EMAIL", "new.person@example.com")
@@ -193,6 +350,10 @@ def main() -> None:
         "Created username '%s' (Keycloak id=%s, Auth0 id=%s)",
         result["username"], result["keycloak_id"], result["auth0_id"],
     )
+
+    # Show correlated group + role membership across both systems
+    membership = manager.get_membership(result["username"], target_email)
+    logger.info("Membership: %s", membership)
 
 
 if __name__ == "__main__":

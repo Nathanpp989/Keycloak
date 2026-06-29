@@ -296,3 +296,141 @@ def test_setup_keycloak_env_override_wins(monkeypatch):
     monkeypatch.setenv("KEYCLOAK_CLIENT_SECRET", "env-override")
     secret = m.setup_keycloak()
     assert secret == "env-override"   # explicit env var takes precedence
+
+
+# ──────────────────────────────────────────────
+# /users/membership  (UserManager.get_membership) — AUTH-PROTECTED
+# ──────────────────────────────────────────────
+def test_membership_requires_authentication(client, monkeypatch):
+    monkeypatch.setattr(main, "keycloak_oidc", None)
+    mgr = MagicMock()
+    monkeypatch.setattr(main, "user_manager", mgr)
+    r = client.get("/users/membership", params={"username": "u", "email": "e@x.com"})
+    assert r.status_code in (401, 403, 503)
+    mgr.get_membership.assert_not_called()
+
+def test_membership_unavailable_when_manager_none(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        monkeypatch.setattr(main, "user_manager", None)
+        r = client.get("/users/membership", params={"username": "u", "email": "e@x.com"})
+        assert r.status_code == 503
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_membership_success(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        mgr.get_membership.return_value = {
+            "username": "u", "email": "e@x.com",
+            "keycloak": {"found": True, "groups": [], "roles": {"realm": [], "client": []}},
+            "auth0": {"found": False, "groups": [], "roles": []},
+            "correlation": {"groups_in_both": [], "roles_in_both": []},
+        }
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.get("/users/membership", params={"username": "u", "email": "e@x.com"})
+        assert r.status_code == 200
+        assert r.json()["keycloak"]["found"] is True
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_membership_runtime_error_becomes_502(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        mgr.get_membership.side_effect = RuntimeError("missing read:roles scope")
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.get("/users/membership", params={"username": "u", "email": "e@x.com"})
+        assert r.status_code == 502
+        assert "read:roles" in r.json()["detail"]
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+# ──────────────────────────────────────────────
+# /groups  and  /users/groups  — group management (AUTH-PROTECTED)
+# ──────────────────────────────────────────────
+def test_create_group_requires_auth(client, monkeypatch):
+    monkeypatch.setattr(main, "keycloak_oidc", None)
+    mgr = MagicMock()
+    monkeypatch.setattr(main, "user_manager", mgr)
+    r = client.post("/groups", data={"name": "admins"})
+    assert r.status_code in (401, 403, 503)
+    mgr.create_group.assert_not_called()
+
+def test_create_group_success(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        mgr.create_group.return_value = {"keycloak_id": "g-1", "auth0_group": None}
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.post("/groups", data={"name": "admins"})
+        assert r.status_code == 200
+        assert r.json()["keycloak_id"] == "g-1"
+        mgr.create_group.assert_called_once_with("admins", parent_path=None)
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_create_subgroup_passes_parent(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        mgr.create_group.return_value = {"keycloak_id": "sub-1", "auth0_group": None}
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.post("/groups", data={"name": "billing", "parent_path": "/finance"})
+        assert r.status_code == 200
+        mgr.create_group.assert_called_once_with("billing", parent_path="/finance")
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_create_group_missing_parent_is_400(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        mgr.create_group.side_effect = ValueError("Keycloak parent group '/x' not found")
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.post("/groups", data={"name": "billing", "parent_path": "/x"})
+        assert r.status_code == 400
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_modify_group_membership_add(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        mgr.set_group_membership.return_value = {"keycloak": "added", "auth0": "skipped"}
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.post("/users/groups", data={
+            "username": "u", "email": "e@x.com", "group_name": "admins", "action": "add",
+        })
+        assert r.status_code == 200
+        assert r.json()["keycloak"] == "added"
+        mgr.set_group_membership.assert_called_once_with("u", "e@x.com", "admins", add=True)
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_modify_group_membership_revoke(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        mgr.set_group_membership.return_value = {"keycloak": "removed", "auth0": "skipped"}
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.post("/users/groups", data={
+            "username": "u", "email": "e@x.com", "group_name": "admins", "action": "revoke",
+        })
+        assert r.status_code == 200
+        mgr.set_group_membership.assert_called_once_with("u", "e@x.com", "admins", add=False)
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_modify_group_membership_bad_action_is_422(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        monkeypatch.setattr(main, "user_manager", MagicMock())
+        r = client.post("/users/groups", data={
+            "username": "u", "email": "e@x.com", "group_name": "admins", "action": "frobnicate",
+        })
+        assert r.status_code == 422
+    finally:
+        main.app.dependency_overrides.clear()
