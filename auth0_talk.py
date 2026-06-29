@@ -206,8 +206,13 @@ def main() -> None:
     realm               = os.environ.get("KEYCLOAK_REALM", "Premkey")
 
     # ---- Keycloak side ----
-    kc_token = get_keycloak_admin_token(keycloak_url, keycloak_admin_user, keycloak_admin_pass)
-    kc = KeycloakAdminAPI(keycloak_url, kc_token, realm)
+    # Use a token-getter so KeycloakAdminAPI always has a FRESH admin token.
+    # Keycloak admin tokens expire in ~60s; a one-time token would break later
+    # calls in this script if it runs longer than that.
+    def kc_token_getter() -> str:
+        return get_keycloak_admin_token(keycloak_url, keycloak_admin_user, keycloak_admin_pass)
+
+    kc = KeycloakAdminAPI(keycloak_url, kc_token_getter, realm)
 
     logger.info("Keycloak users in realm '%s' (first page): %d", realm, len(kc.list_users()))
     new_id = kc.create_user("newuser", "newemail@example.com", "ChangeMe123!")

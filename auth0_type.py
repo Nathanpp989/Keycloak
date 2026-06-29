@@ -172,8 +172,12 @@ def main() -> None:
     keycloak_admin_pass = os.environ.get("KEYCLOAK_ADMIN_PASSWORD", "admin")
     realm               = os.environ.get("KEYCLOAK_REALM", "Premkey")
 
-    kc_token = get_keycloak_admin_token(keycloak_url, keycloak_admin_user, keycloak_admin_pass)
-    keycloak = KeycloakAdminAPI(keycloak_url, kc_token, realm)
+    # Token-getter so KeycloakAdminAPI always uses a fresh admin token
+    # (Keycloak admin tokens expire in ~60s).
+    def kc_token_getter() -> str:
+        return get_keycloak_admin_token(keycloak_url, keycloak_admin_user, keycloak_admin_pass)
+
+    keycloak = KeycloakAdminAPI(keycloak_url, kc_token_getter, realm)
 
     auth0 = Auth0Connect(env["AUTH0_DOMAIN"], env["AUTH0_CLIENT_ID"], env["AUTH0_CLIENT_SECRET"])
     auth0_users = Auth0UsersAPI(auth0)
