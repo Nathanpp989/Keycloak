@@ -1028,3 +1028,38 @@ def test_manager_set_role_user_missing():
     assert summary["keycloak"] == "user-not-found"
     assert summary["auth0"] == "user-not-found"
     kc.assign_realm_role.assert_not_called()
+
+
+# ──────────────────────────────────────────────
+# Q1 regression: Auth0 list responses may be bare lists OR wrapped objects
+# ({"roles": [...]} / {"users": [...]}) when include_totals is set. These must
+# not crash with AttributeError.
+# ──────────────────────────────────────────────
+@responses.activate
+def test_get_role_by_name_handles_wrapped_response():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    # Wrapped form (include_totals style)
+    responses.add(responses.GET, f"https://{DOMAIN}/api/v2/roles",
+                  json={"roles": [{"id": "r1", "name": "editor"}], "total": 1}, status=200)
+    api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    role = api.get_role_by_name("editor")
+    assert role["id"] == "r1"
+
+@responses.activate
+def test_get_user_roles_handles_wrapped_response():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.GET, f"https://{DOMAIN}/api/v2/users/auth0|1/roles",
+                  json={"roles": [{"name": "editor"}], "total": 1}, status=200)
+    api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    assert api.get_user_roles("auth0|1") == ["editor"]
+
+@responses.activate
+def test_list_users_handles_wrapped_response():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.GET, f"https://{DOMAIN}/api/v2/users",
+                  json={"users": [{"email": "a@x.com"}], "total": 1}, status=200)
+    api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    assert len(api.list_users()) == 1

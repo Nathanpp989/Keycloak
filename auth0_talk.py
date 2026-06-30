@@ -33,6 +33,18 @@ def _explain_403(resp: requests.Response, needed_scope: str) -> None:
         )
 
 
+def _as_list(payload, wrapper_key: str) -> list:
+    """
+    Normalise an Auth0 list response. Auth0 endpoints return EITHER a bare list
+    OR a paginated object like {"<wrapper_key>": [...], "total": N, ...} when
+    include_totals is set. This returns the list either way, preventing a crash
+    where iterating a dict would yield its string keys.
+    """
+    if isinstance(payload, dict):
+        return payload.get(wrapper_key, [])
+    return payload if isinstance(payload, list) else []
+
+
 # ──────────────────────────────────────────────
 # Keycloak Admin API — user management
 # ──────────────────────────────────────────────
@@ -329,7 +341,7 @@ class Auth0UsersAPI:
         )
         _explain_403(resp, "read:users")   # J2 FIX: clear message on missing scope
         resp.raise_for_status()
-        return resp.json()
+        return _as_list(resp.json(), "users")
 
     def create_user(self, email: str, password: str,
                     connection: str = "Username-Password-Authentication") -> dict:
@@ -371,7 +383,7 @@ class Auth0UsersAPI:
         resp = requests.get(url, headers=self.headers, timeout=10)
         _explain_403(resp, "read:roles")
         resp.raise_for_status()
-        return [r.get("name", "") for r in resp.json()]
+        return [r.get("name", "") for r in _as_list(resp.json(), "roles")]
 
     def _roles_base(self) -> str:
         # Roles live under /api/v2/roles; self.base is .../api/v2/users
@@ -387,7 +399,7 @@ class Auth0UsersAPI:
         _explain_403(resp, "read:roles")
         resp.raise_for_status()
         # name_filter is a substring match, so confirm an exact (case-insensitive) hit
-        for r in resp.json():
+        for r in _as_list(resp.json(), "roles"):
             if r.get("name", "").lower() == role_name.lower():
                 return r
         return None
