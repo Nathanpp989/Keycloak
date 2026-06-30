@@ -134,6 +134,7 @@ python login_flow.py
 | GET | `/users/membership` | Bearer | A user's groups + roles in both systems, correlated |
 | POST | `/groups` | Bearer | Create a group/subgroup in Keycloak (+ Auth0 if configured) |
 | POST | `/users/groups` | Bearer | Add or revoke a user's group membership (`action=add\|revoke`) |
+| POST | `/users/roles` | Bearer | Assign or revoke a user's role in both systems (`action=assign\|revoke`) |
 | GET | `/secure-data` | depends | Uses a server-side Auth0 M2M token |
 | GET | `/keys` | none | Public RSA key |
 

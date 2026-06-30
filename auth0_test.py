@@ -892,3 +892,139 @@ def test_manager_set_group_membership_user_not_found():
     summary = mgr.set_group_membership("ghost", "ghost@x.com", "admins", add=True)
     assert summary["keycloak"] == "user-not-found"
     kc.add_user_to_group.assert_not_called()
+
+
+# ──────────────────────────────────────────────
+# Keycloak realm-role assign / revoke
+# ──────────────────────────────────────────────
+@responses.activate
+def test_keycloak_assign_realm_role():
+    from auth0_talk import KeycloakAdminAPI
+    role_url = f"{KC_URL}/admin/realms/{REALM}/roles/admin"
+    map_url = f"{KC_URL}/admin/realms/{REALM}/users/u-1/role-mappings/realm"
+    responses.add(responses.GET, role_url, json={"id": "r-1", "name": "admin"}, status=200)
+    responses.add(responses.POST, map_url, status=204)
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    api.assign_realm_role("u-1", "admin")  # no raise
+    # The POST body must be the full role representation
+    post = [c for c in responses.calls if c.request.method == "POST"][0]
+    assert json.loads(post.request.body)[0]["id"] == "r-1"
+
+@responses.activate
+def test_keycloak_assign_realm_role_unknown_raises():
+    from auth0_talk import KeycloakAdminAPI
+    responses.add(responses.GET, f"{KC_URL}/admin/realms/{REALM}/roles/ghost", status=404)
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    with pytest.raises(ValueError, match="not found"):
+        api.assign_realm_role("u-1", "ghost")
+
+@responses.activate
+def test_keycloak_revoke_realm_role():
+    from auth0_talk import KeycloakAdminAPI
+    role_url = f"{KC_URL}/admin/realms/{REALM}/roles/admin"
+    map_url = f"{KC_URL}/admin/realms/{REALM}/users/u-1/role-mappings/realm"
+    responses.add(responses.GET, role_url, json={"id": "r-1", "name": "admin"}, status=200)
+    responses.add(responses.DELETE, map_url, status=204)
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    api.revoke_realm_role("u-1", "admin")  # no raise
+
+
+# ──────────────────────────────────────────────
+# Auth0 role assign / revoke
+# ──────────────────────────────────────────────
+@responses.activate
+def test_auth0_assign_role():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.GET, f"https://{DOMAIN}/api/v2/roles",
+                  json=[{"id": "rol_1", "name": "editor"}], status=200)
+    responses.add(responses.POST, f"https://{DOMAIN}/api/v2/users/auth0|1/roles", status=204)
+    api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    api.assign_role("auth0|1", "editor")  # no raise
+    post = [c for c in responses.calls if c.request.method == "POST"
+            and c.request.url.endswith("/roles")][0]
+    assert json.loads(post.request.body)["roles"] == ["rol_1"]
+
+@responses.activate
+def test_auth0_assign_role_unknown_raises():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.GET, f"https://{DOMAIN}/api/v2/roles", json=[], status=200)
+    api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    with pytest.raises(ValueError, match="not found"):
+        api.assign_role("auth0|1", "ghost")
+
+@responses.activate
+def test_auth0_get_role_by_name_exact_match():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    # name_filter is a substring match; ensure we pick the EXACT name
+    responses.add(responses.GET, f"https://{DOMAIN}/api/v2/roles",
+                  json=[{"id": "r1", "name": "editor"}, {"id": "r2", "name": "editor-lite"}],
+                  status=200)
+    api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    role = api.get_role_by_name("editor")
+    assert role["id"] == "r1"
+
+@responses.activate
+def test_auth0_revoke_role():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.GET, f"https://{DOMAIN}/api/v2/roles",
+                  json=[{"id": "rol_1", "name": "editor"}], status=200)
+    responses.add(responses.DELETE, f"https://{DOMAIN}/api/v2/users/auth0|1/roles", status=204)
+    api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    api.revoke_role("auth0|1", "editor")  # no raise
+
+
+# ──────────────────────────────────────────────
+# UserManager.set_role — symmetric cross-system
+# ──────────────────────────────────────────────
+def test_manager_set_role_assign_both():
+    from auth0_type import UserManager
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    mgr = UserManager(kc, a0)
+    mgr._keycloak_user_id = lambda u, e: "kc-1"
+    mgr._auth0_user_id = lambda e: "auth0|1"
+    summary = mgr.set_role("user", "u@x.com", "admin", assign=True)
+    assert summary["keycloak"] == "assigned"
+    assert summary["auth0"] == "assigned"
+    kc.assign_realm_role.assert_called_once_with("kc-1", "admin")
+    a0.assign_role.assert_called_once_with("auth0|1", "admin")
+
+def test_manager_set_role_revoke_both():
+    from auth0_type import UserManager
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    mgr = UserManager(kc, a0)
+    mgr._keycloak_user_id = lambda u, e: "kc-1"
+    mgr._auth0_user_id = lambda e: "auth0|1"
+    summary = mgr.set_role("user", "u@x.com", "admin", assign=False)
+    assert summary["keycloak"] == "revoked"
+    assert summary["auth0"] == "revoked"
+
+def test_manager_set_role_unknown_role_per_system():
+    from auth0_type import UserManager
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    kc.assign_realm_role.side_effect = ValueError("not found")
+    a0.assign_role.side_effect = ValueError("not found")
+    mgr = UserManager(kc, a0)
+    mgr._keycloak_user_id = lambda u, e: "kc-1"
+    mgr._auth0_user_id = lambda e: "auth0|1"
+    summary = mgr.set_role("user", "u@x.com", "ghost", assign=True)
+    assert summary["keycloak"] == "role-not-found"
+    assert summary["auth0"] == "role-not-found"
+
+def test_manager_set_role_user_missing():
+    from auth0_type import UserManager
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    mgr = UserManager(kc, a0)
+    mgr._keycloak_user_id = lambda u, e: None
+    mgr._auth0_user_id = lambda e: None
+    summary = mgr.set_role("ghost", "ghost@x.com", "admin", assign=True)
+    assert summary["keycloak"] == "user-not-found"
+    assert summary["auth0"] == "user-not-found"
+    kc.assign_realm_role.assert_not_called()

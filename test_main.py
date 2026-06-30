@@ -434,3 +434,68 @@ def test_modify_group_membership_bad_action_is_422(client, monkeypatch):
         assert r.status_code == 422
     finally:
         main.app.dependency_overrides.clear()
+
+
+# ──────────────────────────────────────────────
+# /users/roles — role assign/revoke (AUTH-PROTECTED)
+# ──────────────────────────────────────────────
+def test_role_change_requires_auth(client, monkeypatch):
+    monkeypatch.setattr(main, "keycloak_oidc", None)
+    mgr = MagicMock()
+    monkeypatch.setattr(main, "user_manager", mgr)
+    r = client.post("/users/roles", data={
+        "username": "u", "email": "e@x.com", "role_name": "admin", "action": "assign",
+    })
+    assert r.status_code in (401, 403, 503)
+    mgr.set_role.assert_not_called()
+
+def test_role_assign_success(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        mgr.set_role.return_value = {"keycloak": "assigned", "auth0": "assigned"}
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.post("/users/roles", data={
+            "username": "u", "email": "e@x.com", "role_name": "admin", "action": "assign",
+        })
+        assert r.status_code == 200
+        assert r.json()["keycloak"] == "assigned"
+        mgr.set_role.assert_called_once_with("u", "e@x.com", "admin", assign=True)
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_role_revoke_success(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        mgr.set_role.return_value = {"keycloak": "revoked", "auth0": "revoked"}
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.post("/users/roles", data={
+            "username": "u", "email": "e@x.com", "role_name": "admin", "action": "revoke",
+        })
+        assert r.status_code == 200
+        mgr.set_role.assert_called_once_with("u", "e@x.com", "admin", assign=False)
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_role_bad_action_is_422(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        monkeypatch.setattr(main, "user_manager", MagicMock())
+        r = client.post("/users/roles", data={
+            "username": "u", "email": "e@x.com", "role_name": "admin", "action": "nope",
+        })
+        assert r.status_code == 422
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_role_unavailable_when_manager_none(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        monkeypatch.setattr(main, "user_manager", None)
+        r = client.post("/users/roles", data={
+            "username": "u", "email": "e@x.com", "role_name": "admin", "action": "assign",
+        })
+        assert r.status_code == 503
+    finally:
+        main.app.dependency_overrides.clear()

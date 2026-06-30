@@ -271,6 +271,48 @@ class UserManager:
                 summary["auth0"] = "user-not-found"
         return summary
 
+    def set_role(self, username: str, email: str, role_name: str,
+                 assign: bool = True) -> dict:
+        """
+        Assign (assign=True) or revoke (assign=False) a role named `role_name`
+        for a user, in whichever systems the user exists. In Keycloak this maps
+        to a realm role; in Auth0 to an Authorization Core role.
+        Returns a per-system summary: assigned / revoked / role-not-found /
+        user-not-found.
+        """
+        summary: dict = {"keycloak": "skipped", "auth0": "skipped"}
+
+        # Keycloak (realm role)
+        kc_uid = self._keycloak_user_id(username, email)
+        if kc_uid:
+            try:
+                if assign:
+                    self.keycloak.assign_realm_role(kc_uid, role_name)
+                    summary["keycloak"] = "assigned"
+                else:
+                    self.keycloak.revoke_realm_role(kc_uid, role_name)
+                    summary["keycloak"] = "revoked"
+            except ValueError:
+                summary["keycloak"] = "role-not-found"
+        else:
+            summary["keycloak"] = "user-not-found"
+
+        # Auth0 (Authorization Core role)
+        a0_uid = self._auth0_user_id(email)
+        if a0_uid:
+            try:
+                if assign:
+                    self.auth0_users.assign_role(a0_uid, role_name)
+                    summary["auth0"] = "assigned"
+                else:
+                    self.auth0_users.revoke_role(a0_uid, role_name)
+                    summary["auth0"] = "revoked"
+            except ValueError:
+                summary["auth0"] = "role-not-found"
+        else:
+            summary["auth0"] = "user-not-found"
+        return summary
+
     # ── creation ───────────────────────────────────────────────
     def add_user(self, email: str, password: str | None = None,
                  username: str | None = None) -> dict:

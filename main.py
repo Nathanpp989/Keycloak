@@ -402,6 +402,33 @@ def modify_group_membership(
         logger.error("Group membership change failed: %s", exc)
         raise HTTPException(status_code=500, detail="Group membership change failed")
 
+@app.post("/users/roles")
+def modify_user_role(
+    username: str = Form(...),
+    email: str = Form(...),
+    role_name: str = Form(...),
+    action: str = Form(...),  # "assign" or "revoke"
+    token_info: dict = Depends(require_keycloak_auth),
+):
+    """
+    Assign or revoke a role for a user across systems (Keycloak realm role +
+    Auth0 Authorization Core role). Protected. `action` must be 'assign'/'revoke'.
+    """
+    if user_manager is None:
+        raise HTTPException(status_code=503,
+                            detail="User management is unavailable (Auth0 not configured).")
+    if action not in ("assign", "revoke"):
+        raise HTTPException(status_code=422, detail="action must be 'assign' or 'revoke'")
+    try:
+        return user_manager.set_role(
+            username, email, role_name, assign=(action == "assign")
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.error("Role change failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Role change failed")
+
 @app.get("/keys")
 def get_keys():
     if not public_pem:

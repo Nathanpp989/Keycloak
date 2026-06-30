@@ -172,6 +172,48 @@ class KeycloakAdminAPI:
                 client_roles.extend(m.get("name", "") for m in client_entry.get("mappings", []))
         return {"realm": realm_roles, "client": client_roles}
 
+    def get_realm_role(self, role_name: str) -> dict | None:
+        """Fetch a realm role's full representation (needed for assignment)."""
+        url = f"{self.base}/admin/realms/{self.realm}/roles/{role_name}"
+        resp = requests.get(url, headers=self.headers, timeout=10)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
+
+    def assign_realm_role(self, user_id: str, role_name: str) -> None:
+        """
+        Assign a realm role to a user. Keycloak's role-mapping API requires the
+        FULL role representation (id + name), so we look the role up first.
+        Idempotent: assigning an already-assigned role is a no-op for Keycloak.
+        """
+        role = self.get_realm_role(role_name)
+        if role is None:
+            raise ValueError(f"Keycloak realm role '{role_name}' not found")
+        url = f"{self.base}/admin/realms/{self.realm}/users/{user_id}/role-mappings/realm"
+        resp = requests.post(url, headers=self.headers, json=[role], timeout=10)
+        if resp.status_code in (204, 201):
+            logger.info("Assigned realm role '%s' to user %s", role_name, user_id)
+        else:
+            logger.error("Failed to assign realm role: %d %s", resp.status_code, resp.text)
+            resp.raise_for_status()
+
+    def revoke_realm_role(self, user_id: str, role_name: str) -> None:
+        """
+        Revoke a realm role from a user. Like assignment, needs the full role
+        representation. Idempotent: revoking an unassigned role is treated as done.
+        """
+        role = self.get_realm_role(role_name)
+        if role is None:
+            raise ValueError(f"Keycloak realm role '{role_name}' not found")
+        url = f"{self.base}/admin/realms/{self.realm}/users/{user_id}/role-mappings/realm"
+        resp = requests.delete(url, headers=self.headers, json=[role], timeout=10)
+        if resp.status_code in (204, 404):
+            logger.info("Revoked realm role '%s' from user %s", role_name, user_id)
+        else:
+            logger.error("Failed to revoke realm role: %d %s", resp.status_code, resp.text)
+            resp.raise_for_status()
+
     # ── group management ───────────────────────────────────────
     def _groups_url(self, group_id: str | None = None) -> str:
         url = f"{self.base}/admin/realms/{self.realm}/groups"
@@ -330,6 +372,58 @@ class Auth0UsersAPI:
         _explain_403(resp, "read:roles")
         resp.raise_for_status()
         return [r.get("name", "") for r in resp.json()]
+
+    def _roles_base(self) -> str:
+        # Roles live under /api/v2/roles; self.base is .../api/v2/users
+        return self.base.rsplit("/users", 1)[0] + "/roles"
+
+    def get_role_by_name(self, role_name: str) -> dict | None:
+        """
+        Find an Auth0 role by name. Assignment needs the role ID, not the name.
+        Requires the 'read:roles' scope.
+        """
+        resp = requests.get(self._roles_base(), headers=self.headers,
+                            params={"name_filter": role_name}, timeout=10)
+        _explain_403(resp, "read:roles")
+        resp.raise_for_status()
+        # name_filter is a substring match, so confirm an exact (case-insensitive) hit
+        for r in resp.json():
+            if r.get("name", "").lower() == role_name.lower():
+                return r
+        return None
+
+    def assign_role(self, user_id: str, role_name: str) -> None:
+        """
+        Assign an Auth0 role to a user. Requires 'update:users' (and 'read:roles'
+        to resolve the role id). Idempotent on Auth0's side.
+        """
+        role = self.get_role_by_name(role_name)
+        if role is None:
+            raise ValueError(f"Auth0 role '{role_name}' not found")
+        url = f"{self.base}/{user_id}/roles"
+        resp = requests.post(url, headers=self.headers,
+                            json={"roles": [role["id"]]}, timeout=10)
+        _explain_403(resp, "update:users")
+        if resp.status_code in (200, 204):
+            logger.info("Assigned Auth0 role '%s' to user %s", role_name, user_id)
+        else:
+            logger.error("Failed to assign Auth0 role: %d %s", resp.status_code, resp.text)
+            resp.raise_for_status()
+
+    def revoke_role(self, user_id: str, role_name: str) -> None:
+        """Revoke an Auth0 role from a user. Requires 'update:users' + 'read:roles'."""
+        role = self.get_role_by_name(role_name)
+        if role is None:
+            raise ValueError(f"Auth0 role '{role_name}' not found")
+        url = f"{self.base}/{user_id}/roles"
+        resp = requests.delete(url, headers=self.headers,
+                              json={"roles": [role["id"]]}, timeout=10)
+        _explain_403(resp, "update:users")
+        if resp.status_code in (200, 204):
+            logger.info("Revoked Auth0 role '%s' from user %s", role_name, user_id)
+        else:
+            logger.error("Failed to revoke Auth0 role: %d %s", resp.status_code, resp.text)
+            resp.raise_for_status()
 
 
 # ──────────────────────────────────────────────
