@@ -314,6 +314,33 @@ class KeycloakAdminAPI:
             logger.error("Failed to remove user from group: %d %s", resp.status_code, resp.text)
             resp.raise_for_status()
 
+    def update_group(self, group_id: str, **fields) -> None:
+        """
+        Update a Keycloak group (e.g. rename via name=, or attributes=).
+        Keycloak's group PUT replaces the representation, so we read-modify-write
+        to avoid dropping other fields.
+        """
+        get_resp = requests.get(self._groups_url(group_id), headers=self.headers, timeout=10)
+        get_resp.raise_for_status()
+        current = get_resp.json()
+        current.update(fields)
+        resp = requests.put(self._groups_url(group_id), headers=self.headers,
+                          json=current, timeout=10)
+        if resp.status_code in (200, 204):
+            logger.info("Updated Keycloak group %s", group_id)
+        else:
+            logger.error("Failed to update group: %d %s", resp.status_code, resp.text)
+            resp.raise_for_status()
+
+    def delete_group(self, group_id: str) -> None:
+        """Delete a Keycloak group (and its subgroups). Idempotent on 404."""
+        resp = requests.delete(self._groups_url(group_id), headers=self.headers, timeout=10)
+        if resp.status_code in (204, 404):
+            logger.info("Deleted Keycloak group %s", group_id)
+        else:
+            logger.error("Failed to delete group: %d %s", resp.status_code, resp.text)
+            resp.raise_for_status()
+
 
 # ──────────────────────────────────────────────
 # Auth0 Management API — user management
@@ -435,6 +462,118 @@ class Auth0UsersAPI:
             logger.info("Revoked Auth0 role '%s' from user %s", role_name, user_id)
         else:
             logger.error("Failed to revoke Auth0 role: %d %s", resp.status_code, resp.text)
+            resp.raise_for_status()
+
+
+# ──────────────────────────────────────────────
+# Auth0 Organizations (Management API)
+# Requires scopes: read:organizations, create:organizations,
+# update:organizations, delete:organizations, read:organization_members,
+# create:organization_members, delete:organization_members.
+# ──────────────────────────────────────────────
+class Auth0OrganizationsAPI:
+    def __init__(self, auth0: Auth0Connect):
+        self.auth0 = auth0
+        self.base = f"https://{auth0.domain}/api/v2/organizations"
+
+    @property
+    def headers(self) -> dict:
+        return {
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {self.auth0.token}",
+        }
+
+    def list_organizations(self, page: int = 0, per_page: int = 50) -> list:
+        resp = requests.get(self.base, headers=self.headers,
+                            params={"page": page, "per_page": per_page}, timeout=10)
+        _explain_403(resp, "read:organizations")
+        resp.raise_for_status()
+        return _as_list(resp.json(), "organizations")
+
+    def get_organization(self, org_id: str) -> dict:
+        resp = requests.get(f"{self.base}/{org_id}", headers=self.headers, timeout=10)
+        _explain_403(resp, "read:organizations")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_organization_by_name(self, name: str) -> dict | None:
+        """Look up an organization by its (unique) name via the name endpoint."""
+        resp = requests.get(f"{self.base}/name/{name}", headers=self.headers, timeout=10)
+        if resp.status_code == 404:
+            return None
+        _explain_403(resp, "read:organizations")
+        resp.raise_for_status()
+        return resp.json()
+
+    def create_organization(self, name: str, display_name: str | None = None) -> dict:
+        """
+        Get-or-create an organization by name (names are unique in Auth0).
+        Returns the organization dict.
+        """
+        existing = self.get_organization_by_name(name)
+        if existing:
+            logger.info("Auth0 organization '%s' already exists; reusing", name)
+            return existing
+        payload = {"name": name, "display_name": display_name or name}
+        resp = requests.post(self.base, headers=self.headers, json=payload, timeout=10)
+        _explain_403(resp, "create:organizations")
+        if resp.status_code in (200, 201):
+            logger.info("Created Auth0 organization '%s'", name)
+            return resp.json()
+        logger.error("Failed to create organization: %d %s", resp.status_code, resp.text)
+        resp.raise_for_status()
+        return {}
+
+    def update_organization(self, org_id: str, **fields) -> dict:
+        """Update an organization (e.g. display_name, branding, metadata)."""
+        resp = requests.patch(f"{self.base}/{org_id}", headers=self.headers,
+                             json=fields, timeout=10)
+        _explain_403(resp, "update:organizations")
+        if resp.status_code == 200:
+            logger.info("Updated Auth0 organization %s", org_id)
+            return resp.json()
+        logger.error("Failed to update organization: %d %s", resp.status_code, resp.text)
+        resp.raise_for_status()
+        return {}
+
+    def delete_organization(self, org_id: str) -> None:
+        """Delete an organization. Idempotent: a 404 is treated as already gone."""
+        resp = requests.delete(f"{self.base}/{org_id}", headers=self.headers, timeout=10)
+        _explain_403(resp, "delete:organizations")
+        if resp.status_code in (204, 404):
+            logger.info("Deleted Auth0 organization %s", org_id)
+        else:
+            logger.error("Failed to delete organization: %d %s", resp.status_code, resp.text)
+            resp.raise_for_status()
+
+    # ── members ────────────────────────────────────────────────
+    def list_members(self, org_id: str, page: int = 0, per_page: int = 50) -> list:
+        resp = requests.get(f"{self.base}/{org_id}/members", headers=self.headers,
+                            params={"page": page, "per_page": per_page}, timeout=10)
+        _explain_403(resp, "read:organization_members")
+        resp.raise_for_status()
+        return _as_list(resp.json(), "members")
+
+    def add_members(self, org_id: str, user_ids: list[str]) -> None:
+        """Add one or more users to an organization."""
+        resp = requests.post(f"{self.base}/{org_id}/members", headers=self.headers,
+                            json={"members": user_ids}, timeout=10)
+        _explain_403(resp, "create:organization_members")
+        if resp.status_code in (200, 204):
+            logger.info("Added %d member(s) to organization %s", len(user_ids), org_id)
+        else:
+            logger.error("Failed to add members: %d %s", resp.status_code, resp.text)
+            resp.raise_for_status()
+
+    def remove_members(self, org_id: str, user_ids: list[str]) -> None:
+        """Remove one or more users from an organization. Idempotent."""
+        resp = requests.delete(f"{self.base}/{org_id}/members", headers=self.headers,
+                             json={"members": user_ids}, timeout=10)
+        _explain_403(resp, "delete:organization_members")
+        if resp.status_code in (200, 204, 404):
+            logger.info("Removed %d member(s) from organization %s", len(user_ids), org_id)
+        else:
+            logger.error("Failed to remove members: %d %s", resp.status_code, resp.text)
             resp.raise_for_status()
 
 
@@ -576,6 +715,26 @@ class Auth0AuthzExtensionAPI:
         if resp.status_code not in (200, 204):
             resp.raise_for_status()
         logger.info("Removed user %s from Authz Extension group %s", user_id, group_id)
+
+    def update_group(self, group_id: str, name: str | None = None,
+                     description: str | None = None) -> dict:
+        """Update an Authorization Extension group's name/description."""
+        body: dict = {}
+        if name is not None:
+            body["name"] = name
+        if description is not None:
+            body["description"] = description
+        resp = self._ext_request("PUT", f"groups/{group_id}", json=body)
+        resp.raise_for_status()
+        logger.info("Updated Authz Extension group %s", group_id)
+        return resp.json() if resp.text else {}
+
+    def delete_group(self, group_id: str) -> None:
+        """Delete an Authorization Extension group. Idempotent on 404."""
+        resp = self._ext_request("DELETE", f"groups/{group_id}")
+        if resp.status_code not in (200, 204, 404):
+            resp.raise_for_status()
+        logger.info("Deleted Authz Extension group %s", group_id)
 
 
 def main() -> None:

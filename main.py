@@ -14,7 +14,7 @@ from keycloak.exceptions import KeycloakAuthenticationError
 
 # User-flow integration (auth0_connect.py / auth0_talk.py / auth0_type.py)
 from auth0_connect import Auth0Connect, get_keycloak_admin_token
-from auth0_talk import KeycloakAdminAPI, Auth0UsersAPI, Auth0AuthzExtensionAPI
+from auth0_talk import KeycloakAdminAPI, Auth0UsersAPI, Auth0AuthzExtensionAPI, Auth0OrganizationsAPI
 from auth0_type import UserManager
 
 # I3 FIX: configure logging before anything else so all logger.* calls produce output
@@ -169,7 +169,9 @@ def _build_user_manager() -> UserManager | None:
     authz_url = os.environ.get("AUTH0_AUTHZ_EXTENSION_URL")
     if authz_url:
         authz = Auth0AuthzExtensionAPI(auth0_conn, authz_url)
-    return UserManager(keycloak_api, auth0_users, auth0_authz=authz)
+    # Auth0 Organizations are always available via the Management API.
+    auth0_orgs = Auth0OrganizationsAPI(auth0_conn)
+    return UserManager(keycloak_api, auth0_users, auth0_authz=authz, auth0_orgs=auth0_orgs)
 
 
 @asynccontextmanager
@@ -428,6 +430,130 @@ def modify_user_role(
     except Exception as exc:
         logger.error("Role change failed: %s", exc)
         raise HTTPException(status_code=500, detail="Role change failed")
+
+@app.patch("/groups")
+def update_group_endpoint(
+    group: str = Form(...),
+    new_name: str = Form(...),
+    token_info: dict = Depends(require_keycloak_auth),
+):
+    """Rename a group (by path or name) across systems. Protected."""
+    if user_manager is None:
+        raise HTTPException(status_code=503,
+                            detail="User management is unavailable (Auth0 not configured).")
+    try:
+        return user_manager.update_group(group, new_name)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.error("Group update failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Group update failed")
+
+@app.delete("/groups")
+def delete_group_endpoint(
+    group: str,
+    token_info: dict = Depends(require_keycloak_auth),
+):
+    """Delete a group (by path or name) across systems. Protected."""
+    if user_manager is None:
+        raise HTTPException(status_code=503,
+                            detail="User management is unavailable (Auth0 not configured).")
+    try:
+        return user_manager.delete_group(group)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.error("Group delete failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Group delete failed")
+
+@app.post("/organizations")
+def create_organization_endpoint(
+    name: str = Form(...),
+    display_name: str | None = Form(default=None),
+    token_info: dict = Depends(require_keycloak_auth),
+):
+    """Create (or reuse) an Auth0 organization. Protected."""
+    if user_manager is None or user_manager.auth0_orgs is None:
+        raise HTTPException(status_code=503, detail="Organizations API unavailable.")
+    try:
+        return user_manager.auth0_orgs.create_organization(name, display_name=display_name)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.error("Organization create failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Organization create failed")
+
+@app.get("/organizations")
+def list_organizations_endpoint(
+    token_info: dict = Depends(require_keycloak_auth),
+):
+    """List Auth0 organizations. Protected."""
+    if user_manager is None or user_manager.auth0_orgs is None:
+        raise HTTPException(status_code=503, detail="Organizations API unavailable.")
+    try:
+        return {"organizations": user_manager.auth0_orgs.list_organizations()}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.error("Organization list failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Organization list failed")
+
+@app.patch("/organizations/{org_id}")
+def update_organization_endpoint(
+    org_id: str,
+    display_name: str = Form(...),
+    token_info: dict = Depends(require_keycloak_auth),
+):
+    """Update an Auth0 organization's display name. Protected."""
+    if user_manager is None or user_manager.auth0_orgs is None:
+        raise HTTPException(status_code=503, detail="Organizations API unavailable.")
+    try:
+        return user_manager.auth0_orgs.update_organization(org_id, display_name=display_name)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.error("Organization update failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Organization update failed")
+
+@app.delete("/organizations/{org_id}")
+def delete_organization_endpoint(
+    org_id: str,
+    token_info: dict = Depends(require_keycloak_auth),
+):
+    """Delete an Auth0 organization. Protected."""
+    if user_manager is None or user_manager.auth0_orgs is None:
+        raise HTTPException(status_code=503, detail="Organizations API unavailable.")
+    try:
+        user_manager.auth0_orgs.delete_organization(org_id)
+        return {"deleted": org_id}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.error("Organization delete failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Organization delete failed")
+
+@app.post("/organizations/members")
+def organization_membership_endpoint(
+    email: str = Form(...),
+    org_name: str = Form(...),
+    action: str = Form(...),  # "add" or "remove"
+    token_info: dict = Depends(require_keycloak_auth),
+):
+    """Add or remove a user (by email) from an Auth0 organization. Protected."""
+    if user_manager is None or user_manager.auth0_orgs is None:
+        raise HTTPException(status_code=503, detail="Organizations API unavailable.")
+    if action not in ("add", "remove"):
+        raise HTTPException(status_code=422, detail="action must be 'add' or 'remove'")
+    try:
+        status = user_manager.set_organization_membership(
+            email, org_name, add=(action == "add")
+        )
+        return {"status": status}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.error("Organization membership change failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Organization membership change failed")
 
 @app.get("/keys")
 def get_keys():

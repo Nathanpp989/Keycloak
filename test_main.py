@@ -499,3 +499,128 @@ def test_role_unavailable_when_manager_none(client, monkeypatch):
         assert r.status_code == 503
     finally:
         main.app.dependency_overrides.clear()
+
+
+# ──────────────────────────────────────────────
+# Group update/delete + Organizations endpoints (AUTH-PROTECTED)
+# ──────────────────────────────────────────────
+def test_update_group_endpoint(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        mgr.update_group.return_value = {"keycloak": "updated", "auth0": "skipped"}
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.patch("/groups", data={"group": "/admins", "new_name": "superadmins"})
+        assert r.status_code == 200
+        mgr.update_group.assert_called_once_with("/admins", "superadmins")
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_delete_group_endpoint(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        mgr.delete_group.return_value = {"keycloak": "deleted", "auth0": "skipped"}
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.delete("/groups", params={"group": "/admins"})
+        assert r.status_code == 200
+        mgr.delete_group.assert_called_once_with("/admins")
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_group_endpoints_require_auth(client, monkeypatch):
+    monkeypatch.setattr(main, "keycloak_oidc", None)
+    monkeypatch.setattr(main, "user_manager", MagicMock())
+    assert client.patch("/groups", data={"group": "g", "new_name": "n"}).status_code in (401, 403, 503)
+    assert client.request("DELETE", "/groups", params={"group": "g"}).status_code in (401, 403, 503)
+
+def _mgr_with_orgs():
+    mgr = MagicMock()
+    mgr.auth0_orgs = MagicMock()
+    return mgr
+
+def test_create_organization_endpoint(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = _mgr_with_orgs()
+        mgr.auth0_orgs.create_organization.return_value = {"id": "org_1", "name": "acme"}
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.post("/organizations", data={"name": "acme"})
+        assert r.status_code == 200
+        assert r.json()["id"] == "org_1"
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_organizations_unavailable_without_orgs_api(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        mgr.auth0_orgs = None   # orgs API not configured
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.get("/organizations")
+        assert r.status_code == 503
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_list_organizations_endpoint(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = _mgr_with_orgs()
+        mgr.auth0_orgs.list_organizations.return_value = [{"id": "org_1"}]
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.get("/organizations")
+        assert r.status_code == 200
+        assert r.json()["organizations"][0]["id"] == "org_1"
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_update_organization_endpoint(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = _mgr_with_orgs()
+        mgr.auth0_orgs.update_organization.return_value = {"id": "org_1", "display_name": "Acme"}
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.patch("/organizations/org_1", data={"display_name": "Acme"})
+        assert r.status_code == 200
+        mgr.auth0_orgs.update_organization.assert_called_once_with("org_1", display_name="Acme")
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_delete_organization_endpoint(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = _mgr_with_orgs()
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.delete("/organizations/org_1")
+        assert r.status_code == 200
+        assert r.json()["deleted"] == "org_1"
+        mgr.auth0_orgs.delete_organization.assert_called_once_with("org_1")
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_org_membership_endpoint_add(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = _mgr_with_orgs()
+        mgr.set_organization_membership.return_value = "added"
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.post("/organizations/members", data={
+            "email": "u@x.com", "org_name": "acme", "action": "add",
+        })
+        assert r.status_code == 200
+        assert r.json()["status"] == "added"
+        mgr.set_organization_membership.assert_called_once_with("u@x.com", "acme", add=True)
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_org_membership_endpoint_bad_action(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = _mgr_with_orgs()
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.post("/organizations/members", data={
+            "email": "u@x.com", "org_name": "acme", "action": "nope",
+        })
+        assert r.status_code == 422
+    finally:
+        main.app.dependency_overrides.clear()

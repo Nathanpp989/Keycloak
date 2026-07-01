@@ -1063,3 +1063,200 @@ def test_list_users_handles_wrapped_response():
                   json={"users": [{"email": "a@x.com"}], "total": 1}, status=200)
     api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
     assert len(api.list_users()) == 1
+
+
+# ──────────────────────────────────────────────
+# Auth0 Organizations API (CRUD + members)
+# ──────────────────────────────────────────────
+def _org_token():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+
+ORG_BASE = f"https://{DOMAIN}/api/v2/organizations"
+
+@responses.activate
+def test_org_list_handles_wrapped():
+    from auth0_talk import Auth0OrganizationsAPI
+    _org_token()
+    responses.add(responses.GET, ORG_BASE,
+                  json={"organizations": [{"id": "org_1", "name": "acme"}], "total": 1},
+                  status=200)
+    api = Auth0OrganizationsAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    orgs = api.list_organizations()
+    assert len(orgs) == 1 and orgs[0]["id"] == "org_1"
+
+@responses.activate
+def test_org_get_by_name_found():
+    from auth0_talk import Auth0OrganizationsAPI
+    _org_token()
+    responses.add(responses.GET, f"{ORG_BASE}/name/acme",
+                  json={"id": "org_1", "name": "acme"}, status=200)
+    api = Auth0OrganizationsAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    assert api.get_organization_by_name("acme")["id"] == "org_1"
+
+@responses.activate
+def test_org_get_by_name_missing_returns_none():
+    from auth0_talk import Auth0OrganizationsAPI
+    _org_token()
+    responses.add(responses.GET, f"{ORG_BASE}/name/ghost", status=404)
+    api = Auth0OrganizationsAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    assert api.get_organization_by_name("ghost") is None
+
+@responses.activate
+def test_org_create_new():
+    from auth0_talk import Auth0OrganizationsAPI
+    _org_token()
+    responses.add(responses.GET, f"{ORG_BASE}/name/acme", status=404)  # not existing
+    responses.add(responses.POST, ORG_BASE,
+                  json={"id": "org_1", "name": "acme"}, status=201)
+    api = Auth0OrganizationsAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    assert api.create_organization("acme")["id"] == "org_1"
+
+@responses.activate
+def test_org_create_reuses_existing():
+    from auth0_talk import Auth0OrganizationsAPI
+    _org_token()
+    responses.add(responses.GET, f"{ORG_BASE}/name/acme",
+                  json={"id": "org_ex", "name": "acme"}, status=200)
+    api = Auth0OrganizationsAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    assert api.create_organization("acme")["id"] == "org_ex"
+    assert not any(c.request.method == "POST" and c.request.url == ORG_BASE
+                   for c in responses.calls)
+
+@responses.activate
+def test_org_update():
+    from auth0_talk import Auth0OrganizationsAPI
+    _org_token()
+    responses.add(responses.PATCH, f"{ORG_BASE}/org_1",
+                  json={"id": "org_1", "display_name": "Acme Inc"}, status=200)
+    api = Auth0OrganizationsAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    assert api.update_organization("org_1", display_name="Acme Inc")["display_name"] == "Acme Inc"
+
+@responses.activate
+def test_org_delete_idempotent():
+    from auth0_talk import Auth0OrganizationsAPI
+    _org_token()
+    responses.add(responses.DELETE, f"{ORG_BASE}/org_1", status=404)  # already gone
+    api = Auth0OrganizationsAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    api.delete_organization("org_1")  # no raise
+
+@responses.activate
+def test_org_add_and_remove_members():
+    from auth0_talk import Auth0OrganizationsAPI
+    _org_token()
+    responses.add(responses.POST, f"{ORG_BASE}/org_1/members", status=204)
+    responses.add(responses.DELETE, f"{ORG_BASE}/org_1/members", status=204)
+    api = Auth0OrganizationsAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    api.add_members("org_1", ["auth0|1"])       # no raise
+    api.remove_members("org_1", ["auth0|1"])    # no raise
+
+@responses.activate
+def test_org_list_403_names_scope():
+    from auth0_talk import Auth0OrganizationsAPI
+    _org_token()
+    responses.add(responses.GET, ORG_BASE, json={"error": "Forbidden"}, status=403)
+    api = Auth0OrganizationsAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    with pytest.raises(RuntimeError, match="read:organizations"):
+        api.list_organizations()
+
+
+# ──────────────────────────────────────────────
+# Keycloak group update / delete
+# ──────────────────────────────────────────────
+@responses.activate
+def test_keycloak_update_group_read_modify_write():
+    from auth0_talk import KeycloakAdminAPI
+    url = f"{KC_URL}/admin/realms/{REALM}/groups/g-1"
+    responses.add(responses.GET, url,
+                  json={"id": "g-1", "name": "old", "path": "/old",
+                        "attributes": {"k": ["v"]}}, status=200)
+    responses.add(responses.PUT, url, status=204)
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    api.update_group("g-1", name="new")
+    put = [c for c in responses.calls if c.request.method == "PUT"][0]
+    body = json.loads(put.request.body)
+    assert body["name"] == "new"                 # updated
+    assert body["attributes"] == {"k": ["v"]}    # preserved
+
+@responses.activate
+def test_keycloak_delete_group_idempotent():
+    from auth0_talk import KeycloakAdminAPI
+    url = f"{KC_URL}/admin/realms/{REALM}/groups/g-1"
+    responses.add(responses.DELETE, url, status=404)  # already gone
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    api.delete_group("g-1")  # no raise
+
+
+# ──────────────────────────────────────────────
+# Authz Extension group update / delete
+# ──────────────────────────────────────────────
+@responses.activate
+def test_authz_update_group():
+    from auth0_talk import Auth0AuthzExtensionAPI
+    _ext_token()
+    responses.add(responses.PUT, f"{EXT_URL}/groups/g-1",
+                  json={"_id": "g-1", "name": "new"}, status=200)
+    ext = Auth0AuthzExtensionAPI(Auth0Connect(DOMAIN, "cid", "sec"), EXT_URL)
+    assert ext.update_group("g-1", name="new")["name"] == "new"
+
+@responses.activate
+def test_authz_delete_group_idempotent():
+    from auth0_talk import Auth0AuthzExtensionAPI
+    _ext_token()
+    responses.add(responses.DELETE, f"{EXT_URL}/groups/g-1", status=404)
+    ext = Auth0AuthzExtensionAPI(Auth0Connect(DOMAIN, "cid", "sec"), EXT_URL)
+    ext.delete_group("g-1")  # no raise
+
+
+# ──────────────────────────────────────────────
+# UserManager: org membership + group update/delete orchestration
+# ──────────────────────────────────────────────
+def test_manager_set_org_membership_add():
+    from auth0_type import UserManager
+    from auth0_talk import Auth0OrganizationsAPI
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    orgs = create_autospec(Auth0OrganizationsAPI, instance=True)
+    orgs.get_organization_by_name.return_value = {"id": "org_1", "name": "acme"}
+    mgr = UserManager(kc, a0, auth0_orgs=orgs)
+    mgr._auth0_user_id = lambda e: "auth0|1"
+    assert mgr.set_organization_membership("u@x.com", "acme", add=True) == "added"
+    orgs.add_members.assert_called_once_with("org_1", ["auth0|1"])
+
+def test_manager_set_org_membership_no_api():
+    from auth0_type import UserManager
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    mgr = UserManager(kc, a0)  # no orgs api
+    assert mgr.set_organization_membership("u@x.com", "acme", add=True) == "no-orgs-api"
+
+def test_manager_set_org_membership_org_missing():
+    from auth0_type import UserManager
+    from auth0_talk import Auth0OrganizationsAPI
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    orgs = create_autospec(Auth0OrganizationsAPI, instance=True)
+    orgs.get_organization_by_name.return_value = None
+    mgr = UserManager(kc, a0, auth0_orgs=orgs)
+    assert mgr.set_organization_membership("u@x.com", "ghost", add=True) == "org-not-found"
+
+def test_manager_update_group_keycloak_only():
+    from auth0_type import UserManager
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    kc.find_group_by_path.return_value = {"id": "g-1"}
+    mgr = UserManager(kc, a0)
+    summary = mgr.update_group("/admins", "superadmins")
+    assert summary["keycloak"] == "updated"
+    kc.update_group.assert_called_once_with("g-1", name="superadmins")
+
+def test_manager_delete_group_not_found():
+    from auth0_type import UserManager
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    kc.find_group_by_path.return_value = None
+    kc.list_groups.return_value = []
+    mgr = UserManager(kc, a0)
+    summary = mgr.delete_group("ghost")
+    assert summary["keycloak"] == "group-not-found"
+    kc.delete_group.assert_not_called()

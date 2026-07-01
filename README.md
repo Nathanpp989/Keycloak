@@ -135,6 +135,13 @@ python login_flow.py
 | POST | `/groups` | Bearer | Create a group/subgroup in Keycloak (+ Auth0 if configured) |
 | POST | `/users/groups` | Bearer | Add or revoke a user's group membership (`action=add\|revoke`) |
 | POST | `/users/roles` | Bearer | Assign or revoke a user's role in both systems (`action=assign\|revoke`) |
+| PATCH | `/groups` | Bearer | Rename a group across systems |
+| DELETE | `/groups` | Bearer | Delete a group across systems |
+| POST | `/organizations` | Bearer | Create (or reuse) an Auth0 organization |
+| GET | `/organizations` | Bearer | List Auth0 organizations |
+| PATCH | `/organizations/{org_id}` | Bearer | Update an organization's display name |
+| DELETE | `/organizations/{org_id}` | Bearer | Delete an organization |
+| POST | `/organizations/members` | Bearer | Add/remove a user from an org (`action=add\|remove`) |
 | GET | `/secure-data` | depends | Uses a server-side Auth0 M2M token |
 | GET | `/keys` | none | Public RSA key |
 

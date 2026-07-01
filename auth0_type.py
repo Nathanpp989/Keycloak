@@ -12,7 +12,7 @@ import secrets
 from enum import Enum
 
 from auth0_connect import Auth0Connect, get_keycloak_admin_token, _require_env
-from auth0_talk import KeycloakAdminAPI, Auth0UsersAPI, Auth0AuthzExtensionAPI
+from auth0_talk import KeycloakAdminAPI, Auth0UsersAPI, Auth0AuthzExtensionAPI, Auth0OrganizationsAPI
 
 logger = logging.getLogger(__name__)
 
@@ -56,11 +56,13 @@ class UserManager:
     """Detects user presence across systems and creates users in both."""
 
     def __init__(self, keycloak: KeycloakAdminAPI, auth0_users: Auth0UsersAPI,
-                 auth0_authz=None):
+                 auth0_authz=None, auth0_orgs=None):
         self.keycloak = keycloak
         self.auth0_users = auth0_users
         # Optional Auth0AuthzExtensionAPI; group lookup is skipped if not provided.
         self.auth0_authz = auth0_authz
+        # Optional Auth0OrganizationsAPI; org operations require it.
+        self.auth0_orgs = auth0_orgs
 
     # ── id resolution ──────────────────────────────────────────
     def _keycloak_user_id(self, username: str, email: str) -> str | None:
@@ -313,6 +315,84 @@ class UserManager:
             summary["auth0"] = "user-not-found"
         return summary
 
+    # ── Auth0 organization membership ──────────────────────────
+    def set_organization_membership(self, email: str, org_name: str,
+                                    add: bool = True) -> str:
+        """
+        Add or remove a user (by email) from an Auth0 organization (by name).
+        Returns a status string: added / removed / user-not-found /
+        org-not-found / no-orgs-api.
+        """
+        if self.auth0_orgs is None:
+            return "no-orgs-api"
+        org = self.auth0_orgs.get_organization_by_name(org_name)
+        if org is None:
+            return "org-not-found"
+        a0_uid = self._auth0_user_id(email)
+        if a0_uid is None:
+            return "user-not-found"
+        org_id = org.get("id")
+        if add:
+            self.auth0_orgs.add_members(org_id, [a0_uid])
+            return "added"
+        self.auth0_orgs.remove_members(org_id, [a0_uid])
+        return "removed"
+
+    # ── group update / delete (cross-system) ───────────────────
+    def update_group(self, group_path_or_name: str, new_name: str) -> dict:
+        """
+        Rename a group in Keycloak (by path or top-level name) and, if the Authz
+        Extension is configured, in Auth0. Returns a per-system status.
+        """
+        summary: dict = {"keycloak": "skipped", "auth0": "skipped"}
+
+        group = self.keycloak.find_group_by_path("/" + group_path_or_name.strip("/"))
+        if not group:
+            group = next((g for g in self.keycloak.list_groups()
+                          if g.get("name", "").lower() == group_path_or_name.lower()), None)
+        if group:
+            self.keycloak.update_group(group.get("id"), name=new_name)
+            summary["keycloak"] = "updated"
+        else:
+            summary["keycloak"] = "group-not-found"
+
+        if self.auth0_authz is not None:
+            ext_group = self.auth0_authz.find_group_by_name(group_path_or_name)
+            if ext_group:
+                gid = ext_group.get("_id") or ext_group.get("id")
+                self.auth0_authz.update_group(gid, name=new_name)
+                summary["auth0"] = "updated"
+            else:
+                summary["auth0"] = "group-not-found"
+        return summary
+
+    def delete_group(self, group_path_or_name: str) -> dict:
+        """
+        Delete a group in Keycloak (by path or top-level name) and, if configured,
+        in the Auth0 Authz Extension. Returns a per-system status.
+        """
+        summary: dict = {"keycloak": "skipped", "auth0": "skipped"}
+
+        group = self.keycloak.find_group_by_path("/" + group_path_or_name.strip("/"))
+        if not group:
+            group = next((g for g in self.keycloak.list_groups()
+                          if g.get("name", "").lower() == group_path_or_name.lower()), None)
+        if group:
+            self.keycloak.delete_group(group.get("id"))
+            summary["keycloak"] = "deleted"
+        else:
+            summary["keycloak"] = "group-not-found"
+
+        if self.auth0_authz is not None:
+            ext_group = self.auth0_authz.find_group_by_name(group_path_or_name)
+            if ext_group:
+                gid = ext_group.get("_id") or ext_group.get("id")
+                self.auth0_authz.delete_group(gid)
+                summary["auth0"] = "deleted"
+            else:
+                summary["auth0"] = "group-not-found"
+        return summary
+
     # ── creation ───────────────────────────────────────────────
     def add_user(self, email: str, password: str | None = None,
                  username: str | None = None) -> dict:
@@ -381,7 +461,10 @@ def main() -> None:
     if authz_url:
         authz = Auth0AuthzExtensionAPI(auth0, authz_url)
 
-    manager = UserManager(keycloak, auth0_users, auth0_authz=authz)
+    # Organizations are always available via the Management API.
+    orgs = Auth0OrganizationsAPI(auth0)
+
+    manager = UserManager(keycloak, auth0_users, auth0_authz=authz, auth0_orgs=orgs)
 
     # Example: add a new user from an email address
     target_email = os.environ.get("NEW_USER_EMAIL", "new.person@example.com")
