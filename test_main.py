@@ -624,3 +624,17 @@ def test_org_membership_endpoint_bad_action(client, monkeypatch):
         assert r.status_code == 422
     finally:
         main.app.dependency_overrides.clear()
+
+
+def test_create_organization_invalid_name_is_400(client, monkeypatch):
+    # Q3: an unconvertible org name should surface as 400, not 500.
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = _mgr_with_orgs()
+        mgr.auth0_orgs.create_organization.side_effect = ValueError(
+            "'x' cannot be converted to a valid Auth0 organization name")
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.post("/organizations", data={"name": "x"})
+        assert r.status_code == 400
+    finally:
+        main.app.dependency_overrides.clear()

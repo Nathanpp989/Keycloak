@@ -477,6 +477,8 @@ def create_organization_endpoint(
         raise HTTPException(status_code=503, detail="Organizations API unavailable.")
     try:
         return user_manager.auth0_orgs.create_organization(name, display_name=display_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
     except Exception as exc:

@@ -1260,3 +1260,36 @@ def test_manager_delete_group_not_found():
     summary = mgr.delete_group("ghost")
     assert summary["keycloak"] == "group-not-found"
     kc.delete_group.assert_not_called()
+
+
+# ──────────────────────────────────────────────
+# Q3 regression: Auth0 organization name normalization/validation
+# ──────────────────────────────────────────────
+def test_org_normalize_name_basic():
+    from auth0_talk import Auth0OrganizationsAPI
+    assert Auth0OrganizationsAPI.normalize_org_name("Acme Corp") == "acme-corp"
+    assert Auth0OrganizationsAPI.normalize_org_name("My_Org") == "my_org"
+    assert Auth0OrganizationsAPI.normalize_org_name("already-valid") == "already-valid"
+
+def test_org_normalize_name_too_short_raises():
+    from auth0_talk import Auth0OrganizationsAPI
+    with pytest.raises(ValueError, match="valid Auth0 organization name"):
+        Auth0OrganizationsAPI.normalize_org_name("ab")   # < 3 chars after cleaning
+
+@responses.activate
+def test_org_create_normalizes_name_and_keeps_display():
+    from auth0_talk import Auth0OrganizationsAPI
+    _org_token()
+    # get-or-create checks the NORMALIZED name
+    responses.add(responses.GET, f"{ORG_BASE}/name/acme-corp", status=404)
+    responses.add(responses.POST, ORG_BASE,
+                  json={"id": "org_1", "name": "acme-corp", "display_name": "Acme Corp"},
+                  status=201)
+    api = Auth0OrganizationsAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    org = api.create_organization("Acme Corp")
+    assert org["name"] == "acme-corp"
+    # The POST body must send the normalized name but keep the original as display_name
+    post = [c for c in responses.calls if c.request.method == "POST" and c.request.url == ORG_BASE][0]
+    body = json.loads(post.request.body)
+    assert body["name"] == "acme-corp"
+    assert body["display_name"] == "Acme Corp"

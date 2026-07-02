@@ -505,20 +505,41 @@ class Auth0OrganizationsAPI:
         resp.raise_for_status()
         return resp.json()
 
+    @staticmethod
+    def normalize_org_name(name: str) -> str:
+        """
+        Normalise a name to Auth0's organization-name rules: lowercase, only
+        [a-z0-9_-], 3-50 chars, starting with an alphanumeric. Spaces and other
+        characters become hyphens. Raises ValueError if the result is still
+        invalid (e.g. too short after cleaning).
+        """
+        import re
+        cleaned = re.sub(r"[^a-z0-9_-]+", "-", name.lower()).strip("-_")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{2,49}", cleaned):
+            raise ValueError(
+                f"'{name}' cannot be converted to a valid Auth0 organization name "
+                "(needs 3-50 chars of lowercase letters, digits, '-' or '_', "
+                "starting with a letter or digit)."
+            )
+        return cleaned
+
     def create_organization(self, name: str, display_name: str | None = None) -> dict:
         """
-        Get-or-create an organization by name (names are unique in Auth0).
-        Returns the organization dict.
+        Get-or-create an organization. The `name` is normalised to Auth0's
+        organization-name rules (lowercase, [a-z0-9_-]); the human-readable label
+        is kept as display_name (defaulting to the original input). Names are
+        unique in Auth0, so an existing org with the normalised name is reused.
         """
-        existing = self.get_organization_by_name(name)
+        norm = self.normalize_org_name(name)
+        existing = self.get_organization_by_name(norm)
         if existing:
-            logger.info("Auth0 organization '%s' already exists; reusing", name)
+            logger.info("Auth0 organization '%s' already exists; reusing", norm)
             return existing
-        payload = {"name": name, "display_name": display_name or name}
+        payload = {"name": norm, "display_name": display_name or name}
         resp = requests.post(self.base, headers=self.headers, json=payload, timeout=10)
         _explain_403(resp, "create:organizations")
         if resp.status_code in (200, 201):
-            logger.info("Created Auth0 organization '%s'", name)
+            logger.info("Created Auth0 organization '%s'", norm)
             return resp.json()
         logger.error("Failed to create organization: %d %s", resp.status_code, resp.text)
         resp.raise_for_status()
