@@ -1293,3 +1293,42 @@ def test_org_create_normalizes_name_and_keeps_display():
     body = json.loads(post.request.body)
     assert body["name"] == "acme-corp"
     assert body["display_name"] == "Acme Corp"
+
+
+# ──────────────────────────────────────────────
+# Q4 regression: get_organization_by_name must normalise the name, so a lookup
+# with a human-readable label resolves to the org created under its slug.
+# ──────────────────────────────────────────────
+@responses.activate
+def test_org_get_by_name_normalizes_lookup():
+    from auth0_talk import Auth0OrganizationsAPI
+    _org_token()
+    # Org exists as 'acme-corp'; caller looks it up as 'Acme Corp'
+    responses.add(responses.GET, f"{ORG_BASE}/name/acme-corp",
+                  json={"id": "org_1", "name": "acme-corp"}, status=200)
+    api = Auth0OrganizationsAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    org = api.get_organization_by_name("Acme Corp")
+    assert org is not None and org["id"] == "org_1"
+
+@responses.activate
+def test_org_get_by_name_uninormalizable_returns_none():
+    from auth0_talk import Auth0OrganizationsAPI
+    _org_token()
+    # 'a' can't be a valid org name -> no HTTP call, just None
+    api = Auth0OrganizationsAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    assert api.get_organization_by_name("a") is None
+
+def test_manager_org_membership_with_display_name():
+    # Q4 end-to-end: membership by human-readable name resolves the slugged org.
+    from auth0_type import UserManager
+    from auth0_talk import Auth0OrganizationsAPI
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    orgs = create_autospec(Auth0OrganizationsAPI, instance=True)
+    # The real get_organization_by_name would normalize; the autospec just returns the org
+    orgs.get_organization_by_name.return_value = {"id": "org_1", "name": "acme-corp"}
+    mgr = UserManager(kc, a0, auth0_orgs=orgs)
+    mgr._auth0_user_id = lambda e: "auth0|1"
+    result = mgr.set_organization_membership("u@x.com", "Acme Corp", add=True)
+    assert result == "added"
+    orgs.add_members.assert_called_once_with("org_1", ["auth0|1"])

@@ -497,8 +497,19 @@ class Auth0OrganizationsAPI:
         return resp.json()
 
     def get_organization_by_name(self, name: str) -> dict | None:
-        """Look up an organization by its (unique) name via the name endpoint."""
-        resp = requests.get(f"{self.base}/name/{name}", headers=self.headers, timeout=10)
+        """
+        Look up an organization by name via the name endpoint.
+
+        Q4 FIX: normalise the name the same way create_organization does, so a
+        lookup with a human-readable label (e.g. 'Acme Corp') resolves to the
+        org that was created as 'acme-corp'. If the name can't be normalised to a
+        valid Auth0 org name, no such org can exist, so return None.
+        """
+        try:
+            lookup = self.normalize_org_name(name)
+        except ValueError:
+            return None
+        resp = requests.get(f"{self.base}/name/{lookup}", headers=self.headers, timeout=10)
         if resp.status_code == 404:
             return None
         _explain_403(resp, "read:organizations")
