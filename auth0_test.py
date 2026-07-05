@@ -18,6 +18,7 @@ import tempfile
 from unittest.mock import create_autospec, MagicMock
 
 import pytest
+from fastapi import HTTPException as HTTPExceptionType
 import responses
 
 from auth0_connect import (
@@ -1332,3 +1333,188 @@ def test_manager_org_membership_with_display_name():
     result = mgr.set_organization_membership("u@x.com", "Acme Corp", add=True)
     assert result == "added"
     orgs.add_members.assert_called_once_with("org_1", ["auth0|1"])
+
+
+# ──────────────────────────────────────────────
+# Q5 regression: cross-system group ops with a Keycloak SUBGROUP path must match
+# the Auth0 Authorization Extension's FLAT group by the leaf name.
+# ──────────────────────────────────────────────
+def test_manager_update_subgroup_matches_auth0_leaf_name():
+    from auth0_type import UserManager
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    authz = MagicMock()
+    kc.find_group_by_path.return_value = {"id": "kc-sub"}
+    authz.find_group_by_name.return_value = {"_id": "a0-billing"}
+    mgr = UserManager(kc, a0, auth0_authz=authz)
+    summary = mgr.update_group("finance/billing", "invoicing")
+    assert summary["keycloak"] == "updated"
+    assert summary["auth0"] == "updated"
+    # The Auth0 lookup must use the LEAF name 'billing', not 'finance/billing'
+    authz.find_group_by_name.assert_called_once_with("billing")
+
+def test_manager_delete_subgroup_matches_auth0_leaf_name():
+    from auth0_type import UserManager
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    authz = MagicMock()
+    kc.find_group_by_path.return_value = {"id": "kc-sub"}
+    authz.find_group_by_name.return_value = {"_id": "a0-billing"}
+    mgr = UserManager(kc, a0, auth0_authz=authz)
+    summary = mgr.delete_group("/finance/billing/")
+    assert summary["auth0"] == "deleted"
+    authz.find_group_by_name.assert_called_once_with("billing")
+
+def test_manager_membership_subgroup_matches_auth0_leaf_name():
+    from auth0_type import UserManager
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    authz = MagicMock()
+    kc.find_group_by_path.return_value = {"id": "kc-sub"}
+    authz.find_group_by_name.return_value = {"_id": "a0-billing"}
+    mgr = UserManager(kc, a0, auth0_authz=authz)
+    mgr._keycloak_user_id = lambda u, e: "kc-1"
+    mgr._auth0_user_id = lambda e: "auth0|1"
+    summary = mgr.set_group_membership("user", "u@x.com", "finance/billing", add=True)
+    assert summary["auth0"] == "added"
+    authz.find_group_by_name.assert_called_once_with("billing")
+    authz.add_user_to_group.assert_called_once_with("a0-billing", "auth0|1")
+
+
+# ──────────────────────────────────────────────
+# Q6 regression: Keycloak 23+ (project targets 26) does NOT return subGroups
+# inline. find_group_by_path and the 409-subgroup-reuse must fetch /children.
+# ──────────────────────────────────────────────
+@responses.activate
+def test_find_group_by_path_lazy_loads_children_kc26():
+    from auth0_talk import KeycloakAdminAPI
+    groups_url = f"{KC_URL}/admin/realms/{REALM}/groups"
+    # Top-level list: finance has NO inline subGroups (KC26 behavior)
+    responses.add(responses.GET, groups_url,
+                  json=[{"name": "finance", "id": "f-1", "path": "/finance"}], status=200)
+    # Children fetched lazily via /children
+    responses.add(responses.GET, f"{groups_url}/f-1/children",
+                  json=[{"name": "billing", "id": "b-1", "path": "/finance/billing"}],
+                  status=200)
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    found = api.find_group_by_path("/finance/billing")
+    assert found is not None and found["id"] == "b-1"
+
+@responses.activate
+def test_create_subgroup_conflict_resolves_via_children_kc26():
+    from auth0_talk import KeycloakAdminAPI
+    children_url = f"{KC_URL}/admin/realms/{REALM}/groups/parent-1/children"
+    # POST child -> 409 conflict
+    responses.add(responses.POST, children_url, status=409)
+    # Reuse path must GET /children (not rely on inline subGroups)
+    responses.add(responses.GET, children_url,
+                  json=[{"name": "billing", "id": "existing-sub"}], status=200)
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    assert api.create_group("billing", parent_id="parent-1") == "existing-sub"
+
+@responses.activate
+def test_find_group_by_path_children_endpoint_404_falls_back():
+    # Older Keycloak: /children returns 404 -> fall back to inline subGroups
+    from auth0_talk import KeycloakAdminAPI
+    groups_url = f"{KC_URL}/admin/realms/{REALM}/groups"
+    responses.add(responses.GET, groups_url,
+                  json=[{"name": "finance", "id": "f-1", "path": "/finance"}], status=200)
+    responses.add(responses.GET, f"{groups_url}/f-1/children", status=404)
+    responses.add(responses.GET, f"{groups_url}/f-1",
+                  json={"name": "finance", "id": "f-1", "path": "/finance",
+                        "subGroups": [{"name": "billing", "id": "b-old",
+                                       "path": "/finance/billing"}]}, status=200)
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    found = api.find_group_by_path("/finance/billing")
+    assert found is not None and found["id"] == "b-old"
+
+
+# ──────────────────────────────────────────────
+# Coverage for previously-untested org API methods: get_organization (by id)
+# and list_members.
+# ──────────────────────────────────────────────
+@responses.activate
+def test_org_get_by_id():
+    from auth0_talk import Auth0OrganizationsAPI
+    _org_token()
+    responses.add(responses.GET, f"{ORG_BASE}/org_1",
+                  json={"id": "org_1", "name": "acme"}, status=200)
+    api = Auth0OrganizationsAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    assert api.get_organization("org_1")["name"] == "acme"
+
+@responses.activate
+def test_org_get_by_id_403_names_scope():
+    from auth0_talk import Auth0OrganizationsAPI
+    _org_token()
+    responses.add(responses.GET, f"{ORG_BASE}/org_1", json={}, status=403)
+    api = Auth0OrganizationsAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    with pytest.raises(RuntimeError, match="read:organizations"):
+        api.get_organization("org_1")
+
+@responses.activate
+def test_org_list_members_bare_list():
+    from auth0_talk import Auth0OrganizationsAPI
+    _org_token()
+    responses.add(responses.GET, f"{ORG_BASE}/org_1/members",
+                  json=[{"user_id": "auth0|1"}, {"user_id": "auth0|2"}], status=200)
+    api = Auth0OrganizationsAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    members = api.list_members("org_1")
+    assert len(members) == 2
+
+@responses.activate
+def test_org_list_members_wrapped():
+    from auth0_talk import Auth0OrganizationsAPI
+    _org_token()
+    responses.add(responses.GET, f"{ORG_BASE}/org_1/members",
+                  json={"members": [{"user_id": "auth0|1"}], "total": 1}, status=200)
+    api = Auth0OrganizationsAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    assert len(api.list_members("org_1")) == 1
+
+@responses.activate
+def test_org_list_members_403_names_scope():
+    from auth0_talk import Auth0OrganizationsAPI
+    _org_token()
+    responses.add(responses.GET, f"{ORG_BASE}/org_1/members", json={}, status=403)
+    api = Auth0OrganizationsAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    with pytest.raises(RuntimeError, match="read:organization_members"):
+        api.list_members("org_1")
+
+
+# ──────────────────────────────────────────────
+# Coverage for authorize.verify_auth0_token (RS256 Auth0 JWT validation).
+# The crypto chain (JWKS/signing key) is mocked; we verify the decode call and
+# the error->401 mapping.
+# ──────────────────────────────────────────────
+def test_verify_auth0_token_valid(monkeypatch):
+    import authorize
+    monkeypatch.setattr(authorize, "get_secret", lambda k: "aud-123")
+    monkeypatch.setattr(authorize, "_get_signing_key", lambda d, t: "signing-key")
+    monkeypatch.setattr(authorize.jwt, "decode",
+                        lambda *a, **k: {"sub": "user|1", "aud": "aud-123"})
+    claims = authorize.verify_auth0_token("some.jwt.token")
+    assert claims["sub"] == "user|1"
+
+def test_verify_auth0_token_expired_maps_to_401(monkeypatch):
+    import authorize
+    from jose.exceptions import ExpiredSignatureError
+    monkeypatch.setattr(authorize, "get_secret", lambda k: "aud-123")
+    monkeypatch.setattr(authorize, "_get_signing_key", lambda d, t: "signing-key")
+    def _raise(*a, **k):
+        raise ExpiredSignatureError("expired")
+    monkeypatch.setattr(authorize.jwt, "decode", _raise)
+    with pytest.raises(HTTPExceptionType) as exc:
+        authorize.verify_auth0_token("some.jwt.token")
+    assert exc.value.status_code == 401
+    assert "expired" in exc.value.detail.lower()
+
+def test_verify_auth0_token_invalid_maps_to_401(monkeypatch):
+    import authorize
+    from jose import JWTError
+    monkeypatch.setattr(authorize, "get_secret", lambda k: "aud-123")
+    monkeypatch.setattr(authorize, "_get_signing_key", lambda d, t: "signing-key")
+    def _raise(*a, **k):
+        raise JWTError("bad signature")
+    monkeypatch.setattr(authorize.jwt, "decode", _raise)
+    with pytest.raises(HTTPExceptionType) as exc:
+        authorize.verify_auth0_token("some.jwt.token")
+    assert exc.value.status_code == 401

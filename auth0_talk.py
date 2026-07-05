@@ -237,10 +237,30 @@ class KeycloakAdminAPI:
         resp.raise_for_status()
         return resp.json()
 
+    def _group_children(self, group_id: str) -> list[dict]:
+        """
+        Return a group's direct subgroups. Keycloak 23+ does not include
+        subGroups inline, so use the dedicated /children endpoint (falling back
+        to the inline field on older Keycloak).
+        """
+        resp = requests.get(f"{self._groups_url(group_id)}/children",
+                            headers=self.headers, timeout=10)
+        if resp.status_code == 404:
+            parent = requests.get(self._groups_url(group_id),
+                                  headers=self.headers, timeout=10)
+            parent.raise_for_status()
+            return parent.json().get("subGroups") or []
+        resp.raise_for_status()
+        return _as_list(resp.json(), "subGroups")
+
     def find_group_by_path(self, path: str) -> dict | None:
         """
         Find a group by its full path (e.g. '/finance/billing'), searching the
         nested group tree. Returns the group dict (with 'id') or None.
+
+        Q6: Keycloak 23+ (this project targets 26) does not return subGroups
+        inline, so children are fetched lazily via the /children endpoint as we
+        descend, rather than assuming list_groups() already contains them.
         """
         wanted = "/" + path.strip("/")
 
@@ -248,9 +268,15 @@ class KeycloakAdminAPI:
             for g in groups:
                 if g.get("path") == wanted:
                     return g
-                found = walk(g.get("subGroups") or [])
-                if found:
-                    return found
+                # Only descend if the wanted path is under this group's path.
+                gpath = g.get("path", "")
+                if wanted == gpath or wanted.startswith(gpath.rstrip("/") + "/"):
+                    children = g.get("subGroups")
+                    if not children and g.get("id"):
+                        children = self._group_children(g["id"])
+                    found = walk(children or [])
+                    if found:
+                        return found
             return None
 
         return walk(self.list_groups())
@@ -280,13 +306,25 @@ class KeycloakAdminAPI:
             return gid or ""
         if resp.status_code == 409:
             logger.info("Keycloak group '%s' already exists; reusing", name)
-            # Resolve existing id: build the expected path
+            # Resolve existing id.
             if parent_id:
-                parent = requests.get(self._groups_url(parent_id),
-                                      headers=self.headers, timeout=10)
-                parent.raise_for_status()
-                existing = next((s for s in (parent.json().get("subGroups") or [])
-                                 if s.get("name") == name), None)
+                # Q6 FIX: Keycloak 23+ (this project is on 26) does NOT return
+                # subGroups inline on GET /groups/{id}; query the dedicated
+                # /children endpoint instead, or the subgroup is never found.
+                children = requests.get(
+                    f"{self._groups_url(parent_id)}/children",
+                    headers=self.headers, timeout=10,
+                )
+                if children.status_code == 404:
+                    # Older Keycloak: fall back to the inline subGroups field
+                    parent = requests.get(self._groups_url(parent_id),
+                                          headers=self.headers, timeout=10)
+                    parent.raise_for_status()
+                    child_list = parent.json().get("subGroups") or []
+                else:
+                    children.raise_for_status()
+                    child_list = _as_list(children.json(), "subGroups")
+                existing = next((s for s in child_list if s.get("name") == name), None)
             else:
                 existing = next((g for g in self.list_groups() if g.get("name") == name), None)
             return existing.get("id", "") if existing else ""
