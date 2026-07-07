@@ -161,6 +161,41 @@ zero-downtime you would need either a standby second Auth0 application (swap the
 IdP to it, then rotate the idle one) or Auth0's private-key-JWT client
 authentication with multiple keys — larger changes not implemented here.
 
+## Running in a container (Docker or Podman)
+
+The image is defined in a `Containerfile` (with an identical `Dockerfile` copy),
+using only standard OCI instructions so it builds and runs the same under both
+engines.
+
+Build:
+```bash
+docker build -t auth-broker .      # Docker
+podman build -t auth-broker .      # Podman (reads Containerfile by default)
+```
+
+Run (supplying config via an env file):
+```bash
+docker run --env-file .env -p 8000:8000 auth-broker
+podman run --env-file .env -p 8000:8000 auth-broker
+```
+
+Or bring up the API together with a Keycloak instance via compose:
+```bash
+docker compose up --build          # Docker
+podman compose up --build          # Podman v4.1+
+podman-compose up --build          # standalone podman-compose
+```
+
+Notes:
+- The container runs as a non-root user and writes generated RSA keys to
+  `KEY_DIR` (`/data/keys`), which `compose.yaml` persists in a named volume.
+- On startup the app waits for Keycloak, retrying with exponential backoff
+  (`KEYCLOAK_STARTUP_RETRIES`, default 10; `KEYCLOAK_STARTUP_BACKOFF`, default
+  2.0s). This tolerates Keycloak still coming up, complementing compose's
+  `depends_on: service_healthy`.
+- A `HEALTHCHECK` hits `GET /`; Docker runs it natively, Podman honours it when
+  run with `--health-cmd` or via `podman play`.
+
 ## Testing
 
 ```bash

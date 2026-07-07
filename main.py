@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import logging
 import os
 import stat
@@ -174,6 +175,41 @@ def _build_user_manager() -> UserManager | None:
     return UserManager(keycloak_api, auth0_users, auth0_authz=authz, auth0_orgs=auth0_orgs)
 
 
+def _setup_keycloak_with_retry() -> str:
+    """
+    Call setup_keycloak() with retry + exponential backoff, so the app can start
+    in a container before Keycloak is fully ready (a common race even with
+    compose 'depends_on'). Tunable via env vars:
+      KEYCLOAK_STARTUP_RETRIES (default 10)
+      KEYCLOAK_STARTUP_BACKOFF (default 2.0 seconds, doubles each attempt, capped)
+    Raises the last error if all attempts fail.
+    """
+    import time
+
+    retries = int(os.environ.get("KEYCLOAK_STARTUP_RETRIES", "10"))
+    backoff = float(os.environ.get("KEYCLOAK_STARTUP_BACKOFF", "2.0"))
+    max_backoff = 30.0
+    last_exc: Exception | None = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            return setup_keycloak()
+        except Exception as exc:  # noqa: BLE001 — we deliberately retry on any error
+            last_exc = exc
+            if attempt == retries:
+                break
+            wait = min(backoff * (2 ** (attempt - 1)), max_backoff)
+            logger.warning(
+                "Keycloak not ready (attempt %d/%d): %s — retrying in %.1fs",
+                attempt, retries, exc, wait,
+            )
+            time.sleep(wait)
+
+    raise RuntimeError(
+        f"Keycloak setup failed after {retries} attempts"
+    ) from last_exc
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global keycloak_oidc, user_manager
@@ -183,9 +219,10 @@ async def lifespan(app: FastAPI):
         logger.error("RSA key initialisation failed: %s", exc)
         raise
     try:
-        client_secret = setup_keycloak()
+        client_secret = _setup_keycloak_with_retry()
     except Exception as exc:
-        logger.error("Keycloak setup failed — check KEYCLOAK_URL and credentials: %s", exc)
+        logger.error("Keycloak setup failed after retries — check KEYCLOAK_URL "
+                     "and credentials: %s", exc)
         raise
     if not client_secret:
         logger.warning(

@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # test_main.py
 # Endpoint tests for main.py using FastAPI's TestClient.
 #
@@ -638,3 +639,43 @@ def test_create_organization_invalid_name_is_400(client, monkeypatch):
         assert r.status_code == 400
     finally:
         main.app.dependency_overrides.clear()
+
+
+# ──────────────────────────────────────────────
+# _setup_keycloak_with_retry — container startup resilience
+# ──────────────────────────────────────────────
+def test_setup_keycloak_retry_succeeds_after_transient_failure(monkeypatch):
+    import main as m
+    monkeypatch.setenv("KEYCLOAK_STARTUP_RETRIES", "5")
+    monkeypatch.setenv("KEYCLOAK_STARTUP_BACKOFF", "0")  # no real waiting in tests
+    calls = {"n": 0}
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise ConnectionError("Keycloak not up yet")
+        return "the-secret"
+    monkeypatch.setattr(m, "setup_keycloak", flaky)
+    monkeypatch.setattr(m.time if hasattr(m, "time") else __import__("time"),
+                        "sleep", lambda *_: None)
+    assert m._setup_keycloak_with_retry() == "the-secret"
+    assert calls["n"] == 3  # failed twice, succeeded on the third
+
+def test_setup_keycloak_retry_gives_up_after_max(monkeypatch):
+    import main as m
+    monkeypatch.setenv("KEYCLOAK_STARTUP_RETRIES", "3")
+    monkeypatch.setenv("KEYCLOAK_STARTUP_BACKOFF", "0")
+    calls = {"n": 0}
+    def always_fail():
+        calls["n"] += 1
+        raise ConnectionError("down")
+    monkeypatch.setattr(m, "setup_keycloak", always_fail)
+    monkeypatch.setattr(__import__("time"), "sleep", lambda *_: None)
+    with pytest.raises(RuntimeError, match="failed after 3 attempts"):
+        m._setup_keycloak_with_retry()
+    assert calls["n"] == 3  # tried exactly the configured number of times
+
+def test_setup_keycloak_retry_succeeds_first_try(monkeypatch):
+    import main as m
+    monkeypatch.setenv("KEYCLOAK_STARTUP_RETRIES", "5")
+    monkeypatch.setattr(m, "setup_keycloak", lambda: "immediate")
+    assert m._setup_keycloak_with_retry() == "immediate"

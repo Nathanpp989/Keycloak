@@ -1,0 +1,60 @@
+# compose.yaml — runs the broker API together with a Keycloak instance.
+#
+# Works with all three of these (they read this same file):
+#     docker compose up --build
+#     podman compose up --build        # Podman v4.1+ (shells out to compose)
+#     podman-compose up --build        # the standalone podman-compose tool
+#
+# The filename "compose.yaml" is the modern spec name recognised by every one of
+# them. Override any AUTH0_* value in a local .env file (auto-loaded) or your
+# shell environment before running.
+
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: start-dev
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USER:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+    ports:
+      - "8080:8080"
+    # Give Keycloak time to come up before the app's healthcheck matters.
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && echo -e 'GET /health/ready HTTP/1.0\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200 OK'"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  app:
+    build:
+      context: .
+      # Explicit so both engines pick the same file; Containerfile == Dockerfile.
+      dockerfile: Containerfile
+    ports:
+      - "8000:8000"
+    environment:
+      # Point the app at the Keycloak service by its compose network name.
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM:-Premkey}
+      KEYCLOAK_ADMIN_USER: ${KEYCLOAK_ADMIN_USER:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-Hello-World-app}
+      KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:-}
+      # Auth0 / Key Vault — supply these via .env or your shell.
+      AUTH0_DOMAIN: ${AUTH0_DOMAIN:-}
+      AUTH0_CLIENT_ID: ${AUTH0_CLIENT_ID:-}
+      AUTH0_CLIENT_SECRET: ${AUTH0_CLIENT_SECRET:-}
+      AUTH0_AUDIENCE: ${AUTH0_AUDIENCE:-}
+      AUTH0_AUTHZ_EXTENSION_URL: ${AUTH0_AUTHZ_EXTENSION_URL:-}
+      KEY_VAULT_URL: ${KEY_VAULT_URL:-}
+      KEY_DIR: /data/keys
+    volumes:
+      # Persist generated RSA keys across restarts.
+      - keys:/data/keys
+    depends_on:
+      keycloak:
+        condition: service_healthy
+
+volumes:
+  keys:
