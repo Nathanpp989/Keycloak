@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # rotate_secret.py
 # Rotates the Auth0 client secret AND updates the Keycloak Auth0 IdP config with
 # the new value in one atomic-ish flow, so the broker keeps working after rotation.
@@ -28,24 +29,33 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _candidate_idp_urls(keycloak_url: str, realm_name: str, alias: str) -> list[str]:
+    """IdP instance URLs to try: Keycloak 17+ path first, then the legacy path."""
+    base = keycloak_url.rstrip("/")
+    return [f"{base}{prefix}/{realm_name}/identity-provider/instances/{alias}"
+            for prefix in ("/admin/realms", "/auth/admin/realms")]
+
+
 def update_keycloak_idp_secret(
     keycloak_url: str,
     realm_name: str,
     admin_token: str,
     alias: str,
     new_secret: str,
-) -> None:
+) -> str:
     """
     Update the clientSecret in an existing Keycloak OIDC identity provider.
 
     Uses GET (fetch current config) then PUT (write back with new secret), because
     Keycloak's IdP update replaces the whole representation — a partial PUT would
     drop the other config fields.
+
+    Returns the IdP URL that worked, so callers (rotate_and_sync) can verify
+    against the same endpoint without re-probing both path variants.
     """
-    base = keycloak_url.rstrip("/")
+    candidates = _candidate_idp_urls(keycloak_url, realm_name, alias)
     last_error = ""
-    for prefix in ("/admin/realms", "/auth/admin/realms"):
-        url = f"{base}{prefix}/{realm_name}/identity-provider/instances/{alias}"
+    for i, url in enumerate(candidates):
         headers = {
             "content-type":  "application/json",
             "authorization": f"Bearer {admin_token}",
@@ -57,7 +67,7 @@ def update_keycloak_idp_secret(
 
         if get_resp.status_code == 404:
             last_error = get_resp.text
-            if prefix == "/admin/realms":
+            if i < len(candidates) - 1:
                 continue
             break
         if not get_resp.ok:
@@ -76,13 +86,13 @@ def update_keycloak_idp_secret(
 
         if put_resp.status_code in (200, 204):
             logger.info("Keycloak IdP '%s' secret updated in realm '%s'", alias, realm_name)
-            return
+            return url
         raise RuntimeError(
             f"Keycloak IdP update returned {put_resp.status_code}: {put_resp.text}"
         )
 
     raise RuntimeError(
-        f"Keycloak IdP '{alias}' not found in realm '{realm_name}' at {base}. "
+        f"Keycloak IdP '{alias}' not found in realm '{realm_name}'. "
         f"Last error: {last_error}"
     )
 
@@ -93,22 +103,26 @@ def verify_keycloak_idp_secret(
     admin_token: str,
     alias: str,
     expected_secret: str,
+    idp_url: str | None = None,
 ) -> bool:
     """
     Read back the IdP config and confirm its clientSecret matches expected.
     Note: Keycloak may mask the secret in GET responses (returning '**********'),
     in which case we cannot positively confirm and return False to signal
     'unverifiable' rather than 'wrong'.
+
+    If idp_url is given (e.g. returned by update_keycloak_idp_secret), only that
+    exact endpoint is checked — no re-probing of both path variants.
     """
-    base = keycloak_url.rstrip("/")
-    for prefix in ("/admin/realms", "/auth/admin/realms"):
-        url = f"{base}{prefix}/{realm_name}/identity-provider/instances/{alias}"
-        headers = {"authorization": f"Bearer {admin_token}"}
+    candidates = [idp_url] if idp_url else _candidate_idp_urls(
+        keycloak_url, realm_name, alias)
+    headers = {"authorization": f"Bearer {admin_token}"}
+    for i, url in enumerate(candidates):
         try:
             resp = requests.get(url, headers=headers, timeout=10)
         except requests.RequestException:
             return False
-        if resp.status_code == 404 and prefix == "/admin/realms":
+        if resp.status_code == 404 and i < len(candidates) - 1:
             continue
         if not resp.ok:
             return False
@@ -150,13 +164,14 @@ def rotate_and_sync(
     new_secret = auth0.rotate_client_secret(auth0.client_id)
 
     # 2. Push to Keycloak immediately to close the window as fast as possible
-    update_keycloak_idp_secret(
+    idp_url = update_keycloak_idp_secret(
         keycloak_url, realm_name, keycloak_admin_token, idp_alias, new_secret
     )
 
     # 3. Best-effort verification that Keycloak holds the new secret
     if verify_keycloak_idp_secret(
-        keycloak_url, realm_name, keycloak_admin_token, idp_alias, new_secret
+        keycloak_url, realm_name, keycloak_admin_token, idp_alias, new_secret,
+        idp_url=idp_url,
     ):
         logger.info("Verified Keycloak IdP '%s' holds the new secret", idp_alias)
     else:

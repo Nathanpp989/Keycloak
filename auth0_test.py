@@ -195,14 +195,23 @@ def test_keycloak_update_user_read_modify_write():
     assert body["enabled"] is True          # preserved
 
 def test_keycloak_admin_api_token_getter_refreshes():
-    # K1 regression test: a callable token source must refresh each request
+    # K1 + E1: a callable token source is cached for a short TTL (E1 efficiency
+    # fix — no fresh password-grant per request) but MUST refresh once the TTL
+    # lapses, preserving the K1 guarantee that a long-running app never uses a
+    # stale admin token.
     counter = {"n": 0}
     def getter():
         counter["n"] += 1
         return f"tok-{counter['n']}"
     api = KeycloakAdminAPI(KC_URL, getter, REALM)
     assert api.headers["Authorization"] == "Bearer tok-1"
+    # Within the TTL the cached token is reused — the getter is NOT re-invoked.
+    assert api.headers["Authorization"] == "Bearer tok-1"
+    assert counter["n"] == 1
+    # Simulate the TTL lapsing: the next access must mint a fresh token (K1).
+    api._token_fetched_at -= api._token_ttl + 1
     assert api.headers["Authorization"] == "Bearer tok-2"
+    assert counter["n"] == 2
 
 def test_keycloak_admin_api_accepts_static_string():
     api = KeycloakAdminAPI(KC_URL, "static", REALM)

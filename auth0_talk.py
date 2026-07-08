@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import time
 
 import requests
 
@@ -60,12 +62,24 @@ class KeycloakAdminAPI:
         self.base = keycloak_url.rstrip("/")
         self.realm = realm
         self._token_source = admin_token
+        # E1: cache tokens minted by a callable source. Without this, EVERY
+        # request minted a fresh admin token (a full password-grant round trip),
+        # doubling the HTTP cost of each call. 45s TTL stays safely under
+        # Keycloak's ~60s token lifetime, preserving the K1 expiry fix.
+        self._cached_token: str | None = None
+        self._token_fetched_at: float = 0.0
+        self._token_ttl: float = 45.0
 
     @property
     def headers(self) -> dict:
-        # Resolve the token fresh on each access so a long-lived server never
-        # uses an expired admin token (Keycloak tokens live ~60s).
-        token = self._token_source() if callable(self._token_source) else self._token_source
+        if callable(self._token_source):
+            now = time.monotonic()
+            if self._cached_token is None or (now - self._token_fetched_at) >= self._token_ttl:
+                self._cached_token = self._token_source()
+                self._token_fetched_at = now
+            token = self._cached_token
+        else:
+            token = self._token_source
         return {
             "Content-Type":  "application/json",
             "Authorization": f"Bearer {token}",
@@ -716,7 +730,6 @@ class Auth0OrganizationsAPI:
         characters become hyphens. Raises ValueError if the result is still
         invalid (e.g. too short after cleaning).
         """
-        import re
         cleaned = re.sub(r"[^a-z0-9_-]+", "-", name.lower()).strip("-_")
         if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{2,49}", cleaned):
             raise ValueError(
@@ -812,12 +825,20 @@ class Auth0AuthzExtensionAPI:
     def __init__(self, auth0: Auth0Connect, extension_url: str):
         self.auth0 = auth0
         self.base = extension_url.rstrip("/")
+        # E2: cache the extension token. Previously EVERY extension call minted
+        # a fresh token (an extra Auth0 round trip per request).
+        self._ext_token: str | None = None
+        self._ext_token_expiry: float = 0.0
 
     def _token(self) -> str:
         """
         Get an access token for the Authorization Extension API. Its audience
-        differs from the Management API, so we request it explicitly.
+        differs from the Management API, so we request it explicitly. Cached
+        until 60s before expiry.
         """
+        now = time.monotonic()
+        if self._ext_token and now < self._ext_token_expiry:
+            return self._ext_token
         url = f"https://{self.auth0.domain}/oauth/token"
         payload = {
             "client_id":     self.auth0.client_id,
@@ -833,9 +854,12 @@ class Auth0AuthzExtensionAPI:
             raise RuntimeError(
                 f"Authz Extension token returned {resp.status_code}: {resp.text}"
             )
-        token = resp.json().get("access_token")
+        body = resp.json()
+        token = body.get("access_token")
         if not token:
             raise RuntimeError("Authz Extension token response missing access_token")
+        self._ext_token = token
+        self._ext_token_expiry = now + max(int(body.get("expires_in", 3600)) - 60, 30)
         return token
 
     def get_user_groups(self, user_id: str) -> list[dict]:

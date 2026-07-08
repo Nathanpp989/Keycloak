@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+import json
 import logging
+import time
 import os
 import stat
 import tempfile
@@ -184,7 +186,6 @@ def _setup_keycloak_with_retry() -> str:
       KEYCLOAK_STARTUP_BACKOFF (default 2.0 seconds, doubles each attempt, capped)
     Raises the last error if all attempts fail.
     """
-    import time
 
     retries = int(os.environ.get("KEYCLOAK_STARTUP_RETRIES", "10"))
     backoff = float(os.environ.get("KEYCLOAK_STARTUP_BACKOFF", "2.0"))
@@ -605,9 +606,8 @@ def set_user_metadata(
     if user_manager is None:
         raise HTTPException(status_code=503,
                             detail="User management is unavailable (Auth0 not configured).")
-    import json as _json
     try:
-        parsed = _json.loads(metadata)
+        parsed = json.loads(metadata)
         if not isinstance(parsed, dict):
             raise ValueError("metadata must be a JSON object")
     except (ValueError, TypeError):

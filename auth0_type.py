@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import requests
 import os
 import re
 import secrets
@@ -68,7 +69,6 @@ class UserManager:
     # ── id resolution ──────────────────────────────────────────
     def _keycloak_user_id(self, username: str, email: str) -> str | None:
         """Return the Keycloak user id for an email (preferred) or username."""
-        import requests
         for params in ({"email": email, "exact": "true"},
                        {"username": username, "exact": "true"}):
             resp = requests.get(
@@ -85,7 +85,6 @@ class UserManager:
 
     def _auth0_user_id(self, email: str) -> str | None:
         """Return the Auth0 user_id for an email, or None if not found."""
-        import requests
         base = f"https://{self.auth0_users.auth0.domain}/api/v2/users-by-email"
         resp = requests.get(
             base, headers=self.auth0_users.headers,

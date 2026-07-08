@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # test_rotate.py
 # Tests for rotate_secret.py — Auth0 secret rotation + Keycloak IdP sync.
 # All HTTP mocked; no live services needed.
@@ -94,3 +95,28 @@ def test_verify_keycloak_idp_secret_masked_returns_false():
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+@responses.activate
+def test_rotate_and_sync_verify_reuses_discovered_url():
+    # E2 efficiency: verify must hit ONLY the URL update discovered (one GET),
+    # not re-probe both modern and legacy path variants.
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.POST,
+                  f"https://{DOMAIN}/api/v2/clients/cid/rotate-secret",
+                  json={"client_id": "cid", "client_secret": "new-s"}, status=200)
+    idp_url = f"{KC_URL}/admin/realms/{REALM}/identity-provider/instances/auth0"
+    responses.add(responses.GET, idp_url,
+                  json={"alias": "auth0", "config": {"clientSecret": "old"}}, status=200)
+    responses.add(responses.PUT, idp_url, status=204)
+    responses.add(responses.GET, idp_url,
+                  json={"alias": "auth0", "config": {"clientSecret": "new-s"}}, status=200)
+
+    auth0 = Auth0Connect(DOMAIN, "cid", "old")
+    rotate_and_sync(auth0, KC_URL, REALM, "kc-tok", update_env=False)
+    legacy_calls = [c for c in responses.calls if "/auth/admin/" in c.request.url]
+    assert legacy_calls == []          # never probed the legacy path
+    gets = [c for c in responses.calls
+            if c.request.method == "GET" and "identity-provider" in c.request.url]
+    assert len(gets) == 2              # one read-for-update + one verify, no extras
