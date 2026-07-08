@@ -594,6 +594,110 @@ def organization_membership_endpoint(
         logger.error("Organization membership change failed: %s", exc)
         raise HTTPException(status_code=500, detail="Organization membership change failed")
 
+@app.patch("/users/metadata")
+def set_user_metadata(
+    username: str = Form(...),
+    email: str = Form(...),
+    metadata: str = Form(...),  # JSON object as a string
+    token_info: dict = Depends(require_keycloak_auth),
+):
+    """Merge key/values into Keycloak attributes + Auth0 app_metadata. Protected."""
+    if user_manager is None:
+        raise HTTPException(status_code=503,
+                            detail="User management is unavailable (Auth0 not configured).")
+    import json as _json
+    try:
+        parsed = _json.loads(metadata)
+        if not isinstance(parsed, dict):
+            raise ValueError("metadata must be a JSON object")
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="metadata must be a JSON object string")
+    try:
+        return user_manager.set_user_metadata(username, email, parsed)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.error("Metadata update failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Metadata update failed")
+
+@app.post("/users/active")
+def set_user_active(
+    username: str = Form(...),
+    email: str = Form(...),
+    active: bool = Form(...),
+    token_info: dict = Depends(require_keycloak_auth),
+):
+    """Enable/disable (Keycloak) and unblock/block (Auth0) an account. Protected."""
+    if user_manager is None:
+        raise HTTPException(status_code=503,
+                            detail="User management is unavailable (Auth0 not configured).")
+    try:
+        return user_manager.set_user_active(username, email, active)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.error("Active-state change failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Active-state change failed")
+
+@app.post("/users/verify-email")
+def verify_email(
+    username: str = Form(...),
+    email: str = Form(...),
+    action: str = Form(...),  # "set" (mark verified) or "send" (send the email)
+    token_info: dict = Depends(require_keycloak_auth),
+):
+    """Mark email verified in both systems, or trigger verification emails. Protected."""
+    if user_manager is None:
+        raise HTTPException(status_code=503,
+                            detail="User management is unavailable (Auth0 not configured).")
+    if action not in ("set", "send"):
+        raise HTTPException(status_code=422, detail="action must be 'set' or 'send'")
+    try:
+        if action == "set":
+            return user_manager.set_email_verified(username, email, True)
+        return user_manager.send_verification_email(username, email)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.error("Email verification failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Email verification failed")
+
+@app.post("/users/password-reset")
+def password_reset(
+    username: str = Form(...),
+    email: str = Form(...),
+    token_info: dict = Depends(require_keycloak_auth),
+):
+    """Trigger a password reset in both systems (Auth0 returns a ticket URL). Protected."""
+    if user_manager is None:
+        raise HTTPException(status_code=503,
+                            detail="User management is unavailable (Auth0 not configured).")
+    try:
+        return user_manager.trigger_password_reset(username, email)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.error("Password reset failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Password reset failed")
+
+@app.post("/users/logout")
+def logout_user(
+    username: str = Form(...),
+    email: str = Form(...),
+    token_info: dict = Depends(require_keycloak_auth),
+):
+    """Kill the user's sessions in both systems (Auth0 also revokes grants). Protected."""
+    if user_manager is None:
+        raise HTTPException(status_code=503,
+                            detail="User management is unavailable (Auth0 not configured).")
+    try:
+        return user_manager.logout_everywhere(username, email)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.error("Logout failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Logout failed")
+
 @app.get("/keys")
 def get_keys():
     if not public_pem:

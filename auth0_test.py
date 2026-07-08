@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # auth0_test.py
 # Test suite for the auth integration. All HTTP is mocked with `responses`,
 # so these tests need NO live Keycloak server and NO Auth0 tenant.
@@ -1518,3 +1519,198 @@ def test_verify_auth0_token_invalid_maps_to_401(monkeypatch):
     with pytest.raises(HTTPExceptionType) as exc:
         authorize.verify_auth0_token("some.jwt.token")
     assert exc.value.status_code == 401
+
+
+# ──────────────────────────────────────────────
+# Account lifecycle — Keycloak side
+# ──────────────────────────────────────────────
+@responses.activate
+def test_kc_set_user_attributes_merges_and_wraps_scalars():
+    from auth0_talk import KeycloakAdminAPI
+    u = f"{KC_URL}/admin/realms/{REALM}/users/u-1"
+    responses.add(responses.GET, u, json={"id": "u-1", "attributes": {"kept": ["1"]}}, status=200)  # get_user_attributes read
+    responses.add(responses.GET, u, json={"id": "u-1", "attributes": {"kept": ["1"]}}, status=200)  # update_user read
+    responses.add(responses.PUT, u, status=204)
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    api.set_user_attributes("u-1", {"dept": "eng", "tags": ["a", "b"]})
+    put = [c for c in responses.calls if c.request.method == "PUT"][0]
+    attrs = json.loads(put.request.body)["attributes"]
+    assert attrs["dept"] == ["eng"]        # scalar wrapped in list
+    assert attrs["tags"] == ["a", "b"]     # list passed through
+    assert attrs["kept"] == ["1"]          # existing preserved
+
+@responses.activate
+def test_kc_set_user_enabled_and_email_verified():
+    from auth0_talk import KeycloakAdminAPI
+    u = f"{KC_URL}/admin/realms/{REALM}/users/u-1"
+    for _ in range(2):
+        responses.add(responses.GET, u, json={"id": "u-1"}, status=200)
+        responses.add(responses.PUT, u, status=204)
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    api.set_user_enabled("u-1", False)
+    api.set_email_verified("u-1", True)
+    puts = [json.loads(c.request.body) for c in responses.calls if c.request.method == "PUT"]
+    assert puts[0]["enabled"] is False
+    assert puts[1]["emailVerified"] is True
+
+@responses.activate
+def test_kc_send_verify_email_and_reset_password():
+    from auth0_talk import KeycloakAdminAPI
+    base = f"{KC_URL}/admin/realms/{REALM}/users/u-1"
+    responses.add(responses.PUT, f"{base}/send-verify-email", status=204)
+    responses.add(responses.PUT, f"{base}/reset-password", status=204)
+    responses.add(responses.PUT, f"{base}/execute-actions-email", status=204)
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    api.send_verify_email("u-1")
+    api.reset_password("u-1", "NewPw123!", temporary=True)
+    api.send_reset_password_email("u-1")
+    bodies = [c.request for c in responses.calls if c.request.method == "PUT"]
+    pw = json.loads(bodies[1].body)
+    assert pw == {"type": "password", "value": "NewPw123!", "temporary": True}
+    assert json.loads(bodies[2].body) == ["UPDATE_PASSWORD"]
+
+@responses.activate
+def test_kc_sessions_and_logout():
+    from auth0_talk import KeycloakAdminAPI
+    base = f"{KC_URL}/admin/realms/{REALM}/users/u-1"
+    responses.add(responses.GET, f"{base}/sessions",
+                  json=[{"id": "sess-1"}], status=200)
+    responses.add(responses.POST, f"{base}/logout", status=204)
+    api = KeycloakAdminAPI(KC_URL, "tok", REALM)
+    assert api.list_user_sessions("u-1") == [{"id": "sess-1"}]
+    api.logout_user("u-1")  # no raise
+
+
+# ──────────────────────────────────────────────
+# Account lifecycle — Auth0 side
+# ──────────────────────────────────────────────
+@responses.activate
+def test_a0_get_user_and_set_metadata():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.GET, f"https://{DOMAIN}/api/v2/users/auth0|1",
+                  json={"user_id": "auth0|1", "email": "a@x.com"}, status=200)
+    responses.add(responses.PATCH, f"https://{DOMAIN}/api/v2/users/auth0|1",
+                  json={"user_id": "auth0|1", "app_metadata": {"dept": "eng"}}, status=200)
+    api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    assert api.get_user("auth0|1")["email"] == "a@x.com"
+    out = api.set_user_metadata("auth0|1", app_metadata={"dept": "eng"})
+    patch = [c for c in responses.calls if c.request.method == "PATCH"][0]
+    body = json.loads(patch.request.body)
+    assert body == {"app_metadata": {"dept": "eng"}}   # only what was provided
+    assert out["app_metadata"]["dept"] == "eng"
+
+def test_a0_set_metadata_no_args_is_noop():
+    api = Auth0UsersAPI.__new__(Auth0UsersAPI)  # no HTTP needed
+    assert api.set_user_metadata("auth0|1") == {}
+
+@responses.activate
+def test_a0_set_blocked():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.PATCH, f"https://{DOMAIN}/api/v2/users/auth0|1",
+                  json={"blocked": True}, status=200)
+    api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    api.set_user_blocked("auth0|1", True)
+    body = json.loads([c for c in responses.calls if c.request.method == "PATCH"][0].request.body)
+    assert body == {"blocked": True}
+
+@responses.activate
+def test_a0_send_verification_email_jobs_endpoint():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.POST, f"https://{DOMAIN}/api/v2/jobs/verification-email",
+                  json={"id": "job_1", "status": "pending"}, status=201)
+    api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    job = api.send_verification_email("auth0|1")
+    assert job["id"] == "job_1"
+
+@responses.activate
+def test_a0_password_reset_ticket():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.POST, f"https://{DOMAIN}/api/v2/tickets/password-change",
+                  json={"ticket": "https://x/reset?t=abc"}, status=201)
+    api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    assert api.create_password_reset_ticket("auth0|1").startswith("https://")
+
+@responses.activate
+def test_a0_password_reset_ticket_missing_raises():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.POST, f"https://{DOMAIN}/api/v2/tickets/password-change",
+                  json={}, status=201)
+    api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    with pytest.raises(RuntimeError, match="no ticket"):
+        api.create_password_reset_ticket("auth0|1")
+
+@responses.activate
+def test_a0_delete_sessions_and_revoke_grants():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.DELETE, f"https://{DOMAIN}/api/v2/users/auth0|1/sessions", status=202)
+    responses.add(responses.DELETE, f"https://{DOMAIN}/api/v2/grants", status=204)
+    api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    api.delete_sessions("auth0|1")
+    api.revoke_grants("auth0|1")
+    grants = [c for c in responses.calls if "grants" in c.request.url][0]
+    assert "user_id=auth0%7C1" in grants.request.url  # user_id param present
+
+
+# ──────────────────────────────────────────────
+# UserManager — the five cross-system pairs
+# ──────────────────────────────────────────────
+def _lifecycle_mgr(kc_id="kc-1", a0_id="auth0|1"):
+    from auth0_type import UserManager
+    kc = create_autospec(KeycloakAdminAPI, instance=True)
+    a0 = create_autospec(Auth0UsersAPI, instance=True)
+    mgr = UserManager(kc, a0)
+    mgr._keycloak_user_id = lambda u, e: kc_id
+    mgr._auth0_user_id = lambda e: a0_id
+    return mgr, kc, a0
+
+def test_pair1_metadata_both_systems():
+    mgr, kc, a0 = _lifecycle_mgr()
+    s = mgr.set_user_metadata("u", "u@x.com", {"dept": "eng"})
+    assert s == {"keycloak": "updated", "auth0": "updated"}
+    kc.set_user_attributes.assert_called_once_with("kc-1", {"dept": "eng"})
+    a0.set_user_metadata.assert_called_once_with("auth0|1", app_metadata={"dept": "eng"})
+
+def test_pair2_active_semantics():
+    mgr, kc, a0 = _lifecycle_mgr()
+    s = mgr.set_user_active("u", "u@x.com", False)   # deactivate
+    assert s == {"keycloak": "disabled", "auth0": "blocked"}
+    kc.set_user_enabled.assert_called_once_with("kc-1", False)
+    a0.set_user_blocked.assert_called_once_with("auth0|1", True)  # blocked = NOT active
+
+def test_pair3_email_verified_and_send():
+    mgr, kc, a0 = _lifecycle_mgr()
+    assert mgr.set_email_verified("u", "u@x.com")["keycloak"] == "set"
+    kc.set_email_verified.assert_called_once_with("kc-1", True)
+    assert mgr.send_verification_email("u", "u@x.com")["auth0"] == "sent"
+    a0.send_verification_email.assert_called_once_with("auth0|1")
+
+def test_pair4_password_reset_returns_ticket():
+    mgr, kc, a0 = _lifecycle_mgr()
+    a0.create_password_reset_ticket.return_value = "https://x/reset?t=1"
+    s = mgr.trigger_password_reset("u", "u@x.com")
+    assert s["keycloak"] == "email-sent"
+    assert s["auth0"] == "ticket-created"
+    assert s["auth0_ticket"] == "https://x/reset?t=1"
+
+def test_pair5_logout_everywhere():
+    mgr, kc, a0 = _lifecycle_mgr()
+    s = mgr.logout_everywhere("u", "u@x.com")
+    assert s == {"keycloak": "logged-out", "auth0": "sessions-and-grants-revoked"}
+    kc.logout_user.assert_called_once_with("kc-1")
+    a0.delete_sessions.assert_called_once_with("auth0|1")
+    a0.revoke_grants.assert_called_once_with("auth0|1")
+
+def test_pairs_user_missing_everywhere():
+    mgr, kc, a0 = _lifecycle_mgr(kc_id=None, a0_id=None)
+    for s in (mgr.set_user_metadata("u", "e", {}), mgr.set_user_active("u", "e", True),
+              mgr.set_email_verified("u", "e"), mgr.logout_everywhere("u", "e")):
+        assert s["keycloak"] == "user-not-found"
+        assert s["auth0"] == "user-not-found"
+    kc.set_user_attributes.assert_not_called()
+    a0.set_user_blocked.assert_not_called()

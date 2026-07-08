@@ -679,3 +679,110 @@ def test_setup_keycloak_retry_succeeds_first_try(monkeypatch):
     monkeypatch.setenv("KEYCLOAK_STARTUP_RETRIES", "5")
     monkeypatch.setattr(m, "setup_keycloak", lambda: "immediate")
     assert m._setup_keycloak_with_retry() == "immediate"
+
+
+# ──────────────────────────────────────────────
+# Lifecycle endpoints (AUTH-PROTECTED): /users/metadata, /users/active,
+# /users/verify-email, /users/password-reset, /users/logout
+# ──────────────────────────────────────────────
+def test_lifecycle_endpoints_require_auth(client, monkeypatch):
+    monkeypatch.setattr(main, "keycloak_oidc", None)
+    mgr = MagicMock()
+    monkeypatch.setattr(main, "user_manager", mgr)
+    d = {"username": "u", "email": "e@x.com"}
+    assert client.patch("/users/metadata", data={**d, "metadata": "{}"}).status_code in (401, 403, 503)
+    assert client.post("/users/active", data={**d, "active": "true"}).status_code in (401, 403, 503)
+    assert client.post("/users/verify-email", data={**d, "action": "set"}).status_code in (401, 403, 503)
+    assert client.post("/users/password-reset", data=d).status_code in (401, 403, 503)
+    assert client.post("/users/logout", data=d).status_code in (401, 403, 503)
+    mgr.set_user_metadata.assert_not_called()
+    mgr.logout_everywhere.assert_not_called()
+
+def test_metadata_endpoint_success_and_bad_json(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        mgr.set_user_metadata.return_value = {"keycloak": "updated", "auth0": "updated"}
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.patch("/users/metadata", data={
+            "username": "u", "email": "e@x.com", "metadata": '{"dept": "eng"}'})
+        assert r.status_code == 200
+        mgr.set_user_metadata.assert_called_once_with("u", "e@x.com", {"dept": "eng"})
+        # invalid JSON -> 422
+        r = client.patch("/users/metadata", data={
+            "username": "u", "email": "e@x.com", "metadata": "not json"})
+        assert r.status_code == 422
+        # JSON but not an object -> 422
+        r = client.patch("/users/metadata", data={
+            "username": "u", "email": "e@x.com", "metadata": "[1,2]"})
+        assert r.status_code == 422
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_active_endpoint(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        mgr.set_user_active.return_value = {"keycloak": "disabled", "auth0": "blocked"}
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.post("/users/active", data={
+            "username": "u", "email": "e@x.com", "active": "false"})
+        assert r.status_code == 200
+        mgr.set_user_active.assert_called_once_with("u", "e@x.com", False)
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_verify_email_endpoint_actions(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        mgr.set_email_verified.return_value = {"keycloak": "set", "auth0": "set"}
+        mgr.send_verification_email.return_value = {"keycloak": "sent", "auth0": "sent"}
+        monkeypatch.setattr(main, "user_manager", mgr)
+        d = {"username": "u", "email": "e@x.com"}
+        assert client.post("/users/verify-email", data={**d, "action": "set"}).status_code == 200
+        mgr.set_email_verified.assert_called_once_with("u", "e@x.com", True)
+        assert client.post("/users/verify-email", data={**d, "action": "send"}).status_code == 200
+        mgr.send_verification_email.assert_called_once_with("u", "e@x.com")
+        assert client.post("/users/verify-email", data={**d, "action": "bogus"}).status_code == 422
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_password_reset_endpoint(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        mgr.trigger_password_reset.return_value = {
+            "keycloak": "email-sent", "auth0": "ticket-created",
+            "auth0_ticket": "https://x/r?t=1"}
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.post("/users/password-reset", data={"username": "u", "email": "e@x.com"})
+        assert r.status_code == 200
+        assert r.json()["auth0_ticket"].startswith("https://")
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_logout_endpoint(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        mgr.logout_everywhere.return_value = {
+            "keycloak": "logged-out", "auth0": "sessions-and-grants-revoked"}
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.post("/users/logout", data={"username": "u", "email": "e@x.com"})
+        assert r.status_code == 200
+        mgr.logout_everywhere.assert_called_once_with("u", "e@x.com")
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_lifecycle_scope_errors_become_502(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        mgr.logout_everywhere.side_effect = RuntimeError("missing delete:grants scope")
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.post("/users/logout", data={"username": "u", "email": "e@x.com"})
+        assert r.status_code == 502
+        assert "delete:grants" in r.json()["detail"]
+    finally:
+        main.app.dependency_overrides.clear()

@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # auth0_talk.py
 # Uses the helpers in auth0_connect.py to talk to BOTH APIs:
 #   - Keycloak Admin API (manage users in the Keycloak realm)
@@ -224,6 +225,72 @@ class KeycloakAdminAPI:
             logger.info("Revoked realm role '%s' from user %s", role_name, user_id)
         else:
             logger.error("Failed to revoke realm role: %d %s", resp.status_code, resp.text)
+            resp.raise_for_status()
+
+    # ── account state & lifecycle ──────────────────────────────
+    def get_user_attributes(self, user_id: str) -> dict:
+        """Return the user's custom attributes (Keycloak stores dict[str, list[str]])."""
+        return self.read_user(user_id).get("attributes") or {}
+
+    def set_user_attributes(self, user_id: str, attributes: dict) -> None:
+        """
+        Merge key/values into the user's attributes. Keycloak requires attribute
+        values as lists of strings, so scalars are wrapped automatically.
+        Existing keys not named here are preserved (read-modify-write).
+        """
+        current = self.get_user_attributes(user_id)
+        for k, v in attributes.items():
+            current[k] = v if isinstance(v, list) else [str(v)]
+        self.update_user(user_id, attributes=current)
+
+    def set_user_enabled(self, user_id: str, enabled: bool) -> None:
+        """Enable (True) or disable (False) a Keycloak account."""
+        self.update_user(user_id, enabled=enabled)
+
+    def set_email_verified(self, user_id: str, verified: bool = True) -> None:
+        """Set the emailVerified flag directly."""
+        self.update_user(user_id, emailVerified=verified)
+
+    def send_verify_email(self, user_id: str) -> None:
+        """Trigger Keycloak's built-in verification email (requires realm SMTP)."""
+        url = f"{self._users_url(user_id)}/send-verify-email"
+        resp = requests.put(url, headers=self.headers, timeout=10)
+        if resp.status_code not in (200, 204):
+            logger.error("send-verify-email failed: %d %s", resp.status_code, resp.text)
+            resp.raise_for_status()
+
+    def reset_password(self, user_id: str, new_password: str,
+                       temporary: bool = False) -> None:
+        """Set a new password. temporary=True forces a change at next login."""
+        url = f"{self._users_url(user_id)}/reset-password"
+        payload = {"type": "password", "value": new_password, "temporary": temporary}
+        resp = requests.put(url, headers=self.headers, json=payload, timeout=10)
+        if resp.status_code not in (200, 204):
+            logger.error("reset-password failed: %d %s", resp.status_code, resp.text)
+            resp.raise_for_status()
+
+    def send_reset_password_email(self, user_id: str) -> None:
+        """Email the user a link to set a new password (requires realm SMTP)."""
+        url = f"{self._users_url(user_id)}/execute-actions-email"
+        resp = requests.put(url, headers=self.headers,
+                            json=["UPDATE_PASSWORD"], timeout=10)
+        if resp.status_code not in (200, 204):
+            logger.error("execute-actions-email failed: %d %s", resp.status_code, resp.text)
+            resp.raise_for_status()
+
+    def list_user_sessions(self, user_id: str) -> list[dict]:
+        """Return the user's active sessions."""
+        url = f"{self._users_url(user_id)}/sessions"
+        resp = requests.get(url, headers=self.headers, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    def logout_user(self, user_id: str) -> None:
+        """Invalidate all of the user's sessions (idempotent)."""
+        url = f"{self._users_url(user_id)}/logout"
+        resp = requests.post(url, headers=self.headers, timeout=10)
+        if resp.status_code not in (200, 204):
+            logger.error("logout failed: %d %s", resp.status_code, resp.text)
             resp.raise_for_status()
 
     # ── group management ───────────────────────────────────────
@@ -500,6 +567,93 @@ class Auth0UsersAPI:
             logger.info("Revoked Auth0 role '%s' from user %s", role_name, user_id)
         else:
             logger.error("Failed to revoke Auth0 role: %d %s", resp.status_code, resp.text)
+            resp.raise_for_status()
+
+    # ── account state & lifecycle ──────────────────────────────
+    def _api_v2_base(self) -> str:
+        # self.base is .../api/v2/users; derive the /api/v2 root for jobs/tickets/grants
+        return self.base.rsplit("/users", 1)[0]
+
+    def get_user(self, user_id: str) -> dict:
+        """Fetch a single Auth0 user. Requires 'read:users'."""
+        resp = requests.get(f"{self.base}/{user_id}", headers=self.headers, timeout=10)
+        _explain_403(resp, "read:users")
+        resp.raise_for_status()
+        return resp.json()
+
+    def set_user_metadata(self, user_id: str, app_metadata: dict | None = None,
+                          user_metadata: dict | None = None) -> dict:
+        """
+        Merge keys into app_metadata and/or user_metadata. Auth0's PATCH merges
+        top-level metadata keys (set a key to None to delete it). Requires
+        'update:users'.
+        """
+        payload: dict = {}
+        if app_metadata is not None:
+            payload["app_metadata"] = app_metadata
+        if user_metadata is not None:
+            payload["user_metadata"] = user_metadata
+        if not payload:
+            return {}
+        return self.update_user(user_id, **payload)
+
+    def set_user_blocked(self, user_id: str, blocked: bool) -> dict:
+        """Block (True) or unblock (False) an Auth0 account. Requires 'update:users'."""
+        return self.update_user(user_id, blocked=blocked)
+
+    def set_email_verified(self, user_id: str, verified: bool = True) -> dict:
+        """Set the email_verified flag directly. Requires 'update:users'."""
+        return self.update_user(user_id, email_verified=verified)
+
+    def send_verification_email(self, user_id: str) -> dict:
+        """
+        Queue Auth0's verification email via the Jobs API.
+        Requires the 'update:users' scope.
+        """
+        url = f"{self._api_v2_base()}/jobs/verification-email"
+        resp = requests.post(url, headers=self.headers,
+                             json={"user_id": user_id}, timeout=10)
+        _explain_403(resp, "update:users")
+        resp.raise_for_status()
+        return resp.json()
+
+    def create_password_reset_ticket(self, user_id: str,
+                                     result_url: str | None = None,
+                                     ttl_sec: int = 86400) -> str:
+        """
+        Create a password-change ticket and return its URL (send it to the user
+        yourself, or use Auth0's email). Requires 'create:user_tickets'.
+        """
+        payload: dict = {"user_id": user_id, "ttl_sec": ttl_sec}
+        if result_url:
+            payload["result_url"] = result_url
+        url = f"{self._api_v2_base()}/tickets/password-change"
+        resp = requests.post(url, headers=self.headers, json=payload, timeout=10)
+        _explain_403(resp, "create:user_tickets")
+        resp.raise_for_status()
+        ticket = resp.json().get("ticket", "")
+        if not ticket:
+            raise RuntimeError("Auth0 returned no ticket URL for password change")
+        return ticket
+
+    def delete_sessions(self, user_id: str) -> None:
+        """Delete the user's Auth0 sessions. Requires 'delete:sessions'."""
+        url = f"{self.base}/{user_id}/sessions"
+        resp = requests.delete(url, headers=self.headers, timeout=10)
+        _explain_403(resp, "delete:sessions")
+        if resp.status_code not in (200, 202, 204):
+            resp.raise_for_status()
+
+    def revoke_grants(self, user_id: str) -> None:
+        """
+        Revoke all grants (incl. refresh tokens) issued to the user.
+        Requires 'delete:grants'.
+        """
+        url = f"{self._api_v2_base()}/grants"
+        resp = requests.delete(url, headers=self.headers,
+                               params={"user_id": user_id}, timeout=10)
+        _explain_403(resp, "delete:grants")
+        if resp.status_code not in (200, 204):
             resp.raise_for_status()
 
 

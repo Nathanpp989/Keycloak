@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # auth0_type.py
 # Detects which system(s) a username already belongs to (Keycloak vs Auth0),
 # derives a username from an email address, and creates a new user in BOTH
@@ -258,7 +259,9 @@ class UserManager:
         if self.auth0_authz is not None:
             a0_uid = self._auth0_user_id(email)
             if a0_uid:
-                group = self.auth0_authz.find_group_by_name(group_name)
+                # Flat group names in the extension; match the leaf of any path.
+                ext_name = group_name.strip("/").split("/")[-1]
+                group = self.auth0_authz.find_group_by_name(ext_name)
                 if group:
                     gid = group.get("_id") or group.get("id")
                     if add:
@@ -315,6 +318,99 @@ class UserManager:
             summary["auth0"] = "user-not-found"
         return summary
 
+    # ── account lifecycle (cross-system pairs) ──────────────────
+    def _resolve_ids(self, username: str, email: str) -> tuple[str | None, str | None]:
+        """Resolve (keycloak_id, auth0_id) for a user; either may be None."""
+        return self._keycloak_user_id(username, email), self._auth0_user_id(email)
+
+    def set_user_metadata(self, username: str, email: str, metadata: dict) -> dict:
+        """
+        Pair 1: write key/values to Keycloak user attributes AND Auth0
+        app_metadata. Returns a per-system status summary.
+        """
+        summary = {"keycloak": "user-not-found", "auth0": "user-not-found"}
+        kc_id, a0_id = self._resolve_ids(username, email)
+        if kc_id:
+            self.keycloak.set_user_attributes(kc_id, metadata)
+            summary["keycloak"] = "updated"
+        if a0_id:
+            self.auth0_users.set_user_metadata(a0_id, app_metadata=metadata)
+            summary["auth0"] = "updated"
+        return summary
+
+    def set_user_active(self, username: str, email: str, active: bool) -> dict:
+        """
+        Pair 2: enable/disable the account everywhere. Keycloak uses enabled=X,
+        Auth0 uses blocked=not X.
+        """
+        summary = {"keycloak": "user-not-found", "auth0": "user-not-found"}
+        kc_id, a0_id = self._resolve_ids(username, email)
+        if kc_id:
+            self.keycloak.set_user_enabled(kc_id, active)
+            summary["keycloak"] = "enabled" if active else "disabled"
+        if a0_id:
+            self.auth0_users.set_user_blocked(a0_id, not active)
+            summary["auth0"] = "unblocked" if active else "blocked"
+        return summary
+
+    def set_email_verified(self, username: str, email: str,
+                           verified: bool = True) -> dict:
+        """Pair 3a: set the verified flag directly in both systems."""
+        summary = {"keycloak": "user-not-found", "auth0": "user-not-found"}
+        kc_id, a0_id = self._resolve_ids(username, email)
+        if kc_id:
+            self.keycloak.set_email_verified(kc_id, verified)
+            summary["keycloak"] = "set"
+        if a0_id:
+            self.auth0_users.set_email_verified(a0_id, verified)
+            summary["auth0"] = "set"
+        return summary
+
+    def send_verification_email(self, username: str, email: str) -> dict:
+        """Pair 3b: trigger each system's own verification email."""
+        summary = {"keycloak": "user-not-found", "auth0": "user-not-found"}
+        kc_id, a0_id = self._resolve_ids(username, email)
+        if kc_id:
+            self.keycloak.send_verify_email(kc_id)
+            summary["keycloak"] = "sent"
+        if a0_id:
+            self.auth0_users.send_verification_email(a0_id)
+            summary["auth0"] = "sent"
+        return summary
+
+    def trigger_password_reset(self, username: str, email: str) -> dict:
+        """
+        Pair 4: start a password reset in both systems. Keycloak emails the user
+        directly (realm SMTP required); Auth0 returns a ticket URL, included in
+        the summary so the caller can deliver it.
+        """
+        summary: dict = {"keycloak": "user-not-found", "auth0": "user-not-found",
+                         "auth0_ticket": None}
+        kc_id, a0_id = self._resolve_ids(username, email)
+        if kc_id:
+            self.keycloak.send_reset_password_email(kc_id)
+            summary["keycloak"] = "email-sent"
+        if a0_id:
+            summary["auth0_ticket"] = self.auth0_users.create_password_reset_ticket(a0_id)
+            summary["auth0"] = "ticket-created"
+        return summary
+
+    def logout_everywhere(self, username: str, email: str) -> dict:
+        """
+        Pair 5: kill the user's sessions in both systems. Keycloak invalidates
+        sessions; Auth0 deletes sessions AND revokes grants/refresh tokens.
+        """
+        summary = {"keycloak": "user-not-found", "auth0": "user-not-found"}
+        kc_id, a0_id = self._resolve_ids(username, email)
+        if kc_id:
+            self.keycloak.logout_user(kc_id)
+            summary["keycloak"] = "logged-out"
+        if a0_id:
+            self.auth0_users.delete_sessions(a0_id)
+            self.auth0_users.revoke_grants(a0_id)
+            summary["auth0"] = "sessions-and-grants-revoked"
+        return summary
+
     # ── Auth0 organization membership ──────────────────────────
     def set_organization_membership(self, email: str, org_name: str,
                                     add: bool = True) -> str:
@@ -357,7 +453,10 @@ class UserManager:
             summary["keycloak"] = "group-not-found"
 
         if self.auth0_authz is not None:
-            ext_group = self.auth0_authz.find_group_by_name(group_path_or_name)
+            # The Authz Extension has flat group names; for a Keycloak subgroup
+            # path like 'finance/billing', match the leaf name ('billing').
+            ext_name = group_path_or_name.strip("/").split("/")[-1]
+            ext_group = self.auth0_authz.find_group_by_name(ext_name)
             if ext_group:
                 gid = ext_group.get("_id") or ext_group.get("id")
                 self.auth0_authz.update_group(gid, name=new_name)
@@ -384,7 +483,8 @@ class UserManager:
             summary["keycloak"] = "group-not-found"
 
         if self.auth0_authz is not None:
-            ext_group = self.auth0_authz.find_group_by_name(group_path_or_name)
+            ext_name = group_path_or_name.strip("/").split("/")[-1]
+            ext_group = self.auth0_authz.find_group_by_name(ext_name)
             if ext_group:
                 gid = ext_group.get("_id") or ext_group.get("id")
                 self.auth0_authz.delete_group(gid)

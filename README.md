@@ -74,6 +74,7 @@ mocked test suite.
    read:clients       create:clients
    read:users         create:users   update:users   delete:users
    read:roles         (for membership/role lookup)
+   create:user_tickets  delete:sessions  delete:grants   (account lifecycle)
    update:client_keys   (for secret rotation)
    ```
 
@@ -142,6 +143,11 @@ python login_flow.py
 | PATCH | `/organizations/{org_id}` | Bearer | Update an organization's display name |
 | DELETE | `/organizations/{org_id}` | Bearer | Delete an organization |
 | POST | `/organizations/members` | Bearer | Add/remove a user from an org (`action=add\|remove`) |
+| PATCH | `/users/metadata` | Bearer | Merge metadata into Keycloak attributes + Auth0 app_metadata |
+| POST | `/users/active` | Bearer | Enable/disable (Keycloak) and unblock/block (Auth0) an account |
+| POST | `/users/verify-email` | Bearer | Mark email verified or send verification emails (`action=set\|send`) |
+| POST | `/users/password-reset` | Bearer | Trigger reset in both systems; returns an Auth0 ticket URL |
+| POST | `/users/logout` | Bearer | Kill sessions in both systems (Auth0 also revokes grants) |
 | GET | `/secure-data` | depends | Uses a server-side Auth0 M2M token |
 | GET | `/keys` | none | Public RSA key |
 
@@ -170,7 +176,7 @@ engines.
 Build:
 ```bash
 docker build -t auth-broker .      # Docker
-podman build -t auth-broker .      # Podman (reads Containerfile by default)
+podman build --format docker -t auth-broker .   # Podman (see note below)
 ```
 
 Run (supplying config via an env file):
@@ -193,8 +199,12 @@ Notes:
   (`KEYCLOAK_STARTUP_RETRIES`, default 10; `KEYCLOAK_STARTUP_BACKOFF`, default
   2.0s). This tolerates Keycloak still coming up, complementing compose's
   `depends_on: service_healthy`.
-- A `HEALTHCHECK` hits `GET /`; Docker runs it natively, Podman honours it when
-  run with `--health-cmd` or via `podman play`.
+- A `HEALTHCHECK` hits `GET /`. Docker stores and runs it natively. Podman's
+  default OCI image format drops HEALTHCHECK, so build with `--format docker`
+  (shown above) or pass `--health-cmd` at run time.
+- The bundled Keycloak service sets `KC_HEALTH_ENABLED=true`; on Keycloak 25+
+  the health endpoints live on the management port (9000), which the compose
+  healthcheck targets.
 
 ## Testing
 
