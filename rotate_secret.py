@@ -131,6 +131,23 @@ def verify_keycloak_idp_secret(
     return False
 
 
+def _persist_secret_to_env(new_secret: str) -> bool:
+    """
+    Write AUTH0_CLIENT_SECRET into the local .env (DOTENV_PATH or ./.env).
+    Returns True if persisted. Never logs the secret itself.
+    """
+    if not _HAVE_DOTENV:
+        logger.warning("python-dotenv not installed — update AUTH0_CLIENT_SECRET manually.")
+        return False
+    env_path = os.environ.get("DOTENV_PATH", ".env")
+    if not os.path.exists(env_path):
+        logger.warning("No .env at %s — update AUTH0_CLIENT_SECRET manually.", env_path)
+        return False
+    set_key(env_path, "AUTH0_CLIENT_SECRET", new_secret)
+    logger.info("Updated AUTH0_CLIENT_SECRET in %s", env_path)
+    return True
+
+
 def rotate_and_sync(
     auth0: Auth0Connect,
     keycloak_url: str,
@@ -163,10 +180,26 @@ def rotate_and_sync(
     # 1. Rotate at Auth0 (old secret dies here)
     new_secret = auth0.rotate_client_secret(auth0.client_id)
 
-    # 2. Push to Keycloak immediately to close the window as fast as possible
-    idp_url = update_keycloak_idp_secret(
-        keycloak_url, realm_name, keycloak_admin_token, idp_alias, new_secret
-    )
+    # 2. Push to Keycloak immediately to close the window as fast as possible.
+    #    R1 FIX: if this fails, the OLD secret is already invalid at Auth0 and
+    #    the NEW one exists only in memory — losing it would lock the operator
+    #    out entirely. So on failure, persist the new secret to .env FIRST,
+    #    then re-raise with clear remediation.
+    try:
+        idp_url = update_keycloak_idp_secret(
+            keycloak_url, realm_name, keycloak_admin_token, idp_alias, new_secret
+        )
+    except Exception as exc:
+        persisted = _persist_secret_to_env(new_secret) if update_env else False
+        raise RuntimeError(
+            "Auth0 secret was rotated but the Keycloak IdP update FAILED. "
+            + ("The new secret was saved to your .env. "
+               if persisted else
+               "The new secret could NOT be saved locally — retrieve it from "
+               "the Auth0 dashboard (Applications → your app → Credentials). ")
+            + f"Update the Keycloak IdP '{idp_alias}' clientSecret manually, "
+            "or re-run this script. Original error: " + str(exc)
+        ) from exc
 
     # 3. Best-effort verification that Keycloak holds the new secret
     if verify_keycloak_idp_secret(
@@ -183,15 +216,8 @@ def rotate_and_sync(
         )
 
     # 4. Persist locally last, so .env only changes after Keycloak is updated
-    if update_env and _HAVE_DOTENV:
-        env_path = os.environ.get("DOTENV_PATH", ".env")
-        if os.path.exists(env_path):
-            set_key(env_path, "AUTH0_CLIENT_SECRET", new_secret)
-            logger.info("Updated AUTH0_CLIENT_SECRET in %s", env_path)
-        else:
-            logger.warning("No .env at %s — update AUTH0_CLIENT_SECRET manually.", env_path)
-    elif update_env:
-        logger.warning("python-dotenv not installed — update AUTH0_CLIENT_SECRET manually.")
+    if update_env:
+        _persist_secret_to_env(new_secret)
 
     return new_secret
 
@@ -202,6 +228,13 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s — %(message)s",
     )
 
+    missing = [k for k in ("AUTH0_DOMAIN", "AUTH0_CLIENT_ID", "AUTH0_CLIENT_SECRET")
+               if not os.environ.get(k)]
+    if missing:
+        raise SystemExit(
+            f"Missing required environment variables: {', '.join(missing)}. "
+            "Set them in .env or your shell before rotating."
+        )
     domain        = os.environ["AUTH0_DOMAIN"]
     client_id     = os.environ["AUTH0_CLIENT_ID"]
     client_secret = os.environ["AUTH0_CLIENT_SECRET"]

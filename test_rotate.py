@@ -120,3 +120,111 @@ def test_rotate_and_sync_verify_reuses_discovered_url():
     gets = [c for c in responses.calls
             if c.request.method == "GET" and "identity-provider" in c.request.url]
     assert len(gets) == 2              # one read-for-update + one verify, no extras
+
+
+# ──────────────────────────────────────────────
+# .env persistence + R1 failure-recovery + main() — previously untested paths
+# ──────────────────────────────────────────────
+import os
+import tempfile
+
+
+def _make_env_file(tmpdir, secret="old-secret"):
+    path = os.path.join(tmpdir, ".env")
+    with open(path, "w") as f:
+        f.write(f"AUTH0_CLIENT_SECRET={secret}\n")
+    return path
+
+
+@responses.activate
+def test_rotate_and_sync_persists_new_secret_to_env(monkeypatch):
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.POST,
+                  f"https://{DOMAIN}/api/v2/clients/cid/rotate-secret",
+                  json={"client_id": "cid", "client_secret": "fresh-123"}, status=200)
+    idp_url = f"{KC_URL}/admin/realms/{REALM}/identity-provider/instances/auth0"
+    responses.add(responses.GET, idp_url,
+                  json={"alias": "auth0", "config": {"clientSecret": "old"}}, status=200)
+    responses.add(responses.PUT, idp_url, status=204)
+    responses.add(responses.GET, idp_url,
+                  json={"alias": "auth0", "config": {"clientSecret": "fresh-123"}}, status=200)
+    with tempfile.TemporaryDirectory() as td:
+        env_path = _make_env_file(td)
+        monkeypatch.setenv("DOTENV_PATH", env_path)
+        auth0 = Auth0Connect(DOMAIN, "cid", "old-secret")
+        rotate_and_sync(auth0, KC_URL, REALM, "kc-tok", update_env=True)
+        content = open(env_path).read()
+        assert "fresh-123" in content          # new secret persisted
+        assert "old-secret" not in content     # old secret replaced
+
+
+@responses.activate
+def test_rotate_keycloak_failure_still_persists_secret(monkeypatch):
+    # R1 regression: Keycloak update fails AFTER Auth0 rotation -> the new
+    # secret must be captured in .env and the error must explain remediation.
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.POST,
+                  f"https://{DOMAIN}/api/v2/clients/cid/rotate-secret",
+                  json={"client_id": "cid", "client_secret": "orphan-risk"}, status=200)
+    # Keycloak IdP fetch: 500 on modern path -> update raises immediately
+    idp_url = f"{KC_URL}/admin/realms/{REALM}/identity-provider/instances/auth0"
+    responses.add(responses.GET, idp_url, status=500)
+    with tempfile.TemporaryDirectory() as td:
+        env_path = _make_env_file(td)
+        monkeypatch.setenv("DOTENV_PATH", env_path)
+        auth0 = Auth0Connect(DOMAIN, "cid", "old-secret")
+        with pytest.raises(RuntimeError, match="Keycloak IdP update FAILED"):
+            rotate_and_sync(auth0, KC_URL, REALM, "kc-tok", update_env=True)
+        content = open(env_path).read()
+        assert "orphan-risk" in content        # R1: secret NOT lost
+
+
+@responses.activate
+def test_rotate_failure_without_env_names_dashboard(monkeypatch):
+    # R1 variant: update_env=False -> error must point to the Auth0 dashboard.
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.POST,
+                  f"https://{DOMAIN}/api/v2/clients/cid/rotate-secret",
+                  json={"client_id": "cid", "client_secret": "s"}, status=200)
+    idp_url = f"{KC_URL}/admin/realms/{REALM}/identity-provider/instances/auth0"
+    responses.add(responses.GET, idp_url, status=500)
+    auth0 = Auth0Connect(DOMAIN, "cid", "old")
+    with pytest.raises(RuntimeError, match="Auth0 dashboard"):
+        rotate_and_sync(auth0, KC_URL, REALM, "kc-tok", update_env=False)
+
+
+@responses.activate
+def test_main_end_to_end(monkeypatch):
+    # The full CLI flow: env -> KC admin token -> rotate -> KC update -> .env
+    import rotate_secret as rs
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.POST,
+                  f"https://{DOMAIN}/api/v2/clients/cid/rotate-secret",
+                  json={"client_id": "cid", "client_secret": "cli-new"}, status=200)
+    idp_url = f"{KC_URL}/admin/realms/{REALM}/identity-provider/instances/auth0"
+    responses.add(responses.GET, idp_url,
+                  json={"alias": "auth0", "config": {"clientSecret": "old"}}, status=200)
+    responses.add(responses.PUT, idp_url, status=204)
+    responses.add(responses.GET, idp_url,
+                  json={"alias": "auth0", "config": {"clientSecret": "cli-new"}}, status=200)
+    with tempfile.TemporaryDirectory() as td:
+        env_path = _make_env_file(td)
+        for k, v in {"AUTH0_DOMAIN": DOMAIN, "AUTH0_CLIENT_ID": "cid",
+                     "AUTH0_CLIENT_SECRET": "old", "KEYCLOAK_URL": KC_URL,
+                     "KEYCLOAK_REALM": REALM, "DOTENV_PATH": env_path}.items():
+            monkeypatch.setenv(k, v)
+        monkeypatch.setattr(rs, "get_keycloak_admin_token", lambda *a, **k: "kc-tok")
+        rs.main()  # must complete without raising
+        assert "cli-new" in open(env_path).read()
+
+
+def test_main_missing_env_exits_clearly(monkeypatch):
+    import rotate_secret as rs
+    for k in ("AUTH0_DOMAIN", "AUTH0_CLIENT_ID", "AUTH0_CLIENT_SECRET"):
+        monkeypatch.delenv(k, raising=False)
+    with pytest.raises(SystemExit, match="Missing required environment variables"):
+        rs.main()
