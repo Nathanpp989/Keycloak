@@ -228,3 +228,23 @@ def test_main_missing_env_exits_clearly(monkeypatch):
         monkeypatch.delenv(k, raising=False)
     with pytest.raises(SystemExit, match="Missing required environment variables"):
         rs.main()
+
+
+@responses.activate
+def test_rotate_failure_env_write_error_does_not_mask_remediation(monkeypatch):
+    # S2 regression: if writing .env ALSO fails, the operator must still get
+    # the remediation error (pointing to the dashboard), not a raw IOError.
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.POST,
+                  f"https://{DOMAIN}/api/v2/clients/cid/rotate-secret",
+                  json={"client_id": "cid", "client_secret": "s"}, status=200)
+    idp_url = f"{KC_URL}/admin/realms/{REALM}/identity-provider/instances/auth0"
+    responses.add(responses.GET, idp_url, status=500)
+    import rotate_secret as rs
+    def boom(_):
+        raise PermissionError(".env is read-only")
+    monkeypatch.setattr(rs, "_persist_secret_to_env", boom)
+    auth0 = Auth0Connect(DOMAIN, "cid", "old")
+    with pytest.raises(RuntimeError, match="Auth0 dashboard"):
+        rs.rotate_and_sync(auth0, KC_URL, REALM, "kc-tok", update_env=True)

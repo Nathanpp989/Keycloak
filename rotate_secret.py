@@ -190,7 +190,14 @@ def rotate_and_sync(
             keycloak_url, realm_name, keycloak_admin_token, idp_alias, new_secret
         )
     except Exception as exc:
-        persisted = _persist_secret_to_env(new_secret) if update_env else False
+        # S2: persistence itself may fail (read-only .env, disk full). That
+        # must NOT mask the remediation message below — swallow and report.
+        persisted = False
+        if update_env:
+            try:
+                persisted = _persist_secret_to_env(new_secret)
+            except Exception as env_exc:  # noqa: BLE001
+                logger.error("Could not persist rotated secret to .env: %s", env_exc)
         raise RuntimeError(
             "Auth0 secret was rotated but the Keycloak IdP update FAILED. "
             + ("The new secret was saved to your .env. "

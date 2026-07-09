@@ -254,7 +254,10 @@ class KeycloakAdminAPI:
         """
         current = self.get_user_attributes(user_id)
         for k, v in attributes.items():
-            current[k] = v if isinstance(v, list) else [str(v)]
+            # S1: Keycloak attribute values are list[str]. Stringify list
+            # ELEMENTS too — previously [1, 2] was sent as raw ints while a
+            # scalar 1 became "1", an inconsistency Keycloak can reject.
+            current[k] = [str(x) for x in v] if isinstance(v, list) else [str(v)]
         self.update_user(user_id, attributes=current)
 
     def set_user_enabled(self, user_id: str, enabled: bool) -> None:
@@ -885,7 +888,8 @@ class Auth0AuthzExtensionAPI:
             )
         resp.raise_for_status()
         groups = []
-        for g in resp.json():
+        # Guard against the wrapped {"groups": [...]} form, matching list_groups.
+        for g in _as_list(resp.json(), "groups"):
             # The extension marks nesting with a 'parent' field or by nesting.
             groups.append({
                 "name": g.get("name", ""),
