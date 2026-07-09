@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # auth0_connect.py
 # Registers Auth0 as an OIDC Identity Provider inside Keycloak and sets up
 # social connections (Google, Facebook, etc.) in Auth0.
@@ -156,10 +157,18 @@ class Auth0Connect:
                 f"Secret rotation for client {client_id} returned no client_secret"
             )
         new_secret = result["client_secret"]
-        # P1 FIX: if we rotated THIS instance's own client, update the stored
-        # secret so a future token refresh (after the cached token expires) uses
-        # the new secret instead of the now-invalid old one.
+        # Freshness guard: when rotating OUR OWN client we know the old secret,
+        # so a "new" secret identical to it means rotation did NOT actually
+        # happen (broken proxy/mock or API anomaly). Failing loudly beats
+        # reporting a rotation that never occurred.
         if client_id == self.client_id:
+            if new_secret == self.client_secret:
+                raise RuntimeError(
+                    f"Auth0 returned the SAME secret for client {client_id} — "
+                    "rotation did not occur. Check the tenant/endpoint."
+                )
+            # P1 FIX: update the stored secret so a future token refresh (after
+            # the cached token expires) uses the new secret, not the dead one.
             self.client_secret = new_secret
         logger.info("Rotated client secret for %s", client_id)
         return new_secret
