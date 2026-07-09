@@ -182,8 +182,8 @@ def _setup_keycloak_with_retry() -> str:
     Call setup_keycloak() with retry + exponential backoff, so the app can start
     in a container before Keycloak is fully ready (a common race even with
     compose 'depends_on'). Tunable via env vars:
-      KEYCLOAK_STARTUP_RETRIES (default 10)
-      KEYCLOAK_STARTUP_BACKOFF (default 2.0 seconds, doubles each attempt, capped)
+    KEYCLOAK_STARTUP_RETRIES (default 10)
+    KEYCLOAK_STARTUP_BACKOFF (default 2.0 seconds, doubles each attempt, capped)
     Raises the last error if all attempts fail.
     """
 
@@ -223,7 +223,7 @@ async def lifespan(app: FastAPI):
         client_secret = _setup_keycloak_with_retry()
     except Exception as exc:
         logger.error("Keycloak setup failed after retries — check KEYCLOAK_URL "
-                     "and credentials: %s", exc)
+                    "and credentials: %s", exc)
         raise
     if not client_secret:
         logger.warning(

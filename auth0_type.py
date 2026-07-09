@@ -180,7 +180,7 @@ class UserManager:
         kc_group_names = {g["name"].lower() for g in result["keycloak"]["groups"]}
         a0_group_names = {g["name"].lower() for g in result["auth0"]["groups"]}
         kc_role_names = {r.lower() for r in
-                         result["keycloak"]["roles"]["realm"] + result["keycloak"]["roles"]["client"]}
+                        result["keycloak"]["roles"]["realm"] + result["keycloak"]["roles"]["client"]}
         a0_role_names = {r.lower() for r in result["auth0"]["roles"]}
 
         result["correlation"] = {

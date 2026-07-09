@@ -197,7 +197,7 @@ def verify_auth0_token(token: str) -> dict:
     signing_key = _get_signing_key(domain, token)
     try:
         return jwt.decode(token, signing_key, algorithms=["RS256"],
-                          audience=audience, issuer=f"https://{domain}/")
+                        audience=audience, issuer=f"https://{domain}/")
     except ExpiredSignatureError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
                             detail="Auth0 token has expired",
