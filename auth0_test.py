@@ -84,7 +84,7 @@ def test_usernames_are_unique():
 @responses.activate
 def test_auth0_token_fetch_and_cache():
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                  json={"access_token": "tok-123", "expires_in": 86400}, status=200)
+                json={"access_token": "tok-123", "expires_in": 86400}, status=200)
     a = Auth0Connect(DOMAIN, "cid", "secret")
     assert a.token == "tok-123"
     assert a.token == "tok-123"
@@ -93,7 +93,7 @@ def test_auth0_token_fetch_and_cache():
 @responses.activate
 def test_auth0_token_missing_access_token_raises():
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                  json={"not_a_token": "x"}, status=200)
+                json={"not_a_token": "x"}, status=200)
     a = Auth0Connect(DOMAIN, "cid", "secret")
     with pytest.raises(RuntimeError, match="missing access_token"):
         _ = a.token
@@ -101,7 +101,7 @@ def test_auth0_token_missing_access_token_raises():
 @responses.activate
 def test_auth0_token_non_200_raises():
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                  json={"error": "access_denied"}, status=401)
+                json={"error": "access_denied"}, status=401)
     a = Auth0Connect(DOMAIN, "cid", "secret")
     with pytest.raises(RuntimeError, match="401"):
         _ = a.token
@@ -109,31 +109,31 @@ def test_auth0_token_non_200_raises():
 @responses.activate
 def test_auth0_create_connection_get_or_create():
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                  json={"access_token": "t", "expires_in": 999}, status=200)
+                json={"access_token": "t", "expires_in": 999}, status=200)
     responses.add(responses.GET, f"https://{DOMAIN}/api/v2/connections",
-                  json=[], status=200)
+                json=[], status=200)
     responses.add(responses.POST, f"https://{DOMAIN}/api/v2/connections",
-                  json={"name": "keycloak-google-oauth2", "strategy": "google-oauth2"},
-                  status=201)
+                json={"name": "keycloak-google-oauth2", "strategy": "google-oauth2"},
+                status=201)
     a = Auth0Connect(DOMAIN, "cid", "secret")
     result = a.create_connection("keycloak-google-oauth2", "google-oauth2")
     assert result["name"] == "keycloak-google-oauth2"
     # A POST to /connections must have happened
     assert any(c.request.method == "POST" and "/connections" in c.request.url
-               for c in responses.calls)
+            for c in responses.calls)
 
 @responses.activate
 def test_auth0_create_connection_reuses_existing():
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                  json={"access_token": "t", "expires_in": 999}, status=200)
+                json={"access_token": "t", "expires_in": 999}, status=200)
     responses.add(responses.GET, f"https://{DOMAIN}/api/v2/connections",
-                  json=[{"name": "keycloak-google-oauth2", "id": "con_1"}], status=200)
+                json=[{"name": "keycloak-google-oauth2", "id": "con_1"}], status=200)
     a = Auth0Connect(DOMAIN, "cid", "secret")
     result = a.create_connection("keycloak-google-oauth2", "google-oauth2")
     assert result["id"] == "con_1"
     # T3 FIX: robust check — no POST to the connections collection at all
     posted = [c for c in responses.calls
-              if c.request.method == "POST" and "/api/v2/connections" in c.request.url]
+            if c.request.method == "POST" and "/api/v2/connections" in c.request.url]
     assert posted == []
 
 
@@ -143,15 +143,15 @@ def test_auth0_create_connection_reuses_existing():
 @responses.activate
 def test_get_keycloak_admin_token():
     responses.add(responses.POST,
-                  f"{KC_URL}/realms/master/protocol/openid-connect/token",
-                  json={"access_token": "kc-admin-tok"}, status=200)
+                f"{KC_URL}/realms/master/protocol/openid-connect/token",
+                json={"access_token": "kc-admin-tok"}, status=200)
     assert get_keycloak_admin_token(KC_URL, "admin", "admin") == "kc-admin-tok"
 
 @responses.activate
 def test_get_keycloak_admin_token_bad_creds():
     responses.add(responses.POST,
-                  f"{KC_URL}/realms/master/protocol/openid-connect/token",
-                  json={"error": "invalid_grant"}, status=401)
+                f"{KC_URL}/realms/master/protocol/openid-connect/token",
+                json={"error": "invalid_grant"}, status=401)
     with pytest.raises(RuntimeError, match="401"):
         get_keycloak_admin_token(KC_URL, "admin", "wrong")
 
@@ -163,7 +163,7 @@ def test_get_keycloak_admin_token_bad_creds():
 def test_keycloak_create_user_returns_id_from_location():
     users_url = f"{KC_URL}/admin/realms/{REALM}/users"
     responses.add(responses.POST, users_url, status=201,
-                  headers={"Location": f"{users_url}/abc-123"})
+                headers={"Location": f"{users_url}/abc-123"})
     api = KeycloakAdminAPI(KC_URL, "static-token", REALM)
     assert api.create_user("alice", "alice@example.com", "pw") == "abc-123"
 
@@ -180,7 +180,7 @@ def test_keycloak_update_user_read_modify_write():
     user_url = f"{KC_URL}/admin/realms/{REALM}/users/u-1"
     # First the GET (read) returns the existing representation
     responses.add(responses.GET, user_url,
-                  json={"id": "u-1", "username": "alice", "email": "old@x.com",
+                json={"id": "u-1", "username": "alice", "email": "old@x.com",
                         "enabled": True}, status=200)
     # Then the PUT (write) succeeds
     responses.add(responses.PUT, user_url, status=204)
@@ -224,18 +224,18 @@ def test_keycloak_admin_api_accepts_static_string():
 @responses.activate
 def test_auth0_users_list():
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                  json={"access_token": "t", "expires_in": 999}, status=200)
+                json={"access_token": "t", "expires_in": 999}, status=200)
     responses.add(responses.GET, f"https://{DOMAIN}/api/v2/users",
-                  json=[{"email": "a@x.com"}, {"email": "b@x.com"}], status=200)
+                json=[{"email": "a@x.com"}, {"email": "b@x.com"}], status=200)
     api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
     assert len(api.list_users()) == 2
 
 @responses.activate
 def test_auth0_users_list_403_gives_clear_message():
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                  json={"access_token": "t", "expires_in": 999}, status=200)
+                json={"access_token": "t", "expires_in": 999}, status=200)
     responses.add(responses.GET, f"https://{DOMAIN}/api/v2/users",
-                  json={"error": "Forbidden"}, status=403)
+                json={"error": "Forbidden"}, status=403)
     api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
     with pytest.raises(RuntimeError, match="read:users"):
         api.list_users()
@@ -308,7 +308,7 @@ def test_in_keycloak_checks_email_not_just_username():
     users_url = f"{KC_URL}/admin/realms/{REALM}/users"
     # Email query returns a hit (user exists under this email)
     responses.add(responses.GET, users_url,
-                  json=[{"id": "u-1", "email": "taken@x.com"}], status=200)
+                json=[{"id": "u-1", "email": "taken@x.com"}], status=200)
     kc = KeycloakAdminAPI(KC_URL, "tok", REALM)
     a0 = create_autospec(Auth0UsersAPI, instance=True)
     mgr = UserManager(kc, a0)
@@ -324,11 +324,11 @@ def test_in_keycloak_checks_email_not_just_username():
 @responses.activate
 def test_auth0_create_client_new():
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                  json={"access_token": "t", "expires_in": 999}, status=200)
+                json={"access_token": "t", "expires_in": 999}, status=200)
     responses.add(responses.GET, f"https://{DOMAIN}/api/v2/clients",
-                  json=[], status=200)
+                json=[], status=200)
     responses.add(responses.POST, f"https://{DOMAIN}/api/v2/clients",
-                  json={"client_id": "new-id", "client_secret": "new-sec"}, status=201)
+                json={"client_id": "new-id", "client_secret": "new-sec"}, status=201)
     a = Auth0Connect(DOMAIN, "cid", "sec")
     result = a.create_client("my-app", ["http://localhost/cb"])
     assert result["client_id"] == "new-id"
@@ -339,19 +339,19 @@ def test_auth0_create_client_refetches_secret_when_existing():
     # Regression for the documented bug: GET /clients omits client_secret, so an
     # existing client must be re-fetched individually to obtain the secret.
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                  json={"access_token": "t", "expires_in": 999}, status=200)
+                json={"access_token": "t", "expires_in": 999}, status=200)
     # List (no secret present)
     responses.add(responses.GET, f"https://{DOMAIN}/api/v2/clients",
-                  json=[{"name": "my-app", "client_id": "exist-id"}], status=200)
+                json=[{"name": "my-app", "client_id": "exist-id"}], status=200)
     # Single-client fetch (includes secret)
     responses.add(responses.GET, f"https://{DOMAIN}/api/v2/clients/exist-id",
-                  json={"client_id": "exist-id", "client_secret": "real-sec"}, status=200)
+                json={"client_id": "exist-id", "client_secret": "real-sec"}, status=200)
     a = Auth0Connect(DOMAIN, "cid", "sec")
     result = a.create_client("my-app", ["http://localhost/cb"])
     assert result["client_secret"] == "real-sec"
     # And it must NOT have POSTed a new client
     assert not any(c.request.method == "POST" and c.request.url.endswith("/api/v2/clients")
-                   for c in responses.calls)
+                for c in responses.calls)
 
 
 # ──────────────────────────────────────────────
@@ -465,18 +465,18 @@ def test_keycloak_delete_user_error_raises():
 @responses.activate
 def test_auth0_create_user():
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                  json={"access_token": "t", "expires_in": 999}, status=200)
+                json={"access_token": "t", "expires_in": 999}, status=200)
     responses.add(responses.POST, f"https://{DOMAIN}/api/v2/users",
-                  json={"user_id": "auth0|new"}, status=201)
+                json={"user_id": "auth0|new"}, status=201)
     api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
     assert api.create_user("x@y.com", "pw")["user_id"] == "auth0|new"
 
 @responses.activate
 def test_auth0_create_user_403_names_scope():
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                  json={"access_token": "t", "expires_in": 999}, status=200)
+                json={"access_token": "t", "expires_in": 999}, status=200)
     responses.add(responses.POST, f"https://{DOMAIN}/api/v2/users",
-                  json={"error": "Forbidden"}, status=403)
+                json={"error": "Forbidden"}, status=403)
     api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
     with pytest.raises(RuntimeError, match="create:users"):
         api.create_user("x@y.com", "pw")
@@ -484,16 +484,16 @@ def test_auth0_create_user_403_names_scope():
 @responses.activate
 def test_auth0_update_user():
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                  json={"access_token": "t", "expires_in": 999}, status=200)
+                json={"access_token": "t", "expires_in": 999}, status=200)
     responses.add(responses.PATCH, f"https://{DOMAIN}/api/v2/users/auth0|1",
-                  json={"user_id": "auth0|1", "name": "New"}, status=200)
+                json={"user_id": "auth0|1", "name": "New"}, status=200)
     api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
     assert api.update_user("auth0|1", name="New")["name"] == "New"
 
 @responses.activate
 def test_auth0_delete_user():
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                  json={"access_token": "t", "expires_in": 999}, status=200)
+                json={"access_token": "t", "expires_in": 999}, status=200)
     responses.add(responses.DELETE, f"https://{DOMAIN}/api/v2/users/auth0|1", status=204)
     api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
     api.delete_user("auth0|1")  # should not raise
@@ -505,11 +505,11 @@ def test_auth0_delete_user():
 @responses.activate
 def test_rotate_client_secret_returns_new_secret():
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                  json={"access_token": "t", "expires_in": 999}, status=200)
+                json={"access_token": "t", "expires_in": 999}, status=200)
     responses.add(responses.POST,
-                  f"https://{DOMAIN}/api/v2/clients/cid/rotate-secret",
-                  json={"client_id": "cid", "client_secret": "brand-new-secret"},
-                  status=200)
+                f"https://{DOMAIN}/api/v2/clients/cid/rotate-secret",
+                json={"client_id": "cid", "client_secret": "brand-new-secret"},
+                status=200)
     a = Auth0Connect(DOMAIN, "cid", "old-secret")
     new = a.rotate_client_secret("cid")
     assert new == "brand-new-secret"
@@ -517,10 +517,10 @@ def test_rotate_client_secret_returns_new_secret():
 @responses.activate
 def test_rotate_client_secret_missing_secret_raises():
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                  json={"access_token": "t", "expires_in": 999}, status=200)
+                json={"access_token": "t", "expires_in": 999}, status=200)
     responses.add(responses.POST,
-                  f"https://{DOMAIN}/api/v2/clients/cid/rotate-secret",
-                  json={"client_id": "cid"}, status=200)  # no client_secret
+                f"https://{DOMAIN}/api/v2/clients/cid/rotate-secret",
+                json={"client_id": "cid"}, status=200)  # no client_secret
     a = Auth0Connect(DOMAIN, "cid", "old")
     with pytest.raises(RuntimeError, match="no client_secret"):
         a.rotate_client_secret("cid")
@@ -530,10 +530,10 @@ def test_rotate_updates_own_instance_secret():
     # P1 regression: rotating this instance's own client must update the stored
     # secret, so a later token refresh uses the new one (not the invalidated old).
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                  json={"access_token": "t", "expires_in": 999}, status=200)
+                json={"access_token": "t", "expires_in": 999}, status=200)
     responses.add(responses.POST,
-                  f"https://{DOMAIN}/api/v2/clients/cid/rotate-secret",
-                  json={"client_id": "cid", "client_secret": "fresh"}, status=200)
+                f"https://{DOMAIN}/api/v2/clients/cid/rotate-secret",
+                json={"client_id": "cid", "client_secret": "fresh"}, status=200)
     a = Auth0Connect(DOMAIN, "cid", "old-secret")
     _ = a.token  # prime the token cache
     a.rotate_client_secret("cid")
@@ -543,10 +543,10 @@ def test_rotate_updates_own_instance_secret():
 def test_rotate_other_client_does_not_touch_instance_secret():
     # Rotating a DIFFERENT client must NOT change this instance's secret.
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                  json={"access_token": "t", "expires_in": 999}, status=200)
+                json={"access_token": "t", "expires_in": 999}, status=200)
     responses.add(responses.POST,
-                  f"https://{DOMAIN}/api/v2/clients/other-id/rotate-secret",
-                  json={"client_id": "other-id", "client_secret": "fresh"}, status=200)
+                f"https://{DOMAIN}/api/v2/clients/other-id/rotate-secret",
+                json={"client_id": "other-id", "client_secret": "fresh"}, status=200)
     a = Auth0Connect(DOMAIN, "cid", "my-secret")
     a.rotate_client_secret("other-id")
     assert a.client_secret == "my-secret"  # unchanged
@@ -603,7 +603,7 @@ def test_keycloak_get_user_roles_realm_and_client():
     from auth0_talk import KeycloakAdminAPI
     base = f"{KC_URL}/admin/realms/{REALM}/users/u-1/role-mappings"
     responses.add(responses.GET, f"{base}/realm",
-                  json=[{"name": "offline_access"}, {"name": "admin"}], status=200)
+                json=[{"name": "offline_access"}, {"name": "admin"}], status=200)
     responses.add(responses.GET, base, json={
         "realmMappings": [{"name": "admin"}],
         "clientMappings": {
@@ -618,18 +618,18 @@ def test_keycloak_get_user_roles_realm_and_client():
 @responses.activate
 def test_auth0_get_user_roles():
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                  json={"access_token": "t", "expires_in": 999}, status=200)
+                json={"access_token": "t", "expires_in": 999}, status=200)
     responses.add(responses.GET, f"https://{DOMAIN}/api/v2/users/auth0|1/roles",
-                  json=[{"name": "editor"}, {"name": "viewer"}], status=200)
+                json=[{"name": "editor"}, {"name": "viewer"}], status=200)
     api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
     assert api.get_user_roles("auth0|1") == ["editor", "viewer"]
 
 @responses.activate
 def test_auth0_get_user_roles_403_names_scope():
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                  json={"access_token": "t", "expires_in": 999}, status=200)
+                json={"access_token": "t", "expires_in": 999}, status=200)
     responses.add(responses.GET, f"https://{DOMAIN}/api/v2/users/auth0|1/roles",
-                  json={"error": "Forbidden"}, status=403)
+                json={"error": "Forbidden"}, status=403)
     api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
     with pytest.raises(RuntimeError, match="read:roles"):
         api.get_user_roles("auth0|1")
@@ -640,7 +640,7 @@ def test_authz_extension_get_user_groups():
     ext_url = "https://tenant.us.webtask.io/abc/api"
     # The extension fetches its own token (audience urn:auth0-authz-api)
     responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
-                  json={"access_token": "ext-tok", "expires_in": 999}, status=200)
+                json={"access_token": "ext-tok", "expires_in": 999}, status=200)
     responses.add(responses.GET, f"{ext_url}/users/auth0|1/groups", json=[
         {"name": "engineering"},
         {"name": "backend", "parent": "engineering"},
