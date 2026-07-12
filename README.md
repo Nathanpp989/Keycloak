@@ -213,7 +213,14 @@ pip install pytest responses
 pytest
 ```
 
-All HTTP is mocked, so no live Keycloak or Auth0 is needed. The suite covers
+All HTTP is mocked, so no live Keycloak or Auth0 is needed.
+
+For a one-command end-to-end check that the REAL app boots and serves (full
+lifespan, token grant, introspection, protected endpoints) against a built-in
+mock IdP, run:
+```bash
+python e2e_smoke.py     # exit 0 = all checks passed
+``` The suite covers
 every module and all HTTP endpoints. CI (`.github/workflows/ci.yml`) runs lint
 (`pyflakes`) and the full suite on every push against Python 3.11 and 3.12.
 
