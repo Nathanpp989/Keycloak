@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import MagicMock
 
 import pytest
 import responses
@@ -305,3 +306,61 @@ def test_same_secret_returned_means_rotation_failed():
     auth0 = Auth0Connect(DOMAIN, "cid", "same-old")
     with pytest.raises(RuntimeError, match="SAME secret"):
         auth0.rotate_client_secret("cid")
+
+
+# ──────────────────────────────────────────────
+# R2/R3: Key Vault integration with rotation
+# ──────────────────────────────────────────────
+def test_kv_persist_uses_hyphenated_name_and_succeeds(monkeypatch):
+    import rotate_secret as rs
+    monkeypatch.setenv("KEY_VAULT_URL", "https://kv.example.vault.azure.net/")
+    fake = MagicMock()
+    assert rs._persist_secret_to_keyvault("new-s", client=fake) is True
+    # R3 convention: hyphens, never underscores (invalid KV object name)
+    fake.set_secret.assert_called_once_with("AUTH0-CLIENT-SECRET", "new-s")
+
+def test_kv_persist_skips_when_unconfigured(monkeypatch):
+    import rotate_secret as rs
+    monkeypatch.delenv("KEY_VAULT_URL", raising=False)
+    fake = MagicMock()
+    assert rs._persist_secret_to_keyvault("s", client=fake) is False
+    fake.set_secret.assert_not_called()
+
+def test_kv_persist_failure_never_raises(monkeypatch):
+    import rotate_secret as rs
+    monkeypatch.setenv("KEY_VAULT_URL", "https://kv.example.vault.azure.net/")
+    fake = MagicMock()
+    fake.set_secret.side_effect = ConnectionError("kv down")
+    assert rs._persist_secret_to_keyvault("s", client=fake) is False  # logged, not raised
+
+@responses.activate
+def test_rotate_and_sync_pushes_to_keyvault(monkeypatch):
+    # R2 regression: a successful rotation must also update Key Vault.
+    import rotate_secret as rs
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.POST,
+                  f"https://{DOMAIN}/api/v2/clients/cid/rotate-secret",
+                  json={"client_id": "cid", "client_secret": "kv-new"}, status=200)
+    idp_url = f"{KC_URL}/admin/realms/{REALM}/identity-provider/instances/auth0"
+    responses.add(responses.GET, idp_url,
+                  json={"alias": "auth0", "config": {"clientSecret": "old"}}, status=200)
+    responses.add(responses.PUT, idp_url, status=204)
+    responses.add(responses.GET, idp_url,
+                  json={"alias": "auth0", "config": {"clientSecret": "kv-new"}}, status=200)
+    called = {}
+    monkeypatch.setattr(rs, "_persist_secret_to_keyvault",
+                        lambda s, client=None: called.setdefault("secret", s) or True)
+    auth0 = Auth0Connect(DOMAIN, "cid", "old")
+    rs.rotate_and_sync(auth0, KC_URL, REALM, "kc-tok", update_env=False)
+    assert called["secret"] == "kv-new"
+
+
+def test_authorize_get_secret_hyphenates_kv_name(monkeypatch):
+    # R3 regression: env-style names must reach Azure as hyphenated KV names.
+    import authorize
+    fake_client = MagicMock()
+    fake_client.get_secret.return_value = MagicMock(value="v")
+    monkeypatch.setattr(authorize, "_get_kv_client", lambda: fake_client)
+    assert authorize.get_secret("AUTH0_CLIENT_SECRET") == "v"
+    fake_client.get_secret.assert_called_once_with("AUTH0-CLIENT-SECRET")

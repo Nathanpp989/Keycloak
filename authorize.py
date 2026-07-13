@@ -67,8 +67,12 @@ def _get_kv_client() -> SecretClient:
     return _kv_client
 
 def get_secret(secret_name: str) -> str:
+    # R3 FIX: Azure Key Vault secret names allow only [0-9a-zA-Z-]. Callers use
+    # env-style names (AUTH0_CLIENT_SECRET); map underscores to hyphens so the
+    # KV object name is valid (stored as AUTH0-CLIENT-SECRET by convention).
+    kv_name = secret_name.replace("_", "-")
     try:
-        value = _get_kv_client().get_secret(secret_name).value
+        value = _get_kv_client().get_secret(kv_name).value
     except AzureError as exc:
         logger.error("Key Vault secret '%s' could not be retrieved: %s", secret_name, exc)
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -197,7 +201,7 @@ def verify_auth0_token(token: str) -> dict:
     signing_key = _get_signing_key(domain, token)
     try:
         return jwt.decode(token, signing_key, algorithms=["RS256"],
-                        audience=audience, issuer=f"https://{domain}/")
+                          audience=audience, issuer=f"https://{domain}/")
     except ExpiredSignatureError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
                             detail="Auth0 token has expired",

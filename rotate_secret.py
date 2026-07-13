@@ -131,6 +131,32 @@ def verify_keycloak_idp_secret(
     return False
 
 
+def _persist_secret_to_keyvault(new_secret: str, client=None) -> bool:
+    """
+    R2 FIX: best-effort update of Azure Key Vault so services reading the Auth0
+    secret from KV (see authorize.py) don't keep the dead one after rotation.
+    Uses the AUTH0-CLIENT-SECRET name (KV allows hyphens, not underscores — R3).
+    Skips silently when KEY_VAULT_URL isn't configured; failures are logged but
+    NEVER crash the rotation (the .env copy is the primary recovery).
+    """
+    vault_url = os.environ.get("KEY_VAULT_URL")
+    if not vault_url:
+        return False
+    try:
+        if client is None:
+            from azure.identity import DefaultAzureCredential
+            from azure.keyvault.secrets import SecretClient
+            client = SecretClient(vault_url=vault_url,
+                                  credential=DefaultAzureCredential())
+        client.set_secret("AUTH0-CLIENT-SECRET", new_secret)
+        logger.info("Updated AUTH0-CLIENT-SECRET in Key Vault %s", vault_url)
+        return True
+    except Exception as exc:  # noqa: BLE001 — best-effort by design
+        logger.warning("Key Vault update failed (rotation still OK, .env is "
+                       "current): %s — update AUTH0-CLIENT-SECRET manually.", exc)
+        return False
+
+
 def _persist_secret_to_env(new_secret: str) -> bool:
     """
     Write AUTH0_CLIENT_SECRET into the local .env (DOTENV_PATH or ./.env).
@@ -198,6 +224,8 @@ def rotate_and_sync(
                 persisted = _persist_secret_to_env(new_secret)
             except Exception as env_exc:  # noqa: BLE001
                 logger.error("Could not persist rotated secret to .env: %s", env_exc)
+        # Best-effort extra copy in Key Vault (never raises).
+        persisted = _persist_secret_to_keyvault(new_secret) or persisted
         raise RuntimeError(
             "Auth0 secret was rotated but the Keycloak IdP update FAILED. "
             + ("The new secret was saved to your .env. "
@@ -222,9 +250,11 @@ def rotate_and_sync(
             "mask it on read). The update PUT succeeded; verify a login manually."
         )
 
-    # 4. Persist locally last, so .env only changes after Keycloak is updated
+    # 4. Persist locally last, so .env only changes after Keycloak is updated.
+    #    Also push to Azure Key Vault (R2) so KV-backed consumers stay current.
     if update_env:
         _persist_secret_to_env(new_secret)
+    _persist_secret_to_keyvault(new_secret)
 
     return new_secret
 
