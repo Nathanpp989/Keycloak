@@ -229,9 +229,9 @@ def rotate_and_sync(
         raise RuntimeError(
             "Auth0 secret was rotated but the Keycloak IdP update FAILED. "
             + ("The new secret was saved to your .env. "
-               if persisted else
-               "The new secret could NOT be saved locally — retrieve it from "
-               "the Auth0 dashboard (Applications → your app → Credentials). ")
+            if persisted else
+            "The new secret could NOT be saved locally — retrieve it from "
+            "the Auth0 dashboard (Applications → your app → Credentials). ")
             + f"Update the Keycloak IdP '{idp_alias}' clientSecret manually, "
             "or re-run this script. Original error: " + str(exc)
         ) from exc
