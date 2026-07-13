@@ -278,13 +278,13 @@ def test_setup_keycloak_creates_secret_when_missing(monkeypatch):
     fake_admin.get_authentication_flows.return_value = [{"alias": "Hello-World-flow"}]
     fake_admin.get_client_id.return_value = "uuid-1"
     fake_admin.get_client_secrets.return_value = {"value": None}
-    fake_admin.create_client_secret.return_value = {"value": "newly-created"}
+    fake_admin.generate_client_secrets.return_value = {"value": "newly-created"}
     monkeypatch.setattr(m, "KeycloakAdmin", lambda **kw: fake_admin)
     monkeypatch.setattr(m, "create_keycloak_user", lambda *a, **k: "uid")
     monkeypatch.delenv("KEYCLOAK_CLIENT_SECRET", raising=False)
     secret = m.setup_keycloak()
     assert secret == "newly-created"
-    fake_admin.create_client_secret.assert_called_once()
+    fake_admin.generate_client_secrets.assert_called_once()
 
 def test_setup_keycloak_env_override_wins(monkeypatch):
     import main as m
@@ -786,3 +786,64 @@ def test_lifecycle_scope_errors_become_502(client, monkeypatch):
         assert "delete:grants" in r.json()["detail"]
     finally:
         main.app.dependency_overrides.clear()
+
+
+# ──────────────────────────────────────────────
+# WebSocket GitHub relay (/ws/github) — auth handshake + relay
+# ──────────────────────────────────────────────
+class _FakeOIDC:
+    """Stand-in for keycloak_oidc.introspect with controllable result."""
+    def __init__(self, active=True):
+        self._active = active
+    def introspect(self, token):
+        return {"active": self._active, "preferred_username": "nathan"}
+
+def test_ws_requires_valid_token_first(client, monkeypatch):
+    # A bad token must get auth_error and a closed socket.
+    monkeypatch.setattr(main, "keycloak_oidc", _FakeOIDC(active=False))
+    with client.websocket_connect("/ws/github") as ws:
+        ws.send_json({"token": "bad"})
+        reply = ws.receive_json()
+        assert reply["type"] == "auth_error"
+
+def test_ws_auth_ok_then_fetch(client, monkeypatch):
+    monkeypatch.setattr(main, "keycloak_oidc", _FakeOIDC(active=True))
+    # Patch fetch_github so the WS test doesn't hit the network.
+    monkeypatch.setattr(main, "fetch_github",
+                        lambda resource, params: {"status": 200,
+                                                  "data": {"resource": resource,
+                                                           "params": params}})
+    with client.websocket_connect("/ws/github") as ws:
+        ws.send_json({"token": "good"})
+        assert ws.receive_json() == {"type": "auth_ok"}
+        ws.send_json({"resource": "repo", "params": {"owner": "o", "repo": "r"}})
+        result = ws.receive_json()
+        assert result["type"] == "result"
+        assert result["status"] == 200
+        assert result["data"]["resource"] == "repo"
+
+def test_ws_invalid_json_after_auth_is_reported(client, monkeypatch):
+    monkeypatch.setattr(main, "keycloak_oidc", _FakeOIDC(active=True))
+    with client.websocket_connect("/ws/github") as ws:
+        ws.send_json({"token": "good"})
+        ws.receive_json()  # auth_ok
+        ws.send_text("not json{")
+        err = ws.receive_json()
+        assert err["type"] == "error" and "JSON" in err["detail"]
+
+def test_ws_bad_params_type_reported(client, monkeypatch):
+    monkeypatch.setattr(main, "keycloak_oidc", _FakeOIDC(active=True))
+    with client.websocket_connect("/ws/github") as ws:
+        ws.send_json({"token": "good"})
+        ws.receive_json()
+        ws.send_json({"resource": "repo", "params": "not-an-object"})
+        err = ws.receive_json()
+        assert err["type"] == "error" and "params" in err["detail"]
+
+def test_ws_unavailable_when_oidc_none(client, monkeypatch):
+    # If auth service is down, connecting client should get auth_error.
+    monkeypatch.setattr(main, "keycloak_oidc", None)
+    with client.websocket_connect("/ws/github") as ws:
+        ws.send_json({"token": "whatever"})
+        reply = ws.receive_json()
+        assert reply["type"] == "auth_error"

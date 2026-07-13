@@ -7,9 +7,10 @@ import stat
 import tempfile
 from contextlib import asynccontextmanager
 
+import requests
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
-from fastapi import FastAPI, Depends, HTTPException, Form
+from fastapi import FastAPI, Depends, HTTPException, Form, WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPBearer
 from authorize import router as auth0_router, oauth2_scheme
 from keycloak import KeycloakOpenID, KeycloakAdmin
@@ -56,8 +57,13 @@ def _write_atomic(path: str, data: bytes, mode: int = 0o644):
 
 def init_rsa_keys():
     global public_pem
-    KEY_DIR = os.environ.get("KEY_DIR", "/tmp/keys")
+    # B108 fix: default to a USER-PRIVATE directory, not world-writable /tmp
+    # (symlink/pre-creation risk on shared hosts). Containers override via
+    # KEY_DIR=/data/keys. The directory is forced to 0700 either way.
+    KEY_DIR = os.environ.get(
+        "KEY_DIR", os.path.join(os.path.expanduser("~"), ".auth-broker", "keys"))
     os.makedirs(KEY_DIR, exist_ok=True)
+    os.chmod(KEY_DIR, 0o700)
     private_key_path = os.path.join(KEY_DIR, "private.pem")
     public_key_path  = os.path.join(KEY_DIR, "public.pem")
     try:
@@ -127,8 +133,10 @@ def setup_keycloak() -> str:
     existing_secret = admin.get_client_secrets(client_uuid)
     secret_value    = existing_secret.get("value")
     if secret_value is None:
-        # create_client_secret returns the new secret representation
-        created = admin.create_client_secret(client_uuid)
+        # M1 FIX: the python-keycloak method is generate_client_secrets —
+        # create_client_secret does not exist (AttributeError on real library;
+        # hidden in tests by MagicMock accepting any attribute).
+        created = admin.generate_client_secrets(client_uuid)
         secret_value = created.get("value") if isinstance(created, dict) else None
     # Fix #2: return the real secret (env override wins if explicitly set)
     return os.environ.get("KEYCLOAK_CLIENT_SECRET") or secret_value or ""
@@ -182,8 +190,8 @@ def _setup_keycloak_with_retry() -> str:
     Call setup_keycloak() with retry + exponential backoff, so the app can start
     in a container before Keycloak is fully ready (a common race even with
     compose 'depends_on'). Tunable via env vars:
-    KEYCLOAK_STARTUP_RETRIES (default 10)
-    KEYCLOAK_STARTUP_BACKOFF (default 2.0 seconds, doubles each attempt, capped)
+      KEYCLOAK_STARTUP_RETRIES (default 10)
+      KEYCLOAK_STARTUP_BACKOFF (default 2.0 seconds, doubles each attempt, capped)
     Raises the last error if all attempts fail.
     """
 
@@ -223,7 +231,7 @@ async def lifespan(app: FastAPI):
         client_secret = _setup_keycloak_with_retry()
     except Exception as exc:
         logger.error("Keycloak setup failed after retries — check KEYCLOAK_URL "
-                    "and credentials: %s", exc)
+                     "and credentials: %s", exc)
         raise
     if not client_secret:
         logger.warning(
@@ -251,16 +259,16 @@ app.include_router(auth0_router)
 http_bearer     = HTTPBearer()
 
 # ── Auth dependency ───────────────────────────────────────────────────────────
-def require_keycloak_auth(credentials=Depends(http_bearer)) -> dict:
+def _introspect_token(token: str) -> dict:
     """
-    FastAPI dependency: validate the bearer token via Keycloak introspection.
-    Returns the token info dict on success; raises 401/503 otherwise.
-    Used to protect endpoints that must only be reachable by authenticated users.
+    Validate a bearer token via Keycloak introspection and return the token-info
+    dict. Raises HTTPException(401/503) on failure. Shared by the HTTP dependency
+    and the WebSocket handler so both enforce identical rules.
     """
     if keycloak_oidc is None:
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
     try:
-        token_info = keycloak_oidc.introspect(credentials.credentials)
+        token_info = keycloak_oidc.introspect(token)
     except Exception:
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
     # P2 FIX: introspect can return None / a non-dict on some error responses;
@@ -268,6 +276,15 @@ def require_keycloak_auth(credentials=Depends(http_bearer)) -> dict:
     if not isinstance(token_info, dict) or not token_info.get("active"):
         raise HTTPException(status_code=401, detail="Token is inactive or expired")
     return token_info
+
+
+def require_keycloak_auth(credentials=Depends(http_bearer)) -> dict:
+    """
+    FastAPI dependency: validate the bearer token via Keycloak introspection.
+    Returns the token info dict on success; raises 401/503 otherwise.
+    Used to protect endpoints that must only be reachable by authenticated users.
+    """
+    return _introspect_token(credentials.credentials)
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
@@ -704,10 +721,110 @@ def get_keys():
         raise HTTPException(status_code=503, detail="Keys not yet initialised")
     return {"public_key": public_pem.decode("utf-8")}
 
+
+# ── GitHub relay over WebSocket ────────────────────────────────────────────────
+GITHUB_API = "https://api.github.com"
+# Only these resource shapes are allowed, so a client can't drive the server to
+# fetch arbitrary URLs (SSRF guard). Each maps to a GitHub REST path builder.
+_GITHUB_ROUTES = {
+    "repo":      lambda p: f"/repos/{p['owner']}/{p['repo']}",
+    "issues":    lambda p: f"/repos/{p['owner']}/{p['repo']}/issues",
+    "user":      lambda p: f"/users/{p['username']}",
+}
+
+
+def fetch_github(resource: str, params: dict) -> dict:
+    """
+    Fetch an allow-listed GitHub resource. Returns a dict with 'status' and
+    'data'. Never raises for HTTP errors — the status is returned to the client.
+    Kept synchronous and small so it's easy to unit-test with `responses`.
+    """
+    builder = _GITHUB_ROUTES.get(resource)
+    if builder is None:
+        return {"status": 400, "error": f"unknown resource '{resource}'"}
+    try:
+        path = builder(params)
+    except (KeyError, TypeError):
+        return {"status": 400, "error": f"missing parameters for resource '{resource}'"}
+    headers = {"Accept": "application/vnd.github+json",
+               "User-Agent": "keycloak-auth0-broker"}
+    # Optional token lifts rate limits / allows private repos; never required.
+    gh_token = os.environ.get("GITHUB_TOKEN")
+    if gh_token:
+        headers["Authorization"] = f"Bearer {gh_token}"
+    try:
+        resp = requests.get(f"{GITHUB_API}{path}", headers=headers, timeout=10)
+    except requests.RequestException as exc:
+        return {"status": 502, "error": f"GitHub request failed: {exc}"}
+    try:
+        data = resp.json()
+    except ValueError:
+        data = None
+    return {"status": resp.status_code, "data": data}
+
+
+@app.websocket("/ws/github")
+async def github_ws(websocket: WebSocket):
+    """
+    Authenticated WebSocket GitHub relay.
+
+    Handshake: the client's FIRST message must be JSON {"token": "<keycloak
+    access token>"}. The token is validated via Keycloak introspection (same
+    rules as the HTTP endpoints). On success the server replies
+    {"type": "auth_ok"}; on failure it sends {"type": "auth_error"} and closes.
+
+    Thereafter each client message is {"resource": "...", "params": {...}} and
+    the server responds with {"type": "result", ...} carrying GitHub's status
+    and data. Unknown resources return a 400-style result rather than closing.
+    """
+    await websocket.accept()
+    # 1. Authenticate on the first frame.
+    try:
+        raw = await websocket.receive_text()
+        hello = json.loads(raw)
+        token = hello.get("token", "")
+    except (WebSocketDisconnect, json.JSONDecodeError, AttributeError):
+        await websocket.close(code=1008)
+        return
+    try:
+        _introspect_token(token)
+    except HTTPException:
+        # Don't leak whether it was 401 vs 503 over the socket; just refuse.
+        try:
+            await websocket.send_json({"type": "auth_error",
+                                       "detail": "authentication failed"})
+        finally:
+            await websocket.close(code=1008)
+        return
+    await websocket.send_json({"type": "auth_ok"})
+
+    # 2. Serve requests until the client disconnects.
+    try:
+        while True:
+            msg = await websocket.receive_text()
+            try:
+                req = json.loads(msg)
+            except json.JSONDecodeError:
+                await websocket.send_json({"type": "error", "detail": "invalid JSON"})
+                continue
+            resource = req.get("resource")
+            params = req.get("params") or {}
+            if not isinstance(params, dict):
+                await websocket.send_json({"type": "error",
+                                           "detail": "'params' must be an object"})
+                continue
+            result = fetch_github(resource, params)
+            await websocket.send_json({"type": "result", **result})
+    except WebSocketDisconnect:
+        return
+
+
 if __name__ == "__main__":
     import uvicorn  # I4 FIX: lazy import — only needed when run directly
     uvicorn.run(
         app,
-        host=os.environ.get("HOST", "0.0.0.0"),
+        # B104 fix: bind loopback by default for local runs; the container
+        # opts into all interfaces explicitly via ENV HOST=0.0.0.0.
+        host=os.environ.get("HOST", "127.0.0.1"),
         port=int(os.environ.get("PORT", "8000"))
     )

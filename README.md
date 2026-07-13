@@ -150,6 +150,7 @@ python login_flow.py
 | POST | `/users/logout` | Bearer | Kill sessions in both systems (Auth0 also revokes grants) |
 | GET | `/secure-data` | depends | Uses a server-side Auth0 M2M token |
 | GET | `/keys` | none | Public RSA key |
+| WS | `/ws/github` | Token on connect | Authenticated WebSocket GitHub relay (send `{resource, params}`) |
 
 ## Secret rotation
 
