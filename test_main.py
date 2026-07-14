@@ -901,3 +901,100 @@ def test_fetch_github_accepts_legit_identifiers():
         out = m.fetch_github("repo", {"owner": "octo-cat", "repo": "Hello.World_2"})
         assert out["status"] == 200
     run()
+
+
+# ──────────────────────────────────────────────
+# /secure-data (authorize router — previously untested endpoint)
+# ──────────────────────────────────────────────
+def test_secure_data_ok(client, monkeypatch):
+    import authorize
+    main.app.dependency_overrides[authorize.get_current_user] = \
+        lambda: authorize.TokenData(username="nathan")
+    try:
+        monkeypatch.setattr(authorize, "get_auth0_token", lambda: "m2m-tok")
+        r = client.get("/secure-data")
+        assert r.status_code == 200
+        assert r.json()["user"] == "nathan"
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_secure_data_auth0_down_is_503(client, monkeypatch):
+    import authorize
+    main.app.dependency_overrides[authorize.get_current_user] = \
+        lambda: authorize.TokenData(username="nathan")
+    try:
+        def boom():
+            raise RuntimeError("kv exploded")
+        monkeypatch.setattr(authorize, "get_auth0_token", boom)
+        r = client.get("/secure-data")
+        assert r.status_code == 503
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+# ──────────────────────────────────────────────
+# init_rsa_keys + create_keycloak_user (previously untested startup helpers)
+# ──────────────────────────────────────────────
+def test_init_rsa_keys_creates_keypair_with_safe_perms(tmp_path, monkeypatch):
+    import os, stat
+    monkeypatch.setenv("KEY_DIR", str(tmp_path))
+    main.init_rsa_keys()
+    priv = tmp_path / "private.pem"
+    pub = tmp_path / "public.pem"
+    assert priv.exists() and pub.exists()
+    mode = stat.S_IMODE(os.stat(priv).st_mode)
+    assert mode == 0o600                       # private key not world-readable
+    assert main.public_pem.startswith(b"-----BEGIN PUBLIC KEY-----")
+
+def test_init_rsa_keys_reuses_existing(tmp_path, monkeypatch):
+    monkeypatch.setenv("KEY_DIR", str(tmp_path))
+    main.init_rsa_keys()
+    first = (tmp_path / "public.pem").read_bytes()
+    main.init_rsa_keys()                       # second call must not regenerate
+    assert (tmp_path / "public.pem").read_bytes() == first
+
+def test_create_keycloak_user_existing_short_circuits():
+    admin = MagicMock()
+    admin.get_users.return_value = [{"id": "u-exists"}]
+    out = main.create_keycloak_user(admin, "user", "pw", "users")
+    assert out == "u-exists"
+    admin.create_user.assert_not_called()
+
+def test_create_keycloak_user_creates_group_if_missing():
+    admin = MagicMock()
+    admin.get_users.return_value = []
+    admin.get_groups.return_value = [{"id": "g-other", "name": "other"}]
+    admin.create_group.return_value = "g-new"
+    admin.create_user.return_value = "u-new"
+    out = main.create_keycloak_user(admin, "user", "pw", "users")
+    assert out == "u-new"
+    admin.create_group.assert_called_once_with({"name": "users"})
+    admin.group_user_add.assert_called_once_with("u-new", "g-new")
+
+
+# ──────────────────────────────────────────────
+# Endpoint error branches (RuntimeError -> 502, Exception -> 500)
+# ──────────────────────────────────────────────
+def test_group_endpoint_runtime_error_is_502(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        mgr.update_group.side_effect = RuntimeError("missing scope xyz")
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.patch("/groups", data={"group": "/g", "new_name": "n"})
+        assert r.status_code == 502 and "xyz" in r.json()["detail"]
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_metadata_endpoint_unexpected_error_is_500(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        mgr.set_user_metadata.side_effect = ValueError("boom")
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.patch("/users/metadata", data={
+            "username": "u", "email": "e@x.com", "metadata": "{}"})
+        assert r.status_code == 500
+        assert "boom" not in r.json()["detail"]   # internals not leaked
+    finally:
+        main.app.dependency_overrides.clear()

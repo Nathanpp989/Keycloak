@@ -1781,3 +1781,157 @@ def test_fetch_github_sends_token_when_present(monkeypatch):
                   json={"login": "octocat"}, status=200)
     main.fetch_github("user", {"username": "octocat"})
     assert responses.calls[0].request.headers.get("Authorization") == "Bearer ghp_secret"
+
+
+# ──────────────────────────────────────────────
+# authorize.py — Auth0 M2M token machinery (previously 36% covered)
+# ──────────────────────────────────────────────
+def _reset_authorize_caches(monkeypatch):
+    import authorize
+    from datetime import datetime, timezone
+    monkeypatch.setattr(authorize, "_auth0_token_cache", None)
+    monkeypatch.setattr(authorize, "_auth0_token_expiry",
+                        datetime.now(timezone.utc))
+    monkeypatch.setattr(authorize, "_jwks_cache", None)
+
+@responses.activate
+def test_authenticate_with_auth0_happy_path(monkeypatch):
+    import authorize
+    monkeypatch.setenv("AUTH0_DOMAIN", DOMAIN)
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "m2m-tok", "expires_in": 3600}, status=200)
+    token, exp = authorize.authenticate_with_auth0("cid", "sec", "aud")
+    assert token == "m2m-tok" and exp == 3600
+
+@responses.activate
+def test_authenticate_with_auth0_bad_status_is_401(monkeypatch):
+    import authorize
+    monkeypatch.setenv("AUTH0_DOMAIN", DOMAIN)
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"error": "access_denied"}, status=403)
+    with pytest.raises(HTTPExceptionType) as e:
+        authorize.authenticate_with_auth0("cid", "sec", "aud")
+    assert e.value.status_code == 401
+
+@responses.activate
+def test_authenticate_with_auth0_missing_token_is_502(monkeypatch):
+    import authorize
+    monkeypatch.setenv("AUTH0_DOMAIN", DOMAIN)
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"expires_in": 3600}, status=200)  # no access_token
+    with pytest.raises(HTTPExceptionType) as e:
+        authorize.authenticate_with_auth0("cid", "sec", "aud")
+    assert e.value.status_code == 502
+
+@responses.activate
+def test_authenticate_with_auth0_network_error_is_503(monkeypatch):
+    import authorize
+    monkeypatch.setenv("AUTH0_DOMAIN", DOMAIN)
+    def boom(req):
+        raise __import__("requests").exceptions.ConnectionError("down")
+    responses.add_callback(responses.POST, f"https://{DOMAIN}/oauth/token",
+                           callback=boom)
+    with pytest.raises(HTTPExceptionType) as e:
+        authorize.authenticate_with_auth0("cid", "sec", "aud")
+    assert e.value.status_code == 503
+
+@responses.activate
+def test_get_auth0_token_caches_until_expiry(monkeypatch):
+    import authorize
+    from datetime import datetime, timezone, timedelta
+    _reset_authorize_caches(monkeypatch)
+    monkeypatch.setenv("AUTH0_DOMAIN", DOMAIN)
+    secrets = {"n": 0}
+    def fake_secret(name):
+        secrets["n"] += 1
+        return name.lower()
+    monkeypatch.setattr(authorize, "get_secret", fake_secret)
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "tok-1", "expires_in": 3600}, status=200)
+    assert authorize.get_auth0_token() == "tok-1"
+    first_fetches = secrets["n"]
+    # Second call within expiry: cached — no new KV reads, no new HTTP call.
+    assert authorize.get_auth0_token() == "tok-1"
+    assert secrets["n"] == first_fetches
+    assert len(responses.calls) == 1
+    # Force expiry: must refresh.
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "tok-2", "expires_in": 3600}, status=200)
+    monkeypatch.setattr(authorize, "_auth0_token_expiry",
+                        datetime.now(timezone.utc) - timedelta(seconds=1))
+    assert authorize.get_auth0_token() == "tok-2"
+
+@responses.activate
+def test_jwks_fetch_error_raises_runtime(monkeypatch):
+    import authorize
+    def boom(req):
+        raise __import__("requests").exceptions.ConnectionError("down")
+    responses.add_callback(responses.GET,
+                           f"https://{DOMAIN}/.well-known/jwks.json", callback=boom)
+    with pytest.raises(RuntimeError, match="Could not fetch"):
+        authorize._fetch_jwks(DOMAIN)
+
+@responses.activate
+def test_get_jwks_caches(monkeypatch):
+    import authorize
+    _reset_authorize_caches(monkeypatch)
+    responses.add(responses.GET, f"https://{DOMAIN}/.well-known/jwks.json",
+                  json={"keys": [{"kid": "k1"}]}, status=200)
+    assert authorize._get_jwks(DOMAIN)["keys"][0]["kid"] == "k1"
+    assert authorize._get_jwks(DOMAIN)["keys"][0]["kid"] == "k1"
+    assert len(responses.calls) == 1   # second hit served from cache
+
+def test_signing_key_missing_kid_is_401(monkeypatch):
+    import authorize
+    monkeypatch.setattr(authorize.jwt, "get_unverified_header", lambda t: {})
+    with pytest.raises(HTTPExceptionType) as e:
+        authorize._get_signing_key(DOMAIN, "tok")
+    assert e.value.status_code == 401
+    assert "kid" in e.value.detail
+
+@responses.activate
+def test_signing_key_rotation_refetches_jwks(monkeypatch):
+    # kid not in cached JWKS -> cache cleared -> refetched once -> key found.
+    import authorize
+    _reset_authorize_caches(monkeypatch)
+    monkeypatch.setattr(authorize, "_jwks_cache", {"keys": [{"kid": "stale"}]})
+    monkeypatch.setattr(authorize.jwt, "get_unverified_header",
+                        lambda t: {"kid": "fresh"})
+    constructed = {}
+    monkeypatch.setattr(authorize.jwk, "construct",
+                        lambda kd: constructed.setdefault("kid", kd["kid"]))
+    responses.add(responses.GET, f"https://{DOMAIN}/.well-known/jwks.json",
+                  json={"keys": [{"kid": "fresh"}]}, status=200)
+    authorize._get_signing_key(DOMAIN, "tok")
+    assert constructed["kid"] == "fresh"
+    assert len(responses.calls) == 1   # exactly one refetch
+
+def test_signing_key_never_found_is_401(monkeypatch):
+    import authorize
+    _reset_authorize_caches(monkeypatch)
+    monkeypatch.setattr(authorize.jwt, "get_unverified_header",
+                        lambda t: {"kid": "ghost"})
+    monkeypatch.setattr(authorize, "_fetch_jwks", lambda d: {"keys": []})
+    with pytest.raises(HTTPExceptionType) as e:
+        authorize._get_signing_key(DOMAIN, "tok")
+    assert e.value.status_code == 401
+
+
+# ──────────────────────────────────────────────
+# login_flow.build_broker_login_url (previously untested)
+# ──────────────────────────────────────────────
+def test_build_broker_login_url():
+    from login_flow import build_broker_login_url
+    url = build_broker_login_url("http://localhost:8080/", "Premkey",
+                                 "Hello-World-app", "http://localhost:8000/cb")
+    assert url.startswith(
+        "http://localhost:8080/realms/Premkey/protocol/openid-connect/auth?")
+    assert "kc_idp_hint=auth0" in url
+    assert "response_type=code" in url
+    assert "redirect_uri=http%3A%2F%2Flocalhost%3A8000%2Fcb" in url
+
+def test_build_broker_login_url_custom_idp_and_scope():
+    from login_flow import build_broker_login_url
+    url = build_broker_login_url("http://kc", "R", "c", "http://cb",
+                                 idp_alias="okta", scope="openid")
+    assert "kc_idp_hint=okta" in url and "scope=openid" in url
