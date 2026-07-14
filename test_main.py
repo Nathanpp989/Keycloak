@@ -847,3 +847,57 @@ def test_ws_unavailable_when_oidc_none(client, monkeypatch):
         ws.send_json({"token": "whatever"})
         reply = ws.receive_json()
         assert reply["type"] == "auth_error"
+
+
+# ──────────────────────────────────────────────
+# W1/W2/W3 regressions: WS relay hardening
+# ──────────────────────────────────────────────
+def test_ws_non_object_json_reported_not_crash(client, monkeypatch):
+    # W1: '42' is valid JSON but not an object — must get an error reply and
+    # the connection must SURVIVE for the next message.
+    monkeypatch.setattr(main, "keycloak_oidc", _FakeOIDC(active=True))
+    monkeypatch.setattr(main, "fetch_github",
+                        lambda r, p: {"status": 200, "data": {}})
+    with client.websocket_connect("/ws/github") as ws:
+        ws.send_json({"token": "good"})
+        ws.receive_json()  # auth_ok
+        ws.send_text("42")
+        err = ws.receive_json()
+        assert err["type"] == "error" and "object" in err["detail"]
+        # connection still alive — a valid request works afterwards
+        ws.send_json({"resource": "repo", "params": {"owner": "o", "repo": "r"}})
+        assert ws.receive_json()["type"] == "result"
+
+def test_ws_binary_frame_reported_not_crash(client, monkeypatch):
+    # W3: binary frames must be reported, not crash the handler.
+    monkeypatch.setattr(main, "keycloak_oidc", _FakeOIDC(active=True))
+    with client.websocket_connect("/ws/github") as ws:
+        ws.send_json({"token": "good"})
+        ws.receive_json()
+        ws.send_bytes(b"\x00\x01")
+        err = ws.receive_json()
+        assert err["type"] == "error" and "text frame" in err["detail"]
+
+def test_fetch_github_rejects_path_injection():
+    # W2: params must not escape the resource allow-list via '/', '?', etc.
+    import main as m
+    for bad in ({"owner": "octocat", "repo": "Hello-World/collaborators"},
+                {"owner": "octocat/../../orgs", "repo": "x"},
+                {"owner": "octocat", "repo": "x?per_page=100"},
+                {"owner": "octocat", "repo": "x%2Fy"},
+                {"owner": "", "repo": "x"},
+                {"owner": 123, "repo": "x"}):
+        out = m.fetch_github("repo", bad)
+        assert out["status"] == 400 and "invalid value" in out["error"], bad
+
+def test_fetch_github_accepts_legit_identifiers():
+    # W2 must NOT break real GitHub names.
+    import main as m
+    import responses as rsp
+    @rsp.activate
+    def run():
+        rsp.add(rsp.GET, "https://api.github.com/repos/octo-cat/Hello.World_2",
+                json={"ok": True}, status=200)
+        out = m.fetch_github("repo", {"owner": "octo-cat", "repo": "Hello.World_2"})
+        assert out["status"] == 200
+    run()

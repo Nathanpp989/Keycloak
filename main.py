@@ -3,6 +3,7 @@ import json
 import logging
 import time
 import os
+import re
 import stat
 import tempfile
 from contextlib import asynccontextmanager
@@ -742,6 +743,14 @@ def fetch_github(resource: str, params: dict) -> dict:
     builder = _GITHUB_ROUTES.get(resource)
     if builder is None:
         return {"status": 400, "error": f"unknown resource '{resource}'"}
+    # W2 FIX: param values are interpolated into the URL path, so restrict them
+    # to GitHub's identifier charset. Otherwise 'repo': 'x/collaborators' (or
+    # '?', '#', '%2F') escapes the resource allow-list and reaches arbitrary
+    # GitHub endpoints through the authenticated relay.
+    for key, value in params.items():
+        if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", value):
+            return {"status": 400,
+                    "error": f"invalid value for parameter '{key}'"}
     try:
         path = builder(params)
     except (KeyError, TypeError):
@@ -801,11 +810,24 @@ async def github_ws(websocket: WebSocket):
     # 2. Serve requests until the client disconnects.
     try:
         while True:
-            msg = await websocket.receive_text()
+            # W3 FIX: a binary frame makes receive_text() raise KeyError —
+            # report it instead of crashing the connection.
+            try:
+                msg = await websocket.receive_text()
+            except KeyError:
+                await websocket.send_json({"type": "error",
+                                           "detail": "expected a text frame"})
+                continue
             try:
                 req = json.loads(msg)
             except json.JSONDecodeError:
                 await websocket.send_json({"type": "error", "detail": "invalid JSON"})
+                continue
+            # W1 FIX: valid JSON that isn't an object ('42', '[1,2]', '"x"')
+            # used to crash the handler via req.get().
+            if not isinstance(req, dict):
+                await websocket.send_json({"type": "error",
+                                           "detail": "message must be a JSON object"})
                 continue
             resource = req.get("resource")
             params = req.get("params") or {}
