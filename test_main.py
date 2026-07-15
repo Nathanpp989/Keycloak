@@ -998,3 +998,61 @@ def test_metadata_endpoint_unexpected_error_is_500(client, monkeypatch):
         assert "boom" not in r.json()["detail"]   # internals not leaked
     finally:
         main.app.dependency_overrides.clear()
+
+
+# ──────────────────────────────────────────────
+# Error-branch sweep: every mutating endpoint maps RuntimeError -> 502 and
+# unexpected exceptions -> 500 (without leaking internals). One parametrized
+# test covers all the copy-paste handlers.
+# ──────────────────────────────────────────────
+_ERROR_SWEEP = [
+    ("patch",  "/groups", {"group": "/g", "new_name": "n"},
+     lambda m: m.update_group),
+    ("delete", "/groups", {"group": "/g"},
+     lambda m: m.delete_group),
+    ("post",   "/users/groups", {"username": "u", "email": "e@x", "group_name": "g", "action": "add"},
+     lambda m: m.set_group_membership),
+    ("post",   "/users/roles", {"username": "u", "email": "e@x", "role_name": "r", "action": "assign"},
+     lambda m: m.set_role),
+    ("post",   "/users/active", {"username": "u", "email": "e@x", "active": "true"},
+     lambda m: m.set_user_active),
+    ("post",   "/users/verify-email", {"username": "u", "email": "e@x", "action": "set"},
+     lambda m: m.set_email_verified),
+    ("post",   "/users/password-reset", {"username": "u", "email": "e@x"},
+     lambda m: m.trigger_password_reset),
+    ("post",   "/users/logout", {"username": "u", "email": "e@x"},
+     lambda m: m.logout_everywhere),
+    ("post",   "/organizations", {"name": "acme"},
+     lambda m: m.auth0_orgs.create_organization),
+    ("post",   "/organizations/members", {"email": "e@x", "org_name": "o", "action": "add"},
+     lambda m: m.set_organization_membership),
+]
+
+@pytest.mark.parametrize("method,path,data,pick", _ERROR_SWEEP)
+def test_endpoint_runtime_error_maps_to_502(client, monkeypatch, method, path, data, pick):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        pick(mgr).side_effect = RuntimeError("scope missing: xyz")
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = getattr(client, method)(path, **({"params": data} if method == "delete" else {"data": data}))
+        assert r.status_code == 502, (path, r.status_code, r.text)
+        assert "xyz" in r.json()["detail"]      # scope message surfaced to caller
+    finally:
+        main.app.dependency_overrides.clear()
+
+@pytest.mark.parametrize("method,path,data,pick", _ERROR_SWEEP)
+def test_endpoint_unexpected_error_maps_to_500(client, monkeypatch, method, path, data, pick):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        mgr = MagicMock()
+        pick(mgr).side_effect = ValueError("internal-detail-abc")
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = getattr(client, method)(path, **({"params": data} if method == "delete" else {"data": data}))
+        # /organizations create maps ValueError->400 by design (Q3); others 500.
+        expected = 400 if path == "/organizations" else 500
+        assert r.status_code == expected, (path, r.status_code, r.text)
+        if expected == 500:
+            assert "internal-detail-abc" not in r.json()["detail"]   # no leak
+    finally:
+        main.app.dependency_overrides.clear()

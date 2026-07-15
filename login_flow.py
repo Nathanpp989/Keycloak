@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # login_flow.py
 # Helpers + a documented manual procedure for testing the real browser login
 # flow (Keycloak -> Auth0 -> back to Keycloak -> your app).
@@ -11,8 +12,15 @@
 
 from __future__ import annotations
 
+import base64
+import json
+import logging
 import os
 from urllib.parse import urlencode
+
+import requests
+
+logger = logging.getLogger(__name__)
 
 
 def build_broker_login_url(
@@ -41,11 +49,215 @@ def build_broker_login_url(
     return f"{base}/realms/{realm}/protocol/openid-connect/auth?{urlencode(params)}"
 
 
+def exchange_code_for_tokens(
+    keycloak_url: str,
+    realm: str,
+    client_id: str,
+    redirect_uri: str,
+    code: str,
+    client_secret: str | None = None,
+    timeout: int = 10,
+) -> dict:
+    """
+    Exchange an authorization code (from the browser redirect) for tokens at
+    Keycloak's token endpoint. Returns the parsed token response dict on success.
+
+    Raises RuntimeError with a clear, actionable message on the common failure
+    modes so a human debugging the live flow knows what to fix, rather than
+    getting a raw stack trace:
+      - network failure reaching Keycloak
+      - Keycloak returning an OAuth error (invalid_grant, redirect mismatch, ...)
+      - a non-JSON or tokenless response
+    """
+    base = keycloak_url.rstrip("/")
+    token_url = f"{base}/realms/{realm}/protocol/openid-connect/token"
+    data = {
+        "grant_type":   "authorization_code",
+        "code":         code,
+        "client_id":    client_id,
+        "redirect_uri": redirect_uri,
+    }
+    if client_secret:
+        data["client_secret"] = client_secret
+    try:
+        resp = requests.post(token_url, data=data, timeout=timeout)
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Could not reach Keycloak token endpoint at "
+                           f"{token_url}: {exc}") from exc
+    if resp.status_code != 200:
+        # Surface Keycloak's own OAuth error so the cause is obvious.
+        detail = resp.text
+        try:
+            body = resp.json()
+            detail = body.get("error_description") or body.get("error") or detail
+        except ValueError:
+            pass
+        raise RuntimeError(
+            f"Token exchange failed ({resp.status_code}): {detail}. "
+            "Common causes: redirect_uri mismatch, wrong client_secret, or an "
+            "expired/reused code."
+        )
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        raise RuntimeError("Keycloak token endpoint returned non-JSON") from exc
+    if "access_token" not in body:
+        raise RuntimeError(f"Token response had no access_token: {body}")
+    return body
+
+
+def decode_token_segments(token: str) -> dict:
+    """
+    Decode a JWT's header and payload WITHOUT verifying the signature — purely
+    for diagnostics when eyeballing what Keycloak returned. Never use this for
+    trust decisions (verify_auth0_token does real verification). Returns
+    {"header": {...}, "payload": {...}}.
+    """
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise ValueError("not a well-formed JWT (expected 3 dot-separated parts)")
+
+    def _seg(seg: str) -> dict:
+        # Restore base64url padding before decoding.
+        padded = seg + "=" * (-len(seg) % 4)
+        return json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+
+    return {"header": _seg(parts[0]), "payload": _seg(parts[1])}
+
+
+def process_callback_query(query: dict, keycloak_url: str, realm: str,
+                           client_id: str, redirect_uri: str,
+                           client_secret: str | None) -> dict:
+    """
+    Given the parsed query dict from the browser redirect, drive the token
+    exchange and return a result dict: {"ok": bool, ...}. Pure logic (no HTTP
+    server), so it is unit-testable. `query` values are lists, as produced by
+    urllib.parse.parse_qs.
+    """
+    if "error" in query:
+        msg = query.get("error_description", query["error"])[0]
+        return {"ok": False, "error": f"IdP returned error: {msg}"}
+    code = query.get("code", [None])[0]
+    if not code:
+        return {"ok": False, "pending": True, "error": "no authorization code yet"}
+    try:
+        tokens = exchange_code_for_tokens(
+            keycloak_url, realm, client_id, redirect_uri, code,
+            client_secret=client_secret)
+        claims = decode_token_segments(tokens["access_token"])["payload"]
+        return {
+            "ok": True,
+            "username": claims.get("preferred_username") or claims.get("sub", "?"),
+            "idp": claims.get("identity_provider", "(not present)"),
+        }
+    except (RuntimeError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def run_callback_catcher(keycloak_url: str, realm: str, client_id: str,
+                         redirect_uri: str, client_secret: str | None,
+                         port: int) -> int:
+    """
+    Start a one-shot local HTTP server on `port` to catch the browser redirect,
+    exchange the authorization code for tokens, and print a diagnostic summary.
+    Returns a process exit code (0 = a valid token round-trip completed).
+    """
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from urllib.parse import urlparse, parse_qs
+
+    outcome: dict = {}
+
+    class _Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            query = parse_qs(urlparse(self.path).query)
+            res = process_callback_query(query, keycloak_url, realm, client_id,
+                                         redirect_uri, client_secret)
+            if res.get("pending"):
+                self._reply("Waiting for the OAuth redirect (no 'code' yet).")
+                return
+            if res["ok"]:
+                self._reply(f"Success! Authenticated as {res['username']}. "
+                            f"Broker IdP claim: {res['idp']}. Close this tab.")
+            else:
+                self._reply(f"Login failed: {res['error']}")
+            outcome.update(res)
+
+        def _reply(self, text: str):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(text.encode("utf-8"))
+
+    server = HTTPServer(("127.0.0.1", port), _Handler)
+    print(f"\nListening for the redirect on http://127.0.0.1:{port} ...")
+    print("Complete the login in your browser; this will report the result.\n")
+    while not outcome:
+        server.handle_request()
+    if outcome["ok"]:
+        print(f"✓ Round trip OK — user={outcome['username']}, idp={outcome['idp']}")
+        return 0
+    print(f"✗ Login flow failed — {outcome.get('error')}")
+    return 1
+
+
+def ensure_client_redirect_uri(keycloak_url: str, realm: str, admin_token: str,
+                               client_id: str, redirect_uri: str,
+                               timeout: int = 10) -> bool:
+    """
+    Make sure `redirect_uri` is in the Keycloak client's Valid Redirect URIs.
+    This is the fix for Keycloak's "Invalid parameter: redirect_uri" error,
+    which occurs when the auth request's redirect_uri isn't registered on the
+    client. Returns True if the URI is present (added or already there).
+
+    Requires a realm-admin token (get_keycloak_admin_token). No-op-safe to call
+    repeatedly — it reads the client, adds the URI only if missing, and writes back.
+    """
+    base = keycloak_url.rstrip("/")
+    headers = {"authorization": f"Bearer {admin_token}",
+               "content-type": "application/json"}
+    for prefix in ("/admin/realms", "/auth/admin/realms"):
+        list_url = f"{base}{prefix}/{realm}/clients"
+        try:
+            resp = requests.get(list_url, headers=headers,
+                                params={"clientId": client_id}, timeout=timeout)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Could not reach Keycloak at {list_url}: {exc}") from exc
+        if resp.status_code == 404 and prefix == "/admin/realms":
+            continue
+        resp.raise_for_status()
+        clients = resp.json()
+        if not clients:
+            raise RuntimeError(
+                f"Keycloak client '{client_id}' not found in realm '{realm}'. "
+                "Create it (or run your setup) before registering a redirect URI.")
+        client = clients[0]
+        uris = client.get("redirectUris") or []
+        if redirect_uri in uris:
+            logger.info("Redirect URI already registered on '%s'", client_id)
+            return True
+        uris.append(redirect_uri)
+        upd_url = f"{base}{prefix}/{realm}/clients/{client['id']}"
+        put = requests.put(upd_url, headers=headers,
+                           json={**client, "redirectUris": uris}, timeout=timeout)
+        put.raise_for_status()
+        logger.info("Added redirect URI '%s' to client '%s'", redirect_uri, client_id)
+        return True
+    raise RuntimeError(f"Keycloak realm '{realm}' not found at {base}")
+
+
 def main() -> None:
     keycloak_url = os.environ.get("KEYCLOAK_URL", "http://localhost:8080")
     realm        = os.environ.get("KEYCLOAK_REALM", "Premkey")
     client_id    = os.environ.get("KEYCLOAK_CLIENT_ID", "Hello-World-app")
-    redirect_uri = os.environ.get("APP_REDIRECT_URI", "http://localhost:8000/protected")
+    # The redirect target must (a) be registered on the Keycloak client's Valid
+    # Redirect URIs and (b) actually receive the ?code=. The callback catcher
+    # (LOGIN_FLOW_CATCH=1) listens on this path, so default to it rather than
+    # /protected, which expects a Bearer token and cannot handle a redirect code.
+    redirect_uri = os.environ.get("APP_REDIRECT_URI",
+                                  "http://localhost:8000/callback")
 
     url = build_broker_login_url(keycloak_url, realm, client_id, redirect_uri)
 
@@ -66,6 +278,16 @@ def main() -> None:
     print("  5. You should arrive authenticated (a 'code' param on the redirect).")
     print("\nIf step 2 shows the Keycloak login form instead of Auth0, the")
     print("kc_idp_hint/alias is wrong or the IdP isn't registered.")
+
+    # Optional automated verification: if APP_REDIRECT_URI points at localhost
+    # and LOGIN_FLOW_CATCH=1, catch the redirect and verify the token exchange.
+    if os.environ.get("LOGIN_FLOW_CATCH") == "1":
+        from urllib.parse import urlparse
+        parsed = urlparse(redirect_uri)
+        port = parsed.port or 8000
+        secret = os.environ.get("KEYCLOAK_CLIENT_SECRET")
+        raise SystemExit(run_callback_catcher(
+            keycloak_url, realm, client_id, redirect_uri, secret, port))
     print("=" * 70)
 
 

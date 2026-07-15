@@ -1935,3 +1935,348 @@ def test_build_broker_login_url_custom_idp_and_scope():
     url = build_broker_login_url("http://kc", "R", "c", "http://cb",
                                  idp_alias="okta", scope="openid")
     assert "kc_idp_hint=okta" in url and "scope=openid" in url
+
+
+# ──────────────────────────────────────────────
+# verify_auth0_token END-TO-END: real RS256 keypair, real signature check,
+# real JWKS resolution — nothing in the crypto chain mocked.
+# ──────────────────────────────────────────────
+def _rs256_fixture():
+    from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+    from cryptography.hazmat.primitives import serialization as _ser
+    from jose.backends import RSAKey
+    key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    priv_pem = key.private_bytes(_ser.Encoding.PEM, _ser.PrivateFormat.PKCS8,
+                                 _ser.NoEncryption()).decode()
+    pub_pem = key.public_key().public_bytes(
+        _ser.Encoding.PEM, _ser.PublicFormat.SubjectPublicKeyInfo).decode()
+    jwk_dict = RSAKey(pub_pem, algorithm="RS256").to_dict()
+    jwk_dict["kid"] = "e2e-kid"
+    return priv_pem, jwk_dict
+
+def _e2e_verify_env(monkeypatch, jwk_dict):
+    import authorize
+    monkeypatch.setenv("AUTH0_DOMAIN", DOMAIN)
+    monkeypatch.setattr(authorize, "_jwks_cache", None)
+    monkeypatch.setattr(authorize, "get_secret", lambda n: "e2e-aud")
+    responses.add(responses.GET, f"https://{DOMAIN}/.well-known/jwks.json",
+                  json={"keys": [jwk_dict]}, status=200)
+
+@responses.activate
+def test_verify_auth0_token_end_to_end_valid(monkeypatch):
+    import authorize, time as _t
+    from jose import jwt as _jwt
+    priv, jwk_dict = _rs256_fixture()
+    _e2e_verify_env(monkeypatch, jwk_dict)
+    tok = _jwt.encode({"sub": "auth0|42", "aud": "e2e-aud",
+                       "iss": f"https://{DOMAIN}/",
+                       "exp": int(_t.time()) + 300},
+                      priv, algorithm="RS256", headers={"kid": "e2e-kid"})
+    claims = authorize.verify_auth0_token(tok)
+    assert claims["sub"] == "auth0|42"
+
+@responses.activate
+def test_verify_auth0_token_end_to_end_expired(monkeypatch):
+    import authorize, time as _t
+    from jose import jwt as _jwt
+    priv, jwk_dict = _rs256_fixture()
+    _e2e_verify_env(monkeypatch, jwk_dict)
+    tok = _jwt.encode({"sub": "auth0|42", "aud": "e2e-aud",
+                       "iss": f"https://{DOMAIN}/",
+                       "exp": int(_t.time()) - 10},
+                      priv, algorithm="RS256", headers={"kid": "e2e-kid"})
+    with pytest.raises(HTTPExceptionType) as e:
+        authorize.verify_auth0_token(tok)
+    assert e.value.status_code == 401 and "expired" in e.value.detail.lower()
+
+@responses.activate
+def test_verify_auth0_token_end_to_end_wrong_audience(monkeypatch):
+    import authorize, time as _t
+    from jose import jwt as _jwt
+    priv, jwk_dict = _rs256_fixture()
+    _e2e_verify_env(monkeypatch, jwk_dict)
+    tok = _jwt.encode({"sub": "auth0|42", "aud": "SOMEONE-ELSE",
+                       "iss": f"https://{DOMAIN}/",
+                       "exp": int(_t.time()) + 300},
+                      priv, algorithm="RS256", headers={"kid": "e2e-kid"})
+    with pytest.raises(HTTPExceptionType) as e:
+        authorize.verify_auth0_token(tok)
+    assert e.value.status_code == 401
+
+@responses.activate
+def test_verify_auth0_token_end_to_end_forged_signature(monkeypatch):
+    # Token signed by an ATTACKER's key but claiming the legit kid: the JWKS
+    # holds the real public key, so the signature check must fail.
+    import authorize, time as _t
+    from jose import jwt as _jwt
+    _, legit_jwk = _rs256_fixture()          # the key JWKS serves
+    attacker_priv, _ = _rs256_fixture()      # a different keypair
+    _e2e_verify_env(monkeypatch, legit_jwk)
+    forged = _jwt.encode({"sub": "auth0|42", "aud": "e2e-aud",
+                          "exp": int(_t.time()) + 300},
+                         attacker_priv, algorithm="RS256",
+                         headers={"kid": "e2e-kid"})
+    with pytest.raises(HTTPExceptionType) as e:
+        authorize.verify_auth0_token(forged)
+    assert e.value.status_code == 401
+
+
+@responses.activate
+def test_verify_auth0_token_end_to_end_wrong_issuer(monkeypatch):
+    # Discovered via the valid-token e2e test: issuer IS enforced. Lock it in.
+    import authorize, time as _t
+    from jose import jwt as _jwt
+    priv, jwk_dict = _rs256_fixture()
+    _e2e_verify_env(monkeypatch, jwk_dict)
+    tok = _jwt.encode({"sub": "auth0|42", "aud": "e2e-aud",
+                       "iss": "https://evil.example.com/",
+                       "exp": int(_t.time()) + 300},
+                      priv, algorithm="RS256", headers={"kid": "e2e-kid"})
+    with pytest.raises(HTTPExceptionType) as e:
+        authorize.verify_auth0_token(tok)
+    assert e.value.status_code == 401
+
+
+# ──────────────────────────────────────────────
+# verify_auth0_token END-TO-END with real RS256 crypto: a real keypair signs
+# real JWTs, the public key is served as a JWKS, and the full unmodified
+# verification chain (JWKS -> signing key -> decode) runs against them.
+# ──────────────────────────────────────────────
+import time as _time
+from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+from cryptography.hazmat.primitives import serialization as _ser
+from jose import jwk as _jose_jwk, jwt as _jose_jwt
+
+
+@pytest.fixture(scope="module")
+def rs256_keypair():
+    key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = key.private_bytes(
+        _ser.Encoding.PEM, _ser.PrivateFormat.PKCS8, _ser.NoEncryption()).decode()
+    public_pem = key.public_key().public_bytes(
+        _ser.Encoding.PEM, _ser.PublicFormat.SubjectPublicKeyInfo).decode()
+    jwk_dict = _jose_jwk.construct(public_pem, "RS256").to_dict()
+    jwk_dict.update({"kid": "test-kid", "use": "sig", "alg": "RS256"})
+    return private_pem, jwk_dict
+
+
+def _sign(private_pem, claims):
+    return _jose_jwt.encode(claims, private_pem, algorithm="RS256",
+                            headers={"kid": "test-kid"})
+
+
+def _wire_verify_env(monkeypatch, jwk_dict, audience="test-aud"):
+    import authorize
+    monkeypatch.setenv("AUTH0_DOMAIN", DOMAIN)
+    monkeypatch.setattr(authorize, "_jwks_cache", None)
+    monkeypatch.setattr(authorize, "_fetch_jwks", lambda d: {"keys": [jwk_dict]})
+    monkeypatch.setattr(authorize, "get_secret", lambda name: audience)
+
+
+def _claims(**over):
+    now = int(_time.time())
+    base = {"iss": f"https://{DOMAIN}/", "aud": "test-aud",
+            "sub": "auth0|real", "iat": now, "exp": now + 300}
+    base.update(over)
+    return base
+
+
+def test_verify_rs256_end_to_end_valid(rs256_keypair, monkeypatch):
+    import authorize
+    private_pem, jwk_dict = rs256_keypair
+    _wire_verify_env(monkeypatch, jwk_dict)
+    token = _sign(private_pem, _claims())
+    decoded = authorize.verify_auth0_token(token)
+    assert decoded["sub"] == "auth0|real"
+    assert decoded["aud"] == "test-aud"
+
+def test_verify_rs256_expired_is_401(rs256_keypair, monkeypatch):
+    import authorize
+    private_pem, jwk_dict = rs256_keypair
+    _wire_verify_env(monkeypatch, jwk_dict)
+    token = _sign(private_pem, _claims(exp=int(_time.time()) - 10))
+    with pytest.raises(HTTPExceptionType) as e:
+        authorize.verify_auth0_token(token)
+    assert e.value.status_code == 401 and "expired" in e.value.detail.lower()
+
+def test_verify_rs256_wrong_audience_is_401(rs256_keypair, monkeypatch):
+    import authorize
+    private_pem, jwk_dict = rs256_keypair
+    _wire_verify_env(monkeypatch, jwk_dict)  # verifier expects 'test-aud'
+    token = _sign(private_pem, _claims(aud="someone-else"))
+    with pytest.raises(HTTPExceptionType) as e:
+        authorize.verify_auth0_token(token)
+    assert e.value.status_code == 401
+
+def test_verify_rs256_wrong_issuer_is_401(rs256_keypair, monkeypatch):
+    import authorize
+    private_pem, jwk_dict = rs256_keypair
+    _wire_verify_env(monkeypatch, jwk_dict)
+    token = _sign(private_pem, _claims(iss="https://evil.example/"))
+    with pytest.raises(HTTPExceptionType) as e:
+        authorize.verify_auth0_token(token)
+    assert e.value.status_code == 401
+
+def test_verify_rs256_tampered_signature_is_401(rs256_keypair, monkeypatch):
+    import authorize
+    private_pem, jwk_dict = rs256_keypair
+    _wire_verify_env(monkeypatch, jwk_dict)
+    token = _sign(private_pem, _claims())
+    head, payload, sig = token.rsplit(".", 2)
+    tampered = f"{head}.{payload}.{'A' + sig[1:] if sig[0] != 'A' else 'B' + sig[1:]}"
+    with pytest.raises(HTTPExceptionType) as e:
+        authorize.verify_auth0_token(tampered)
+    assert e.value.status_code == 401
+
+def test_verify_rs256_key_signed_by_stranger_is_401(rs256_keypair, monkeypatch):
+    # Signed by a DIFFERENT private key than the JWKS advertises.
+    import authorize
+    _, jwk_dict = rs256_keypair
+    _wire_verify_env(monkeypatch, jwk_dict)
+    stranger = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    stranger_pem = stranger.private_bytes(
+        _ser.Encoding.PEM, _ser.PrivateFormat.PKCS8, _ser.NoEncryption()).decode()
+    token = _sign(stranger_pem, _claims())
+    with pytest.raises(HTTPExceptionType) as e:
+        authorize.verify_auth0_token(token)
+    assert e.value.status_code == 401
+
+
+# ──────────────────────────────────────────────
+# login_flow: authorization-code exchange + token decode + callback catcher
+# ──────────────────────────────────────────────
+KC = "http://kc.local:8080"
+TOKEN_URL = f"{KC}/realms/Premkey/protocol/openid-connect/token"
+
+@responses.activate
+def test_exchange_code_success():
+    from login_flow import exchange_code_for_tokens
+    responses.add(responses.POST, TOKEN_URL,
+                  json={"access_token": "at", "refresh_token": "rt",
+                        "token_type": "Bearer"}, status=200)
+    out = exchange_code_for_tokens(KC, "Premkey", "app", "http://cb", "the-code",
+                                   client_secret="s")
+    assert out["access_token"] == "at"
+    sent = responses.calls[0].request.body
+    assert "grant_type=authorization_code" in sent and "code=the-code" in sent
+    assert "client_secret=s" in sent
+
+@responses.activate
+def test_exchange_code_oauth_error_is_actionable():
+    from login_flow import exchange_code_for_tokens
+    responses.add(responses.POST, TOKEN_URL,
+                  json={"error": "invalid_grant",
+                        "error_description": "Incorrect redirect_uri"}, status=400)
+    with pytest.raises(RuntimeError, match="Incorrect redirect_uri"):
+        exchange_code_for_tokens(KC, "Premkey", "app", "http://cb", "bad")
+
+@responses.activate
+def test_exchange_code_network_error():
+    from login_flow import exchange_code_for_tokens
+    def boom(req):
+        raise __import__("requests").exceptions.ConnectionError("refused")
+    responses.add_callback(responses.POST, TOKEN_URL, callback=boom)
+    with pytest.raises(RuntimeError, match="Could not reach Keycloak"):
+        exchange_code_for_tokens(KC, "Premkey", "app", "http://cb", "c")
+
+@responses.activate
+def test_exchange_code_no_access_token():
+    from login_flow import exchange_code_for_tokens
+    responses.add(responses.POST, TOKEN_URL, json={"token_type": "Bearer"}, status=200)
+    with pytest.raises(RuntimeError, match="no access_token"):
+        exchange_code_for_tokens(KC, "Premkey", "app", "http://cb", "c")
+
+def test_decode_token_segments():
+    from login_flow import decode_token_segments
+    import base64 as b64, json as j
+    def seg(d):
+        raw = j.dumps(d).encode()
+        return b64.urlsafe_b64encode(raw).decode().rstrip("=")
+    token = f"{seg({'alg': 'RS256', 'kid': 'k1'})}.{seg({'sub': 'user|1', 'preferred_username': 'nathan'})}.sig"
+    out = decode_token_segments(token)
+    assert out["header"]["kid"] == "k1"
+    assert out["payload"]["preferred_username"] == "nathan"
+
+def test_decode_token_segments_rejects_malformed():
+    from login_flow import decode_token_segments
+    with pytest.raises(ValueError, match="well-formed JWT"):
+        decode_token_segments("not.a.jwt.token")
+    with pytest.raises(ValueError):
+        decode_token_segments("onlyonepart")
+
+
+@responses.activate
+def test_process_callback_success():
+    from login_flow import process_callback_query
+    import base64 as b64, json as j
+    def seg(d):
+        return b64.urlsafe_b64encode(j.dumps(d).encode()).decode().rstrip("=")
+    access = f"{seg({'alg':'RS256'})}.{seg({'preferred_username':'nathan','identity_provider':'auth0'})}.s"
+    responses.add(responses.POST, TOKEN_URL,
+                  json={"access_token": access, "token_type": "Bearer"}, status=200)
+    res = process_callback_query({"code": ["abc"]}, KC, "Premkey", "app",
+                                 "http://cb", None)
+    assert res["ok"] and res["username"] == "nathan" and res["idp"] == "auth0"
+
+def test_process_callback_idp_error():
+    from login_flow import process_callback_query
+    res = process_callback_query(
+        {"error": ["access_denied"], "error_description": ["User cancelled"]},
+        KC, "Premkey", "app", "http://cb", None)
+    assert not res["ok"] and "User cancelled" in res["error"]
+
+def test_process_callback_no_code_is_pending():
+    from login_flow import process_callback_query
+    res = process_callback_query({}, KC, "Premkey", "app", "http://cb", None)
+    assert res["ok"] is False and res.get("pending") is True
+
+@responses.activate
+def test_process_callback_exchange_failure_reported():
+    from login_flow import process_callback_query
+    responses.add(responses.POST, TOKEN_URL,
+                  json={"error": "invalid_grant",
+                        "error_description": "code expired"}, status=400)
+    res = process_callback_query({"code": ["stale"]}, KC, "Premkey", "app",
+                                 "http://cb", None)
+    assert not res["ok"] and "code expired" in res["error"]
+
+
+# ──────────────────────────────────────────────
+# ensure_client_redirect_uri — fixes "Invalid parameter: redirect_uri"
+# ──────────────────────────────────────────────
+@responses.activate
+def test_ensure_redirect_uri_adds_when_missing():
+    from login_flow import ensure_client_redirect_uri
+    clients_url = f"{KC}/admin/realms/Premkey/clients"
+    responses.add(responses.GET, clients_url,
+                  json=[{"id": "uuid-1", "clientId": "app",
+                         "redirectUris": ["http://localhost:8000/other"]}], status=200)
+    responses.add(responses.PUT, f"{KC}/admin/realms/Premkey/clients/uuid-1", status=204)
+    ok = ensure_client_redirect_uri(KC, "Premkey", "tok", "app",
+                                    "http://localhost:8000/callback")
+    assert ok is True
+    put = [c for c in responses.calls if c.request.method == "PUT"][0]
+    body = json.loads(put.request.body)
+    assert "http://localhost:8000/callback" in body["redirectUris"]
+    assert "http://localhost:8000/other" in body["redirectUris"]   # preserved
+
+@responses.activate
+def test_ensure_redirect_uri_noop_when_present():
+    from login_flow import ensure_client_redirect_uri
+    clients_url = f"{KC}/admin/realms/Premkey/clients"
+    responses.add(responses.GET, clients_url,
+                  json=[{"id": "uuid-1", "clientId": "app",
+                         "redirectUris": ["http://localhost:8000/callback"]}], status=200)
+    ok = ensure_client_redirect_uri(KC, "Premkey", "tok", "app",
+                                    "http://localhost:8000/callback")
+    assert ok is True
+    assert not [c for c in responses.calls if c.request.method == "PUT"]  # no write
+
+@responses.activate
+def test_ensure_redirect_uri_client_missing_raises():
+    from login_flow import ensure_client_redirect_uri
+    responses.add(responses.GET, f"{KC}/admin/realms/Premkey/clients",
+                  json=[], status=200)
+    with pytest.raises(RuntimeError, match="not found"):
+        ensure_client_redirect_uri(KC, "Premkey", "tok", "ghost",
+                                   "http://localhost:8000/callback")
