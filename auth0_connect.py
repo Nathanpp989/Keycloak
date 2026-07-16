@@ -308,6 +308,12 @@ def integrate_with_keycloak(
             "config": {
                 "clientId":          oidc_client_id,
                 "clientSecret":      oidc_client_secret,
+                # How Keycloak presents its credentials at Auth0's token
+                # endpoint. Without this, Keycloak has no client-auth method
+                # configured and the code->token exchange fails with the generic
+                # "Unexpected error when authenticating with identity provider".
+                # Auth0's default for regular web apps is client_secret_post.
+                "clientAuthMethod":  "client_secret_post",
                 "authorizationUrl":  f"https://{auth0.domain}/authorize",
                 "tokenUrl":          f"https://{auth0.domain}/oauth/token",
                 "userInfoUrl":       f"https://{auth0.domain}/userinfo",
