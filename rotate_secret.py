@@ -131,6 +131,27 @@ def verify_keycloak_idp_secret(
     return False
 
 
+def _get_idp_client_id(keycloak_url: str, realm_name: str, admin_token: str,
+                       alias: str, timeout: int = 10) -> str | None:
+    """
+    Return the clientId the Keycloak IdP authenticates as, or None if the IdP
+    can't be read. Used to guarantee a rotation targets the SAME Auth0
+    application the IdP uses (see the guard in rotate_and_sync).
+    """
+    headers = {"authorization": f"Bearer {admin_token}"}
+    for url in _candidate_idp_urls(keycloak_url, realm_name, alias):
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+        except requests.RequestException:
+            return None
+        if resp.status_code == 404:
+            continue
+        if not resp.ok:
+            return None
+        return (resp.json().get("config") or {}).get("clientId")
+    return None
+
+
 def _persist_secret_to_keyvault(new_secret: str, client=None) -> bool:
     """
     R2 FIX: best-effort update of Azure Key Vault so services reading the Auth0
@@ -174,6 +195,23 @@ def _persist_secret_to_env(new_secret: str) -> bool:
     return True
 
 
+def _idp_client_id(keycloak_url: str, realm_name: str, admin_token: str,
+                   alias: str, timeout: int = 10) -> str | None:
+    """Read the clientId configured on a Keycloak OIDC IdP (None if not found)."""
+    headers = {"authorization": f"Bearer {admin_token}"}
+    for url in _candidate_idp_urls(keycloak_url, realm_name, alias):
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+        except requests.RequestException:
+            return None
+        if resp.status_code == 404:
+            continue
+        if not resp.ok:
+            return None
+        return (resp.json().get("config") or {}).get("clientId")
+    return None
+
+
 def rotate_and_sync(
     auth0: Auth0Connect,
     keycloak_url: str,
@@ -204,6 +242,22 @@ def rotate_and_sync(
     documented in the README.
     """
     # 1. Rotate at Auth0 (old secret dies here)
+    #    GUARD (critical): the Keycloak IdP authenticates to Auth0 as a specific
+    #    clientId. If that is NOT the client we're rotating, pushing our secret
+    #    into the IdP pairs one app's clientId with another app's secret, and
+    #    every brokered login fails with invalid_client. Verify BEFORE rotating,
+    #    so we never destroy a working secret we can't use.
+    idp_client_id = _get_idp_client_id(keycloak_url, realm_name,
+                                       keycloak_admin_token, idp_alias)
+    if idp_client_id is not None and idp_client_id != auth0.client_id:
+        raise RuntimeError(
+            f"Refusing to rotate: the Keycloak IdP '{idp_alias}' authenticates as "
+            f"Auth0 client '{idp_client_id}', but you are rotating client "
+            f"'{auth0.client_id}'. These are different Auth0 applications — "
+            "pushing this secret into the IdP would break every brokered login. "
+            "Rotate the IdP's own application instead (set AUTH0_CLIENT_ID to "
+            f"'{idp_client_id}' and its secret), or pass a different idp_alias."
+        )
     new_secret = auth0.rotate_client_secret(auth0.client_id)
 
     # 2. Push to Keycloak immediately to close the window as fast as possible.
@@ -229,9 +283,9 @@ def rotate_and_sync(
         raise RuntimeError(
             "Auth0 secret was rotated but the Keycloak IdP update FAILED. "
             + ("The new secret was saved to your .env. "
-            if persisted else
-            "The new secret could NOT be saved locally — retrieve it from "
-            "the Auth0 dashboard (Applications → your app → Credentials). ")
+               if persisted else
+               "The new secret could NOT be saved locally — retrieve it from "
+               "the Auth0 dashboard (Applications → your app → Credentials). ")
             + f"Update the Keycloak IdP '{idp_alias}' clientSecret manually, "
             "or re-run this script. Original error: " + str(exc)
         ) from exc

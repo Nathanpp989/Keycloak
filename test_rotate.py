@@ -120,7 +120,9 @@ def test_rotate_and_sync_verify_reuses_discovered_url():
     assert legacy_calls == []          # never probed the legacy path
     gets = [c for c in responses.calls
             if c.request.method == "GET" and "identity-provider" in c.request.url]
-    assert len(gets) == 2              # one read-for-update + one verify, no extras
+    # 3 GETs: (1) the clientId safety guard, (2) read-for-update, (3) verify.
+    # E2's point stands — verify reuses the discovered URL instead of re-probing.
+    assert len(gets) == 3
 
 
 # ──────────────────────────────────────────────
@@ -364,3 +366,60 @@ def test_authorize_get_secret_hyphenates_kv_name(monkeypatch):
     monkeypatch.setattr(authorize, "_get_kv_client", lambda: fake_client)
     assert authorize.get_secret("AUTH0_CLIENT_SECRET") == "v"
     fake_client.get_secret.assert_called_once_with("AUTH0-CLIENT-SECRET")
+
+
+# ──────────────────────────────────────────────
+# CRITICAL GUARD: never pair one Auth0 app's clientId with another's secret.
+# This is what silently broke brokered login: rotate_secret rotated the M2M app
+# and wrote its secret into an IdP that authenticates as a DIFFERENT app.
+# ──────────────────────────────────────────────
+@responses.activate
+def test_rotate_refuses_when_idp_uses_a_different_client():
+    idp_url = f"{KC_URL}/admin/realms/{REALM}/identity-provider/instances/auth0"
+    # The IdP authenticates as a DIFFERENT Auth0 app than the one we'd rotate.
+    responses.add(responses.GET, idp_url,
+                  json={"alias": "auth0",
+                        "config": {"clientId": "OTHER-APP-ID",
+                                   "clientSecret": "****"}}, status=200)
+    auth0 = Auth0Connect(DOMAIN, "m2m-app-id", "sec")
+    with pytest.raises(RuntimeError, match="Refusing to rotate"):
+        rotate_and_sync(auth0, KC_URL, REALM, "kc-tok", update_env=False)
+    # Crucially, the Auth0 secret must NOT have been rotated — no destroyed secret.
+    assert not [c for c in responses.calls if c.request.url.endswith("rotate-secret")]
+
+@responses.activate
+def test_rotate_proceeds_when_idp_client_matches():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    idp_url = f"{KC_URL}/admin/realms/{REALM}/identity-provider/instances/auth0"
+    responses.add(responses.GET, idp_url,
+                  json={"alias": "auth0", "config": {"clientId": "same-app",
+                                                     "clientSecret": "old"}}, status=200)
+    responses.add(responses.POST,
+                  f"https://{DOMAIN}/api/v2/clients/same-app/rotate-secret",
+                  json={"client_id": "same-app", "client_secret": "brand-new"}, status=200)
+    responses.add(responses.PUT, idp_url, status=204)
+    responses.add(responses.GET, idp_url,
+                  json={"alias": "auth0", "config": {"clientId": "same-app",
+                                                     "clientSecret": "brand-new"}}, status=200)
+    auth0 = Auth0Connect(DOMAIN, "same-app", "old")
+    assert rotate_and_sync(auth0, KC_URL, REALM, "kc-tok",
+                           update_env=False) == "brand-new"
+
+@responses.activate
+def test_rotate_proceeds_when_idp_unreadable():
+    # If the IdP can't be read, the guard must not block rotation outright.
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    idp_url = f"{KC_URL}/admin/realms/{REALM}/identity-provider/instances/auth0"
+    legacy = f"{KC_URL}/auth/admin/realms/{REALM}/identity-provider/instances/auth0"
+    responses.add(responses.GET, idp_url, status=404)
+    responses.add(responses.GET, legacy, status=404)
+    responses.add(responses.POST,
+                  f"https://{DOMAIN}/api/v2/clients/cid/rotate-secret",
+                  json={"client_id": "cid", "client_secret": "n"}, status=200)
+    responses.add(responses.GET, idp_url, status=404)
+    responses.add(responses.GET, legacy, status=404)
+    auth0 = Auth0Connect(DOMAIN, "cid", "old")
+    with pytest.raises(RuntimeError, match="Keycloak IdP update FAILED"):
+        rotate_and_sync(auth0, KC_URL, REALM, "kc-tok", update_env=False)

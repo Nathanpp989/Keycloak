@@ -107,7 +107,8 @@ def check_issuer(domain: str) -> tuple[bool, str]:
 
 
 def check_auth0_app(domain: str, client_id: str, client_secret: str,
-                    kc_url: str, realm: str, alias: str) -> dict:
+                    kc_url: str, realm: str, alias: str,
+                    inspect_client_id: str | None = None) -> dict:
     """
     Read the Auth0 APPLICATION's own settings via the Management API. This is
     where the two classic causes of the generic broker error live:
@@ -125,7 +126,8 @@ def check_auth0_app(domain: str, client_id: str, client_secret: str,
             out["error"] = f"token: {tok.status_code}"
             return out
         access = tok.json()["access_token"]
-        r = requests.get(f"https://{domain}/api/v2/clients/{client_id}",
+        target = inspect_client_id or client_id
+        r = requests.get(f"https://{domain}/api/v2/clients/{target}",
                          headers={"authorization": f"Bearer {access}"},
                          params={"fields": "name,app_type,callbacks,grant_types,"
                                            "jwt_configuration,token_endpoint_auth_method"},
@@ -155,11 +157,15 @@ def check_auth0_app(domain: str, client_id: str, client_secret: str,
 
 
 def fix_idp_config(kc_url: str, realm: str, token: str, alias: str,
-                   new_secret: str, auth_method: str = "client_secret_post") -> str:
+                   new_secret: str, expect_client_id: str | None = None,
+                   auth_method: str = "client_secret_post") -> str:
     """
-    Repair the Keycloak IdP: push the known-good client secret AND ensure
-    clientAuthMethod is set (a missing clientAuthMethod breaks the code->token
-    exchange). Read-modify-write so other config is preserved.
+    Repair the Keycloak IdP: push a client secret AND ensure clientAuthMethod is
+    set. Read-modify-write so other config is preserved.
+
+    GUARD: if expect_client_id is given and does not match the IdP's configured
+    clientId, refuse — writing a secret that belongs to a different Auth0
+    application is what breaks brokered login in the first place.
     """
     headers = {"authorization": f"Bearer {token}",
                "content-type": "application/json"}
@@ -170,7 +176,15 @@ def fix_idp_config(kc_url: str, realm: str, token: str, alias: str,
         r.raise_for_status()
         rep = r.json()
         conf = dict(rep.get("config") or {})
-        conf["clientSecret"] = new_secret
+        if expect_client_id is not None and conf.get("clientId") != expect_client_id:
+            raise RuntimeError(
+                f"REFUSING to write: IdP authenticates as Auth0 client "
+                f"'{conf.get('clientId')}', but the secret you're pushing belongs "
+                f"to '{expect_client_id}'. Pairing one app's clientId with "
+                "another app's secret breaks every brokered login. Use "
+                "--set-idp-secret <secret-of-the-IdP's-own-app> instead.")
+        if new_secret:
+            conf["clientSecret"] = new_secret
         if not conf.get("clientAuthMethod"):
             conf["clientAuthMethod"] = auth_method
         put = requests.put(url, headers=headers, json={**rep, "config": conf},
@@ -183,6 +197,13 @@ def fix_idp_config(kc_url: str, realm: str, token: str, alias: str,
 def main() -> int:
     c = _cfg()
     fix = "--fix-secret" in sys.argv
+    set_secret = None
+    if "--set-idp-secret" in sys.argv:
+        i = sys.argv.index("--set-idp-secret")
+        if i + 1 >= len(sys.argv):
+            print("✗ --set-idp-secret needs a value")
+            return 1
+        set_secret = sys.argv[i + 1]
 
     print("=" * 72)
     print("KEYCLOAK <-> AUTH0 IDENTITY-PROVIDER DIAGNOSTIC")
@@ -237,8 +258,13 @@ def main() -> int:
                         "authenticate at Auth0's token endpoint. This alone causes "
                         "the generic broker error. Fix with --fix-secret.")
     if conf.get("clientId") != c["client_id"]:
-        problems.append(f"IdP clientId ({conf.get('clientId')}) != AUTH0_CLIENT_ID "
-                        f"({c['client_id']}) — Keycloak is using a different Auth0 app.")
+        problems.append(
+            f"IdP authenticates as Auth0 client '{conf.get('clientId')}' but "
+            f"AUTH0_CLIENT_ID in .env is '{c['client_id']}'. These are DIFFERENT "
+            "Auth0 apps. That is normal (M2M app vs browser-login app) — BUT it "
+            "means rotate_secret.py must NOT push .env's secret into this IdP, "
+            "and --fix-secret is refused. Use --set-idp-secret <secret> with the "
+            "secret of the IdP's OWN app.")
     if iok and conf.get("issuer") and conf["issuer"] != issuer:
         problems.append(f"IdP issuer ({conf['issuer']}) != Auth0's real issuer "
                         f"({issuer}) — signature/claim validation will fail.")
@@ -247,13 +273,15 @@ def main() -> int:
 
     # 5. The Auth0 application's own settings — where HS256/callback bugs live.
     print("-" * 72)
+    idp_client = conf.get("clientId")
     app_info = check_auth0_app(c["domain"], c["client_id"], c["client_secret"],
-                               c["kc_url"], c["realm"], c["alias"])
+                               c["kc_url"], c["realm"], c["alias"],
+                               inspect_client_id=idp_client)
     if not app_info["ok"]:
         print(f"[5] Auth0 app settings: could not read ({app_info.get('error')})")
     else:
-        print(f"[5] Auth0 app '{app_info['app'].get('name')}' "
-              f"(type={app_info['app'].get('app_type')})")
+        print(f"[5] The IdP's Auth0 app '{app_info['app'].get('name')}' "
+              f"(client_id={idp_client}, type={app_info['app'].get('app_type')})")
         print(f"    ID token algorithm      : {app_info['alg']}")
         print(f"    token_endpoint_auth     : {app_info['auth_method']}")
         print(f"    grant_types             : {app_info['grant_types']}")
@@ -268,9 +296,15 @@ def main() -> int:
             problems.append(
                 f"Auth0 'Allowed Callback URLs' is missing "
                 f"{app_info['broker_url']} — add it in the Auth0 dashboard.")
+        if app_info["app"].get("app_type") == "non_interactive":
+            problems.append(
+                "The IdP's Auth0 app is a MACHINE-TO-MACHINE app "
+                "(non_interactive). M2M apps cannot do browser login at all. "
+                "Keycloak's IdP needs a REGULAR WEB APPLICATION.")
         if "authorization_code" not in app_info["grant_types"]:
-            problems.append("Auth0 app does not allow the authorization_code "
-                            "grant — enable it in the app's Advanced settings.")
+            problems.append("The IdP's Auth0 app does not allow the "
+                            "authorization_code grant — enable it in the app's "
+                            "Advanced settings (Grant Types).")
         if (app_info["auth_method"] and conf.get("clientAuthMethod")
                 and app_info["auth_method"] != conf.get("clientAuthMethod")):
             problems.append(
@@ -291,19 +325,33 @@ def main() -> int:
     print("  Allowed Callback URLs must include:")
     print(f"    {c['kc_url']}/realms/{c['realm']}/broker/{c['alias']}/endpoint")
 
-    if fix:
-        print("\n→ Repairing Keycloak IdP (secret + clientAuthMethod) ...")
+    if set_secret is not None:
+        print("\n→ Setting the IdP's client secret to the value you supplied ...")
         try:
             used = fix_idp_config(c["kc_url"], c["realm"], token, c["alias"],
-                                  c["client_secret"])
+                                  set_secret)   # no expect check: explicit intent
             print(f"✓ IdP updated via {used}")
             print("  Retry the browser login now.")
         except Exception as exc:  # noqa: BLE001
-            print(f"✗ Repair failed: {exc}")
+            print(f"✗ Update failed: {exc}")
+            return 1
+    elif fix:
+        print("\n→ Repairing Keycloak IdP (secret + clientAuthMethod) ...")
+        try:
+            used = fix_idp_config(c["kc_url"], c["realm"], token, c["alias"],
+                                  c["client_secret"],
+                                  expect_client_id=c["client_id"])
+            print(f"✓ IdP updated via {used}")
+            print("  Retry the browser login now.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"✗ {exc}")
             return 1
     else:
-        print("\nRe-run with --fix-secret to push .env's verified secret AND set")
-        print("clientAuthMethod on Keycloak's IdP.")
+        print("\nOptions:")
+        print("  --fix-secret            push .env's secret + set clientAuthMethod")
+        print("                          (refused if the IdP uses a different app)")
+        print("  --set-idp-secret <s>    set the IdP's secret explicitly — use the")
+        print("                          secret of the IdP's OWN Auth0 app")
 
     print("\nALSO: the real exception is in the KEYCLOAK SERVER LOG at the moment")
     print("of failure — look for 'org.keycloak.broker.oidc'. Paste that line.")
