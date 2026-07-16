@@ -203,6 +203,69 @@ def run_callback_catcher(keycloak_url: str, realm: str, client_id: str,
     return 1
 
 
+def diagnose_redirect_uri(keycloak_url: str, realm: str, admin_token: str,
+                          client_id: str, redirect_uri: str,
+                          timeout: int = 10) -> dict:
+    """
+    Diagnose a Keycloak "Invalid parameter: redirect_uri" error by reporting
+    exactly what the client has registered versus what's being requested, and
+    whether Keycloak's matching rules would accept it. Returns a dict with the
+    findings and a human-readable 'verdict'. Requires a realm-admin token.
+    """
+    base = keycloak_url.rstrip("/")
+    headers = {"authorization": f"Bearer {admin_token}"}
+    info: dict = {"requested": redirect_uri, "client_id": client_id}
+    for prefix in ("/admin/realms", "/auth/admin/realms"):
+        try:
+            resp = requests.get(f"{base}{prefix}/{realm}/clients", headers=headers,
+                                params={"clientId": client_id}, timeout=timeout)
+        except requests.RequestException as exc:
+            info["verdict"] = f"cannot reach Keycloak: {exc}"
+            return info
+        if resp.status_code == 404 and prefix == "/admin/realms":
+            continue
+        if not resp.ok:
+            info["verdict"] = f"client lookup failed ({resp.status_code}): {resp.text}"
+            return info
+        clients = resp.json()
+        if not clients:
+            info["verdict"] = (f"NO client with clientId '{client_id}' exists in "
+                               f"realm '{realm}'. Check the exact clientId "
+                               "(case-sensitive) or create the client.")
+            return info
+        client = clients[0]
+        registered = client.get("redirectUris") or []
+        info["registered"] = registered
+        info["standard_flow_enabled"] = client.get("standardFlowEnabled")
+        # Apply Keycloak's matching: exact match, or a '*' wildcard suffix match.
+        def _matches(pattern: str, uri: str) -> bool:
+            if pattern == uri:
+                return True
+            if pattern.endswith("*"):
+                return uri.startswith(pattern[:-1])
+            return False
+        info["would_match"] = any(_matches(p, redirect_uri) for p in registered)
+        if not registered:
+            info["verdict"] = ("client has NO redirect URIs registered — every "
+                               "redirect is rejected. Add one (ensure_client_redirect_uri).")
+        elif not info["would_match"]:
+            info["verdict"] = ("requested redirect_uri is NOT in the registered "
+                               "list and matches no wildcard. Exact-match rules "
+                               "apply: check http/https, localhost vs 127.0.0.1, "
+                               "port, and trailing slash.")
+        elif client.get("standardFlowEnabled") is False:
+            info["verdict"] = ("redirect_uri is fine, but Standard Flow "
+                               "(authorization code) is DISABLED on this client — "
+                               "enable it.")
+        else:
+            info["verdict"] = ("redirect_uri should be accepted. If the error "
+                               "persists, confirm you're hitting this same realm "
+                               "and clientId.")
+        return info
+    info["verdict"] = f"realm '{realm}' not found at {base}"
+    return info
+
+
 def ensure_client_redirect_uri(keycloak_url: str, realm: str, admin_token: str,
                                client_id: str, redirect_uri: str,
                                timeout: int = 10) -> bool:
@@ -235,15 +298,32 @@ def ensure_client_redirect_uri(keycloak_url: str, realm: str, admin_token: str,
                 "Create it (or run your setup) before registering a redirect URI.")
         client = clients[0]
         uris = client.get("redirectUris") or []
-        if redirect_uri in uris:
-            logger.info("Redirect URI already registered on '%s'", client_id)
+        changed = False
+        if redirect_uri not in uris:
+            uris.append(redirect_uri)
+            changed = True
+        # Also register a wildcard on the same origin so trailing-slash / path
+        # variations don't re-trigger the error during local testing.
+        from urllib.parse import urlparse
+        p = urlparse(redirect_uri)
+        wildcard = f"{p.scheme}://{p.netloc}/*"
+        if wildcard not in uris:
+            uris.append(wildcard)
+            changed = True
+        # Standard (authorization-code) flow must be enabled for a browser login.
+        updates = {"redirectUris": uris}
+        if client.get("standardFlowEnabled") is False:
+            updates["standardFlowEnabled"] = True
+            changed = True
+        if not changed:
+            logger.info("Redirect URI + wildcard already registered on '%s'", client_id)
             return True
-        uris.append(redirect_uri)
         upd_url = f"{base}{prefix}/{realm}/clients/{client['id']}"
         put = requests.put(upd_url, headers=headers,
-                           json={**client, "redirectUris": uris}, timeout=timeout)
+                           json={**client, **updates}, timeout=timeout)
         put.raise_for_status()
-        logger.info("Added redirect URI '%s' to client '%s'", redirect_uri, client_id)
+        logger.info("Updated client '%s': redirect URIs %s, standard flow on",
+                    client_id, uris)
         return True
     raise RuntimeError(f"Keycloak realm '{realm}' not found at {base}")
 

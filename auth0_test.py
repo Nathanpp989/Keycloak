@@ -2261,16 +2261,34 @@ def test_ensure_redirect_uri_adds_when_missing():
     assert "http://localhost:8000/other" in body["redirectUris"]   # preserved
 
 @responses.activate
-def test_ensure_redirect_uri_noop_when_present():
+def test_ensure_redirect_uri_noop_when_uri_and_wildcard_present():
     from login_flow import ensure_client_redirect_uri
     clients_url = f"{KC}/admin/realms/Premkey/clients"
     responses.add(responses.GET, clients_url,
                   json=[{"id": "uuid-1", "clientId": "app",
-                         "redirectUris": ["http://localhost:8000/callback"]}], status=200)
+                         "standardFlowEnabled": True,
+                         "redirectUris": ["http://localhost:8000/callback",
+                                          "http://localhost:8000/*"]}], status=200)
     ok = ensure_client_redirect_uri(KC, "Premkey", "tok", "app",
                                     "http://localhost:8000/callback")
     assert ok is True
     assert not [c for c in responses.calls if c.request.method == "PUT"]  # no write
+
+@responses.activate
+def test_ensure_redirect_uri_adds_wildcard_and_enables_flow():
+    from login_flow import ensure_client_redirect_uri
+    clients_url = f"{KC}/admin/realms/Premkey/clients"
+    responses.add(responses.GET, clients_url,
+                  json=[{"id": "uuid-1", "clientId": "app",
+                         "standardFlowEnabled": False,
+                         "redirectUris": []}], status=200)
+    responses.add(responses.PUT, f"{KC}/admin/realms/Premkey/clients/uuid-1", status=204)
+    ensure_client_redirect_uri(KC, "Premkey", "tok", "app",
+                               "http://localhost:8000/callback")
+    body = json.loads([c for c in responses.calls if c.request.method == "PUT"][0].request.body)
+    assert "http://localhost:8000/callback" in body["redirectUris"]
+    assert "http://localhost:8000/*" in body["redirectUris"]   # wildcard added
+    assert body["standardFlowEnabled"] is True                 # flow enabled
 
 @responses.activate
 def test_ensure_redirect_uri_client_missing_raises():
@@ -2280,3 +2298,42 @@ def test_ensure_redirect_uri_client_missing_raises():
     with pytest.raises(RuntimeError, match="not found"):
         ensure_client_redirect_uri(KC, "Premkey", "tok", "ghost",
                                    "http://localhost:8000/callback")
+
+
+@responses.activate
+def test_diagnose_redirect_uri_not_registered():
+    from login_flow import diagnose_redirect_uri
+    responses.add(responses.GET, f"{KC}/admin/realms/Premkey/clients",
+                  json=[{"id": "u1", "clientId": "app", "standardFlowEnabled": True,
+                         "redirectUris": ["http://localhost:8000/other"]}], status=200)
+    d = diagnose_redirect_uri(KC, "Premkey", "tok", "app",
+                              "http://localhost:8000/callback")
+    assert d["would_match"] is False and "NOT in the registered" in d["verdict"]
+
+@responses.activate
+def test_diagnose_redirect_uri_wildcard_matches():
+    from login_flow import diagnose_redirect_uri
+    responses.add(responses.GET, f"{KC}/admin/realms/Premkey/clients",
+                  json=[{"id": "u1", "clientId": "app", "standardFlowEnabled": True,
+                         "redirectUris": ["http://localhost:8000/*"]}], status=200)
+    d = diagnose_redirect_uri(KC, "Premkey", "tok", "app",
+                              "http://localhost:8000/callback")
+    assert d["would_match"] is True
+
+@responses.activate
+def test_diagnose_redirect_uri_no_client():
+    from login_flow import diagnose_redirect_uri
+    responses.add(responses.GET, f"{KC}/admin/realms/Premkey/clients",
+                  json=[], status=200)
+    d = diagnose_redirect_uri(KC, "Premkey", "tok", "ghost", "http://x/cb")
+    assert "NO client" in d["verdict"]
+
+@responses.activate
+def test_diagnose_redirect_uri_flow_disabled():
+    from login_flow import diagnose_redirect_uri
+    responses.add(responses.GET, f"{KC}/admin/realms/Premkey/clients",
+                  json=[{"id": "u1", "clientId": "app", "standardFlowEnabled": False,
+                         "redirectUris": ["http://localhost:8000/callback"]}], status=200)
+    d = diagnose_redirect_uri(KC, "Premkey", "tok", "app",
+                              "http://localhost:8000/callback")
+    assert "Standard Flow" in d["verdict"]

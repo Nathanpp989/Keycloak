@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 
 import pytest
 from fastapi.testclient import TestClient
@@ -1056,3 +1056,93 @@ def test_endpoint_unexpected_error_maps_to_500(client, monkeypatch, method, path
             assert "internal-detail-abc" not in r.json()["detail"]   # no leak
     finally:
         main.app.dependency_overrides.clear()
+
+
+# ──────────────────────────────────────────────
+# ensure_keycloak_client — ROOT-CAUSE fix for "Invalid parameter: redirect_uri".
+# Uses create_autospec against the REAL KeycloakAdmin so a wrong method name
+# fails the test (the M1 lesson: bare MagicMock hides AttributeError).
+# ──────────────────────────────────────────────
+from keycloak import KeycloakAdmin as _RealKCAdmin
+
+def _kc_admin_autospec():
+    return create_autospec(_RealKCAdmin, instance=True)
+
+def test_ensure_client_creates_when_missing(monkeypatch):
+    monkeypatch.setattr(main, "APP_REDIRECT_URI", "http://localhost:8000/callback")
+    monkeypatch.setattr(main, "KEYCLOAK_CLIENT_ID", "Hello-World-app")
+    admin = _kc_admin_autospec()
+    admin.get_client_id.side_effect = [None, "new-uuid"]   # missing, then created
+    uuid = main.ensure_keycloak_client(admin)
+    assert uuid == "new-uuid"
+    payload = admin.create_client.call_args[0][0]
+    assert payload["clientId"] == "Hello-World-app"
+    assert "http://localhost:8000/callback" in payload["redirectUris"]
+    assert "http://localhost:8000/*" in payload["redirectUris"]
+    assert payload["standardFlowEnabled"] is True   # browser login possible
+
+def test_ensure_client_adds_missing_redirect_uri(monkeypatch):
+    monkeypatch.setattr(main, "APP_REDIRECT_URI", "http://localhost:8000/callback")
+    admin = _kc_admin_autospec()
+    admin.get_client_id.return_value = "uuid-1"
+    admin.get_client.return_value = {
+        "clientId": "Hello-World-app", "standardFlowEnabled": True,
+        "redirectUris": ["http://localhost:8000/other"]}
+    main.ensure_keycloak_client(admin)
+    sent = admin.update_client.call_args[0][1]
+    assert "http://localhost:8000/callback" in sent["redirectUris"]
+    assert "http://localhost:8000/other" in sent["redirectUris"]   # preserved
+
+def test_ensure_client_enables_standard_flow(monkeypatch):
+    monkeypatch.setattr(main, "APP_REDIRECT_URI", "http://localhost:8000/callback")
+    admin = _kc_admin_autospec()
+    admin.get_client_id.return_value = "uuid-1"
+    admin.get_client.return_value = {
+        "clientId": "Hello-World-app", "standardFlowEnabled": False,
+        "redirectUris": ["http://localhost:8000/callback",
+                         "http://localhost:8000/*"]}
+    main.ensure_keycloak_client(admin)
+    sent = admin.update_client.call_args[0][1]
+    assert sent["standardFlowEnabled"] is True
+
+def test_ensure_client_noop_when_already_correct(monkeypatch):
+    monkeypatch.setattr(main, "APP_REDIRECT_URI", "http://localhost:8000/callback")
+    admin = _kc_admin_autospec()
+    admin.get_client_id.return_value = "uuid-1"
+    admin.get_client.return_value = {
+        "clientId": "Hello-World-app", "standardFlowEnabled": True,
+        "redirectUris": ["http://localhost:8000/callback",
+                         "http://localhost:8000/*"]}
+    main.ensure_keycloak_client(admin)
+    admin.update_client.assert_not_called()   # no pointless write
+    admin.create_client.assert_not_called()
+
+def test_ensure_client_raises_if_creation_fails(monkeypatch):
+    admin = _kc_admin_autospec()
+    admin.get_client_id.return_value = None    # never resolves, even after create
+    with pytest.raises(RuntimeError, match="Could not create or find"):
+        main.ensure_keycloak_client(admin)
+
+def test_setup_keycloak_provisions_client(monkeypatch):
+    # The root-cause regression: setup_keycloak MUST provision the client's
+    # redirect URIs, not just look the client up.
+    called = {}
+    monkeypatch.setattr(main, "ensure_keycloak_client",
+                        lambda admin: called.setdefault("uuid", "uuid-1") or "uuid-1")
+    fake_admin = _kc_admin_autospec()
+    fake_admin.get_authentication_flows.return_value = [{"alias": "Hello-World-flow"}]
+    fake_admin.get_client_secrets.return_value = {"value": "sec"}
+    monkeypatch.setattr(main, "KeycloakAdmin", lambda **kw: fake_admin)
+    monkeypatch.setattr(main, "create_keycloak_user", lambda *a, **k: "u-1")
+    monkeypatch.delenv("KEYCLOAK_CLIENT_SECRET", raising=False)
+    assert main.setup_keycloak() == "sec"
+    assert called["uuid"] == "uuid-1"   # provisioning ran
+
+def test_ensure_client_survives_unexpected_representation(monkeypatch):
+    # Defensive guard: a non-dict from get_client must not crash startup
+    # (same class as the P2 introspect fix).
+    admin = _kc_admin_autospec()
+    admin.get_client_id.return_value = "uuid-1"
+    admin.get_client.return_value = []          # unexpected shape
+    assert main.ensure_keycloak_client(admin) == "uuid-1"
+    admin.update_client.assert_not_called()

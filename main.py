@@ -21,6 +21,10 @@ from keycloak.exceptions import KeycloakAuthenticationError
 from auth0_connect import Auth0Connect, get_keycloak_admin_token
 from auth0_talk import KeycloakAdminAPI, Auth0UsersAPI, Auth0AuthzExtensionAPI, Auth0OrganizationsAPI
 from auth0_type import UserManager
+from login_flow import diagnose_redirect_uri
+import json
+tok = get_keycloak_admin_token('http://localhost:8080','master','admin','admin')
+print(json.dumps(diagnose_redirect_uri('http://localhost:8080','Premkey',tok,'Hello-World-app','http://localhost:8000/callback'), indent=2))
 
 # I3 FIX: configure logging before anything else so all logger.* calls produce output
 logging.basicConfig(
@@ -36,6 +40,12 @@ logger = logging.getLogger(__name__)
 KEYCLOAK_URL       = os.environ.get("KEYCLOAK_URL", "http://localhost:8080/")
 KEYCLOAK_REALM     = os.environ.get("KEYCLOAK_REALM", "Premkey")
 KEYCLOAK_CLIENT_ID = os.environ.get("KEYCLOAK_CLIENT_ID", "Hello-World-app")
+# Where the browser is sent back after a brokered login. This MUST be registered
+# on the Keycloak client or Keycloak rejects the auth request with
+# "Invalid parameter: redirect_uri" — so the app provisions it at startup
+# (see ensure_keycloak_client) rather than relying on manual admin-console setup.
+APP_REDIRECT_URI   = os.environ.get("APP_REDIRECT_URI",
+                                    "http://localhost:8000/callback")
 
 # ── RSA key management ────────────────────────────────────────────────────────
 public_pem: bytes = b""
@@ -104,6 +114,73 @@ def create_keycloak_user(admin: KeycloakAdmin, username: str, password: str, gro
     admin.group_user_add(user_id, group_id)
     return user_id
 
+def ensure_keycloak_client(admin: KeycloakAdmin) -> str:
+    """
+    Guarantee the app's Keycloak client exists AND is configured for the
+    brokered browser login. Returns the client's internal UUID.
+
+    ROOT-CAUSE FIX for "Invalid parameter: redirect_uri": setup_keycloak used to
+    only *look up* the client (admin.get_client_id) and never provisioned its
+    redirectUris, so the client either didn't exist or had no redirect URI
+    registered — and Keycloak rejects any auth request whose redirect_uri isn't
+    on the client's list. This function now:
+      - creates the client if it's missing, with the redirect URI registered
+      - otherwise adds the redirect URI (plus an origin wildcard) if absent
+      - enables the standard (authorization-code) flow, required for browser login
+
+    It is idempotent: safe to run on every startup.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(APP_REDIRECT_URI)
+    wildcard = f"{parsed.scheme}://{parsed.netloc}/*"
+    wanted_uris = [APP_REDIRECT_URI, wildcard]
+
+    client_uuid = admin.get_client_id(KEYCLOAK_CLIENT_ID)
+    if not client_uuid:
+        logger.info("Keycloak client '%s' not found — creating it", KEYCLOAK_CLIENT_ID)
+        admin.create_client({
+            "clientId":             KEYCLOAK_CLIENT_ID,
+            "enabled":              True,
+            "protocol":             "openid-connect",
+            "publicClient":         False,   # confidential: we use a client secret
+            "standardFlowEnabled":  True,    # authorization-code (browser) flow
+            "directAccessGrantsEnabled": True,  # password grant used by /token
+            "redirectUris":         wanted_uris,
+            "webOrigins":           [f"{parsed.scheme}://{parsed.netloc}"],
+        }, skip_exists=True)
+        client_uuid = admin.get_client_id(KEYCLOAK_CLIENT_ID)
+        if not client_uuid:
+            raise RuntimeError(
+                f"Could not create or find Keycloak client '{KEYCLOAK_CLIENT_ID}' "
+                f"in realm '{KEYCLOAK_REALM}'.")
+        return client_uuid
+
+    # Client exists — make sure the browser login can actually use it.
+    rep = admin.get_client(client_uuid)
+    # Defensive (same class as the P2 introspect fix): if the admin API returns
+    # anything other than a client representation, don't crash the whole startup
+    # on an AttributeError — log and leave the existing config alone.
+    if not isinstance(rep, dict):
+        logger.warning("Keycloak returned an unexpected representation for client "
+                       "'%s' (%s); skipping redirect-URI provisioning.",
+                       KEYCLOAK_CLIENT_ID, type(rep).__name__)
+        return client_uuid
+    uris = list(rep.get("redirectUris") or [])
+    updates: dict = {}
+    missing = [u for u in wanted_uris if u not in uris]
+    if missing:
+        uris.extend(missing)
+        updates["redirectUris"] = uris
+    if not rep.get("standardFlowEnabled"):
+        updates["standardFlowEnabled"] = True
+    if updates:
+        admin.update_client(client_uuid, {**rep, **updates})
+        logger.info("Updated Keycloak client '%s': redirect URIs now %s",
+                    KEYCLOAK_CLIENT_ID, uris)
+    return client_uuid
+
+
 def setup_keycloak() -> str:
     """
     Ensure the realm's auth flow, default user, and client secret exist.
@@ -130,7 +207,7 @@ def setup_keycloak() -> str:
     default_password = os.environ.get("DEFAULT_USER_PASSWORD", "change-me")
     create_keycloak_user(admin, "user", default_password, "users")
 
-    client_uuid     = admin.get_client_id(KEYCLOAK_CLIENT_ID)
+    client_uuid     = ensure_keycloak_client(admin)
     existing_secret = admin.get_client_secrets(client_uuid)
     secret_value    = existing_secret.get("value")
     if secret_value is None:

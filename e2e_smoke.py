@@ -47,8 +47,19 @@ class _MockIdP(BaseHTTPRequestHandler):
             self._send(200, {"type": "secret", "value": "kc-live-secret"})
         elif "/clients" in p and "clientId=" in p:
             self._send(200, [{"id": "client-uuid-1", "clientId": "Hello-World-app"}])
+        elif "/clients/client-uuid-1" in p:
+            # The client representation ensure_keycloak_client reads/updates.
+            self._send(200, {"id": "client-uuid-1", "clientId": "Hello-World-app",
+                             "standardFlowEnabled": True,
+                             "redirectUris": ["http://localhost:8000/callback",
+                                              "http://localhost:8000/*"]})
         else:
             self._send(200, [])
+
+    def do_PUT(self):
+        # ensure_keycloak_client may update the client representation.
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self._send(204, {})
 
     def do_POST(self):
         p = self.path
