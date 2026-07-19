@@ -250,11 +250,95 @@ def set_app_id_token_alg(domain: str, m2m_id: str, m2m_secret: str,
     return (r.json().get("jwt_configuration") or {}).get("alg", "?")
 
 
+def enable_and_fetch_events(kc_url: str, realm: str, token: str,
+                            timeout: int = 10) -> list[dict]:
+    """
+    Turn on Keycloak event logging for the realm (if off) and return recent
+    error events. Every failed brokered login records an event with the exact
+    error code (e.g. 'identity_provider_login_failure',
+    'invalid_token'/'user_info_error'), independent of console log levels — so
+    this is the reliable way to see WHY the callback failed.
+    """
+    headers = {"authorization": f"Bearer {token}",
+               "content-type": "application/json"}
+    base = None
+    for prefix in ("/admin/realms", "/auth/admin/realms"):
+        probe = requests.get(f"{kc_url}{prefix}/{realm}/events/config",
+                             headers=headers, timeout=timeout)
+        if probe.status_code == 404:
+            continue
+        probe.raise_for_status()
+        base = f"{kc_url}{prefix}/{realm}"
+        cfg = probe.json()
+        break
+    if base is None:
+        return []
+    # Ensure error events are being saved.
+    if not cfg.get("eventsEnabled"):
+        new = {**cfg, "eventsEnabled": True,
+               "enabledEventTypes": cfg.get("enabledEventTypes") or []}
+        requests.put(f"{base}/events/config", headers=headers, json=new,
+                     timeout=timeout)
+        # Nothing captured yet — tell the caller to reproduce and re-run.
+        return [{"_note": "events were OFF — now enabled. Reproduce the login "
+                          "and run this again to capture the error."}]
+    r = requests.get(f"{base}/events", headers=headers,
+                     params={"type": "IDENTITY_PROVIDER_LOGIN_ERROR", "max": 5},
+                     timeout=timeout)
+    r.raise_for_status()
+    events = r.json()
+    if not events:
+        # Fall back to all recent error events.
+        r2 = requests.get(f"{base}/events", headers=headers,
+                          params={"max": 10}, timeout=timeout)
+        if r2.ok:
+            events = [e for e in r2.json() if "ERROR" in e.get("type", "")]
+    return events
+
+
+def explain_login_error(error: str, details: dict) -> str:
+    """
+    Map a Keycloak IDENTITY_PROVIDER_LOGIN_ERROR event to a concrete cause and
+    fix. `error` is the event's 'error' field; `details` its 'details' dict.
+    """
+    ipe = (details or {}).get("identity_provider_error")
+    if ipe:
+        # A provider-side error means the token exchange / signature failed.
+        if "signature" in ipe.lower() or "token" in ipe.lower():
+            return (f"Provider error '{ipe}' — the ID token failed validation. "
+                    "This is the RS256/signature or issuer problem: set the Auth0 "
+                    "app's JsonWebToken Signature Algorithm to RS256 (--fix-alg), "
+                    "and confirm the IdP issuer matches Auth0's exactly.")
+        if "client" in ipe.lower():
+            return (f"Provider error '{ipe}' — Auth0 rejected Keycloak's client "
+                    "credentials. Push the IdP app's own secret with "
+                    "--set-idp-secret.")
+        return f"Provider-side error: {ipe}"
+    if error == "identity_provider_login_failure":
+        # No provider error => token exchange SUCCEEDED; failure is post-login.
+        return (
+            "Token exchange and signature validation SUCCEEDED (no provider "
+            "error recorded). The failure is in Keycloak's FIRST BROKER LOGIN "
+            "step — it received a valid token but could not create/link a local "
+            "user. Almost always this means the Auth0 profile returned NO EMAIL "
+            "(or no username) claim. Fixes:\n"
+            "      1. In Keycloak: realm -> Identity Providers -> auth0 -> "
+            "Mappers -> add an 'Attribute Importer' mapping the Auth0 claim "
+            "'email' to the Keycloak user attribute 'email' (and 'name'->username).\n"
+            "      2. Ensure the Auth0 login actually returns email: the user/"
+            "connection must have an email, and scope must include 'email' "
+            "(the IdP defaultScope already does).\n"
+            "      3. Or set the IdP 'trustEmail' = ON and first-login flow to "
+            "not require a verified email, if emails are unverified.")
+    return f"Keycloak login error '{error}'. Details: {details}"
+
+
 def main() -> int:
     c = _cfg()
     fix = "--fix-secret" in sys.argv
     dump = "--dump" in sys.argv
     fix_alg = "--fix-alg" in sys.argv
+    events = "--events" in sys.argv
     set_secret = None
     if "--set-idp-secret" in sys.argv:
         i = sys.argv.index("--set-idp-secret")
@@ -436,6 +520,27 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"✗ {exc}")
             return 1
+
+    if events:
+        print("\n--- Recent Keycloak login-error events ---")
+        try:
+            evs = enable_and_fetch_events(c["kc_url"], c["realm"], token)
+        except Exception as exc:  # noqa: BLE001
+            print(f"could not read events: {exc}")
+            evs = []
+        if not evs:
+            print("(no error events found — reproduce the login, then re-run "
+                  "with --events)")
+        for e in evs:
+            if e.get("_note"):
+                print("NOTE: " + e["_note"])
+                continue
+            print(f"  type={e.get('type')}  error={e.get('error')}  "
+                  f"client={e.get('clientId')}  idp={(e.get('details') or {}).get('identity_provider')}")
+            det = e.get("details") or {}
+            if det:
+                print(f"    details: {det}")
+            print("    → " + explain_login_error(e.get("error", ""), det))
 
     if dump:
         import json as _json

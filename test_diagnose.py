@@ -203,3 +203,65 @@ def test_set_app_id_token_alg_403_names_scope():
                   json={}, status=403)
     with pytest.raises(RuntimeError, match="update:clients"):
         diagnose_idp.set_app_id_token_alg(DOMAIN, "m2m", "sec", "app-1")
+
+
+# ── enable_and_fetch_events ─────────────────────────────────────────────────
+@responses.activate
+def test_events_enables_when_off():
+    cfg_url = f"{KC}/admin/realms/Premkey/events/config"
+    responses.add(responses.GET, cfg_url,
+                  json={"eventsEnabled": False, "enabledEventTypes": []}, status=200)
+    responses.add(responses.PUT, cfg_url, status=204)
+    out = diagnose_idp.enable_and_fetch_events(KC, "Premkey", "tok")
+    assert out and "_note" in out[0]   # tells caller to reproduce + re-run
+    assert any(c.request.method == "PUT" for c in responses.calls)
+
+@responses.activate
+def test_events_returns_idp_errors():
+    cfg_url = f"{KC}/admin/realms/Premkey/events/config"
+    responses.add(responses.GET, cfg_url, json={"eventsEnabled": True}, status=200)
+    responses.add(responses.GET, f"{KC}/admin/realms/Premkey/events",
+                  json=[{"type": "IDENTITY_PROVIDER_LOGIN_ERROR",
+                         "error": "invalid_token",
+                         "details": {"identity_provider": "auth0"}}], status=200)
+    out = diagnose_idp.enable_and_fetch_events(KC, "Premkey", "tok")
+    assert out[0]["error"] == "invalid_token"
+
+@responses.activate
+def test_events_falls_back_to_all_errors():
+    cfg_url = f"{KC}/admin/realms/Premkey/events/config"
+    responses.add(responses.GET, cfg_url, json={"eventsEnabled": True}, status=200)
+    # No IDENTITY_PROVIDER_LOGIN_ERROR events...
+    responses.add(responses.GET, f"{KC}/admin/realms/Premkey/events",
+                  json=[], status=200)
+    # ...fallback pulls recent, filters for ERROR
+    responses.add(responses.GET, f"{KC}/admin/realms/Premkey/events",
+                  json=[{"type": "LOGIN_ERROR", "error": "user_not_found"},
+                        {"type": "LOGIN", "error": None}], status=200)
+    out = diagnose_idp.enable_and_fetch_events(KC, "Premkey", "tok")
+    assert len(out) == 1 and out[0]["error"] == "user_not_found"
+
+
+# ── explain_login_error: map event error codes to causes ────────────────────
+def test_explain_first_broker_login_failure():
+    # The user's actual event: no provider error -> post-login mapping failure.
+    msg = diagnose_idp.explain_login_error(
+        "identity_provider_login_failure", {"code_id": "abc"})
+    assert "FIRST BROKER LOGIN" in msg
+    assert "EMAIL" in msg
+
+def test_explain_signature_provider_error():
+    msg = diagnose_idp.explain_login_error(
+        "identity_provider_login_failure",
+        {"identity_provider_error": "Signature validation failed"})
+    assert "RS256" in msg
+
+def test_explain_client_provider_error():
+    msg = diagnose_idp.explain_login_error(
+        "identity_provider_login_failure",
+        {"identity_provider_error": "invalid_client"})
+    assert "--set-idp-secret" in msg
+
+def test_explain_unknown_error():
+    msg = diagnose_idp.explain_login_error("some_other_error", {"x": 1})
+    assert "some_other_error" in msg
