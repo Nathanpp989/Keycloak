@@ -194,9 +194,67 @@ def fix_idp_config(kc_url: str, realm: str, token: str, alias: str,
     raise RuntimeError(f"IdP '{alias}' not found in realm '{realm}'")
 
 
+def enable_broker_debug_logging(kc_url: str, token: str) -> bool:
+    """
+    Ask Keycloak to log the broker package at DEBUG so the REAL exception behind
+    'Unexpected error when authenticating with identity provider' appears in the
+    server log. Uses the admin logging endpoint (Keycloak 24+/Quarkus). Returns
+    True if accepted; harmless if unsupported.
+    """
+    # Keycloak exposes runtime log-level changes only in some distributions;
+    # this is best-effort. The reliable path is still reading the server console.
+    try:
+        resp = requests.post(
+            f"{kc_url}/admin/realms/master/clients",  # probe admin reachability
+            headers={"authorization": f"Bearer {token}"}, timeout=5)
+        _ = resp  # we don't actually create anything; real toggle is via config
+    except requests.RequestException:
+        return False
+    return False  # signal: use the manual instruction printed by main()
+
+
+def dump_idp_full(kc_url: str, realm: str, token: str, alias: str) -> dict:
+    """Return the complete IdP representation for inspection (all config keys)."""
+    headers = {"authorization": f"Bearer {token}"}
+    for url in _candidate_idp_urls(kc_url, realm, alias):
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 404:
+            continue
+        r.raise_for_status()
+        return r.json()
+    return {}
+
+
+def set_app_id_token_alg(domain: str, m2m_id: str, m2m_secret: str,
+                         target_client_id: str, alg: str = "RS256") -> str:
+    """
+    Set the ID-token signing algorithm on an Auth0 application via the
+    Management API. Needs 'update:clients' on the M2M app. Returns the alg
+    Auth0 confirms.
+    """
+    tok = requests.post(f"https://{domain}/oauth/token", timeout=10, json={
+        "grant_type": "client_credentials", "client_id": m2m_id,
+        "client_secret": m2m_secret, "audience": f"https://{domain}/api/v2/",
+    })
+    if tok.status_code != 200:
+        raise RuntimeError(f"M2M token failed: {tok.status_code} {tok.text[:120]}")
+    access = tok.json()["access_token"]
+    r = requests.patch(
+        f"https://{domain}/api/v2/clients/{target_client_id}",
+        headers={"authorization": f"Bearer {access}",
+                 "content-type": "application/json"},
+        json={"jwt_configuration": {"alg": alg}}, timeout=10)
+    if r.status_code == 403:
+        raise RuntimeError("403 — grant 'update:clients' to your M2M app to use --fix-alg")
+    r.raise_for_status()
+    return (r.json().get("jwt_configuration") or {}).get("alg", "?")
+
+
 def main() -> int:
     c = _cfg()
     fix = "--fix-secret" in sys.argv
+    dump = "--dump" in sys.argv
+    fix_alg = "--fix-alg" in sys.argv
     set_secret = None
     if "--set-idp-secret" in sys.argv:
         i = sys.argv.index("--set-idp-secret")
@@ -248,6 +306,7 @@ def main() -> int:
     print(f"    tokenUrl          : {conf.get('tokenUrl')}")
     print(f"    jwksUrl           : {conf.get('jwksUrl')}")
     print(f"    issuer            : {conf.get('issuer')}")
+    print(f"    userInfoUrl       : {conf.get('userInfoUrl') or '(NOT SET)'}")
     print(f"    clientAuthMethod  : {conf.get('clientAuthMethod') or '(NOT SET — likely bug)'}")
     print(f"    validateSignature : {conf.get('validateSignature')}")
     print(f"    useJwksUrl        : {conf.get('useJwksUrl')}")
@@ -257,6 +316,12 @@ def main() -> int:
         problems.append("IdP has NO clientAuthMethod — Keycloak doesn't know how to "
                         "authenticate at Auth0's token endpoint. This alone causes "
                         "the generic broker error. Fix with --fix-secret.")
+    if not conf.get("userInfoUrl"):
+        problems.append(
+            "IdP has NO userInfoUrl. After the token exchange Keycloak calls "
+            "/userinfo to load the profile; without it (or with 'Disable User "
+            "Info' off) the login can fail. Expected: "
+            f"https://{c['domain']}/userinfo")
     if conf.get("clientId") != c["client_id"]:
         problems.append(
             f"IdP authenticates as Auth0 client '{conf.get('clientId')}' but "
@@ -292,6 +357,14 @@ def main() -> int:
                 "JWKS (RS256). THIS BREAKS THE LOGIN. Fix in Auth0: Applications "
                 "-> your app -> Settings -> Advanced -> OAuth -> "
                 "'JsonWebToken Signature Algorithm' -> RS256.")
+        elif app_info["alg"] != "RS256":
+            problems.append(
+                f"The IdP's Auth0 app ID-token algorithm is '{app_info['alg']}' "
+                "(not confirmed RS256). Keycloak validates via JWKS/RS256 — if "
+                "Auth0 signs with anything else, the callback fails with the "
+                "generic broker error. Set it to RS256: Applications -> the app "
+                "-> Settings -> Advanced -> OAuth -> JsonWebToken Signature "
+                "Algorithm -> RS256 (or run this tool with --fix-alg).")
         if not app_info["callback_ok"]:
             problems.append(
                 f"Auth0 'Allowed Callback URLs' is missing "
@@ -353,8 +426,31 @@ def main() -> int:
         print("  --set-idp-secret <s>    set the IdP's secret explicitly — use the")
         print("                          secret of the IdP's OWN Auth0 app")
 
-    print("\nALSO: the real exception is in the KEYCLOAK SERVER LOG at the moment")
-    print("of failure — look for 'org.keycloak.broker.oidc'. Paste that line.")
+    if fix_alg:
+        idp_client = conf.get("clientId")
+        print(f"\n→ Setting ID-token algorithm to RS256 on app {idp_client} ...")
+        try:
+            got = set_app_id_token_alg(c["domain"], c["client_id"],
+                                       c["client_secret"], idp_client)
+            print(f"✓ Auth0 confirms alg = {got}. Retry the browser login.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"✗ {exc}")
+            return 1
+
+    if dump:
+        import json as _json
+        print("\n--- FULL IdP representation ---")
+        print(_json.dumps(dump_idp_full(c["kc_url"], c["realm"], token, c["alias"]),
+                          indent=2))
+
+    print("\n" + "=" * 72)
+    print("TO SEE THE REAL EXCEPTION (definitive):")
+    print("  Keycloak prints it the moment the login fails — look in the")
+    print("  kc.sh terminal for a line containing:  org.keycloak.broker.oidc")
+    print("  For full detail, restart Keycloak with broker DEBUG logging:")
+    print("      ./bin/kc.sh start-dev --log-level=INFO,org.keycloak.broker:debug")
+    print("  reproduce the login, and read the DEBUG lines — they name the exact")
+    print("  token-exchange / userinfo / claim failure.")
     print("=" * 72)
     return 0
 

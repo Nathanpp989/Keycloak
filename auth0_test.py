@@ -349,6 +349,11 @@ def test_auth0_create_client_refetches_secret_when_existing():
     a = Auth0Connect(DOMAIN, "cid", "sec")
     result = a.create_client("my-app", ["http://localhost/cb"])
     assert result["client_secret"] == "real-sec"
+    # The single-client GET must explicitly request the secret field, or Auth0
+    # may omit it depending on tenant/token config.
+    single = [c for c in responses.calls
+              if c.request.url.startswith(f"https://{DOMAIN}/api/v2/clients/exist-id")][0]
+    assert "client_secret" in single.request.url  # fields=...client_secret...
     # And it must NOT have POSTed a new client
     assert not any(c.request.method == "POST" and c.request.url.endswith("/api/v2/clients")
                    for c in responses.calls)
@@ -2337,3 +2342,27 @@ def test_diagnose_redirect_uri_flow_disabled():
     d = diagnose_redirect_uri(KC, "Premkey", "tok", "app",
                               "http://localhost:8000/callback")
     assert "Standard Flow" in d["verdict"]
+
+
+def test_create_client_forces_rs256_and_auth_method():
+    # Regression: the browser-login app MUST be created with RS256 ID-token
+    # signing (Keycloak validates via JWKS/RS256) — an HS256 default breaks the
+    # broker callback with the generic "Unexpected error" message.
+    import responses as rsp
+    @rsp.activate
+    def run():
+        conn = Auth0Connect(DOMAIN, "cid", "sec")
+        rsp.add(rsp.POST, f"https://{DOMAIN}/oauth/token",
+                json={"access_token": "t", "expires_in": 999}, status=200)
+        rsp.add(rsp.GET, f"https://{DOMAIN}/api/v2/clients",
+                json=[], status=200)   # not existing -> POST path
+        rsp.add(rsp.POST, f"https://{DOMAIN}/api/v2/clients",
+                json={"client_id": "new", "client_secret": "s"}, status=201)
+        conn.create_client("keycloak-oidc-client",
+                           callbacks=["http://kc/broker"])
+        post = [c for c in rsp.calls if c.request.method == "POST"
+                and c.request.url.endswith("/clients")][0]
+        body = json.loads(post.request.body)
+        assert body["jwt_configuration"]["alg"] == "RS256"
+        assert body["token_endpoint_auth_method"] == "client_secret_post"
+    run()

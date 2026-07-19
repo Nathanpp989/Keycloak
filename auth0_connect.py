@@ -131,14 +131,27 @@ class Auth0Connect:
         if existing:
             logger.info("Client '%s' already exists; reusing it", name)
             client_id = existing.get("client_id")
-            # Re-fetch the single client to obtain its client_secret
-            full = self._api("GET", f"clients/{client_id}")
+            # Re-fetch the single client to obtain its client_secret. Request the
+            # field explicitly: without include_fields the secret can be omitted
+            # depending on tenant/token config, which would send an empty secret
+            # to Keycloak and break brokered login.
+            full = self._api("GET", f"clients/{client_id}", params={
+                "fields": "client_id,client_secret,name,app_type,callbacks",
+                "include_fields": "true",
+            })
             return full if isinstance(full, dict) else existing
         return self._api("POST", "clients", json={
             "name":        name,
             "app_type":    "regular_web",
             "grant_types": ["authorization_code", "refresh_token"],
             "callbacks":   callbacks,
+            # Keycloak's IdP validates the ID token against Auth0's RS256 JWKS
+            # (validateSignature + useJwksUrl). Force RS256 signing here so the
+            # broker callback can validate the token; leaving Auth0's default
+            # (which may be HS256) causes "Unexpected error when authenticating
+            # with identity provider" at the callback.
+            "jwt_configuration": {"alg": "RS256"},
+            "token_endpoint_auth_method": "client_secret_post",
         })
 
     def rotate_client_secret(self, client_id: str) -> str:
