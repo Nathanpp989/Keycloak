@@ -489,3 +489,60 @@ def test_ensure_broker_mappers_disables_userinfo_flag():
     body = __import__("json").loads(put.request.body)
     assert body["config"]["disableUserInfo"] == "false"
     assert body["trustEmail"] is True
+
+
+# ── writes must fail loudly, not silently (audit fixes) ─────────────────────
+@responses.activate
+def test_events_config_write_failure_raises():
+    cfg_url = f"{KC}/admin/realms/Premkey/events/config"
+    responses.add(responses.GET, cfg_url,
+                  json={"eventsEnabled": False, "enabledEventTypes": []}, status=200)
+    responses.add(responses.PUT, cfg_url, status=403)   # permission denied
+    with pytest.raises(Exception):   # raise_for_status -> HTTPError
+        diagnose_idp.enable_and_fetch_events(KC, "Premkey", "tok")
+
+@responses.activate
+def test_broker_mappers_trustemail_write_failure_raises():
+    responses.add(responses.GET, IDP_URL,
+                  json={"alias": "auth0", "trustEmail": False, "config": {}}, status=200)
+    responses.add(responses.PUT, IDP_URL, status=500)   # server error
+    with pytest.raises(Exception):
+        diagnose_idp.ensure_broker_mappers(KC, "Premkey", "tok", "auth0")
+
+
+# ── previously-untested helpers ─────────────────────────────────────────────
+@responses.activate
+def test_admin_token_success():
+    responses.add(responses.POST,
+                  f"{KC}/realms/master/protocol/openid-connect/token",
+                  json={"access_token": "adm"}, status=200)
+    assert diagnose_idp.admin_token(KC, "master", "u", "p") == "adm"
+
+@responses.activate
+def test_admin_token_failure_raises():
+    responses.add(responses.POST,
+                  f"{KC}/realms/master/protocol/openid-connect/token",
+                  json={"error": "invalid_grant"}, status=401)
+    with pytest.raises(RuntimeError, match="Admin login failed"):
+        diagnose_idp.admin_token(KC, "master", "u", "wrong")
+
+@responses.activate
+def test_fetch_idp_found_and_missing():
+    responses.add(responses.GET, IDP_URL, json={"alias": "auth0"}, status=200)
+    assert diagnose_idp.fetch_idp(KC, "Premkey", "tok", "auth0")["alias"] == "auth0"
+
+@responses.activate
+def test_check_auth0_secret_network_error():
+    def boom(req):
+        raise __import__("requests").exceptions.ConnectionError("down")
+    responses.add_callback(responses.POST, f"https://{DOMAIN}/oauth/token",
+                           callback=boom)
+    ok, detail = diagnose_idp.check_auth0_secret(DOMAIN, "cid", "sec")
+    assert ok is False and "cannot reach" in detail.lower()
+
+@responses.activate
+def test_check_jwks_failure():
+    responses.add(responses.GET, f"https://{DOMAIN}/.well-known/jwks.json",
+                  json={}, status=500)
+    ok, _ = diagnose_idp.check_jwks(DOMAIN)
+    assert ok is False

@@ -277,8 +277,9 @@ def enable_and_fetch_events(kc_url: str, realm: str, token: str,
     if not cfg.get("eventsEnabled"):
         new = {**cfg, "eventsEnabled": True,
                "enabledEventTypes": cfg.get("enabledEventTypes") or []}
-        requests.put(f"{base}/events/config", headers=headers, json=new,
-                     timeout=timeout)
+        pr = requests.put(f"{base}/events/config", headers=headers, json=new,
+                          timeout=timeout)
+        pr.raise_for_status()
         # Nothing captured yet — tell the caller to reproduce and re-run.
         return [{"_note": "events were OFF — now enabled. Reproduce the login "
                           "and run this again to capture the error."}]
@@ -380,9 +381,10 @@ def ensure_broker_mappers(kc_url: str, realm: str, token: str, alias: str,
                    or str(idp_cfg.get("disableUserInfo")).lower() == "true")
     if need_update:
         idp_cfg["disableUserInfo"] = "false"
-        requests.put(base, headers=headers,
-                     json={**idp_rep, "trustEmail": True, "config": idp_cfg},
-                     timeout=timeout)
+        ur = requests.put(base, headers=headers,
+                          json={**idp_rep, "trustEmail": True, "config": idp_cfg},
+                          timeout=timeout)
+        ur.raise_for_status()
 
     # 2. Add or CORRECT mappers. Matching only by name is not enough: a
     #    pre-existing mapper with the right name but wrong config would silently
