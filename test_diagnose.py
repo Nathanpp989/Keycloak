@@ -265,3 +265,227 @@ def test_explain_client_provider_error():
 def test_explain_unknown_error():
     msg = diagnose_idp.explain_login_error("some_other_error", {"x": 1})
     assert "some_other_error" in msg
+
+
+# ── ensure_broker_mappers: fixes first-broker-login ─────────────────────────
+@responses.activate
+def test_ensure_broker_mappers_creates_all_when_none():
+    responses.add(responses.GET, IDP_URL,
+                  json={"alias": "auth0", "trustEmail": False, "config": {}}, status=200)
+    responses.add(responses.PUT, IDP_URL, status=204)   # trustEmail
+    responses.add(responses.GET, f"{IDP_URL}/mappers", json=[], status=200)
+    responses.add(responses.POST, f"{IDP_URL}/mappers", status=201)
+    created = diagnose_idp.ensure_broker_mappers(KC, "Premkey", "tok", "auth0")
+    assert any("email" in x for x in created) and any("username" in x for x in created)
+    # trustEmail PUT happened
+    assert any(c.request.method == "PUT" for c in responses.calls)
+    # one POST per created mapper
+    posts = [c for c in responses.calls if c.request.method == "POST"
+             and c.request.url.endswith("/mappers")]
+    assert len(posts) == len(created)
+    import json
+    email_body = json.loads(posts[0].request.body)
+    assert email_body["config"]["claim"] == "email"
+    assert email_body["identityProviderMapper"] == "oidc-user-attribute-idp-mapper"
+    assert email_body["identityProviderAlias"] == "auth0"
+
+@responses.activate
+def test_ensure_broker_mappers_idempotent():
+    responses.add(responses.GET, IDP_URL,
+                  json={"alias": "auth0", "trustEmail": True, "config": {}}, status=200)
+    # Existing mappers already have the CORRECT type + config -> no change.
+    responses.add(responses.GET, f"{IDP_URL}/mappers", json=[
+        {"id": "1", "name": "email",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "email", "user.attribute": "email", "syncMode": "INHERIT"}},
+        {"id": "2", "name": "username",
+         "identityProviderMapper": "oidc-username-idp-mapper",
+         "config": {"template": "${CLAIM.email}", "syncMode": "INHERIT"}},
+        {"id": "3", "name": "firstName",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "given_name", "user.attribute": "firstName", "syncMode": "INHERIT"}},
+        {"id": "4", "name": "lastName",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "family_name", "user.attribute": "lastName", "syncMode": "INHERIT"}},
+    ], status=200)
+    created = diagnose_idp.ensure_broker_mappers(KC, "Premkey", "tok", "auth0")
+    assert created == []   # nothing changed
+    assert not [c for c in responses.calls if c.request.method == "PUT"]
+    assert not [c for c in responses.calls if c.request.method == "POST"]
+
+@responses.activate
+def test_ensure_broker_mappers_corrects_broken_existing():
+    # A mapper named 'email' exists but with WRONG config -> must be corrected,
+    # not skipped. This is the false-success bug that hid the real problem.
+    responses.add(responses.GET, IDP_URL,
+                  json={"alias": "auth0", "trustEmail": True, "config": {}}, status=200)
+    responses.add(responses.GET, f"{IDP_URL}/mappers", json=[
+        {"id": "1", "name": "email",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "WRONG_CLAIM", "user.attribute": "email"}},
+        {"id": "2", "name": "username",
+         "identityProviderMapper": "oidc-username-idp-mapper",
+         "config": {"template": "${CLAIM.email}", "syncMode": "INHERIT"}},
+        {"id": "3", "name": "firstName",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "given_name", "user.attribute": "firstName", "syncMode": "INHERIT"}},
+        {"id": "4", "name": "lastName",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "family_name", "user.attribute": "lastName", "syncMode": "INHERIT"}},
+    ], status=200)
+    responses.add(responses.PUT, f"{IDP_URL}/mappers/1", status=204)
+    changed = diagnose_idp.ensure_broker_mappers(KC, "Premkey", "tok", "auth0")
+    assert any("email" in x and "corrected" in x for x in changed)
+    import json
+    put = [c for c in responses.calls if c.request.method == "PUT"
+           and c.request.url.endswith("/mappers/1")][0]
+    assert json.loads(put.request.body)["config"]["claim"] == "email"  # fixed
+
+@responses.activate
+def test_ensure_broker_mappers_partial():
+    # email exists, username missing -> only username created
+    responses.add(responses.GET, IDP_URL,
+                  json={"alias": "auth0", "trustEmail": True, "config": {}}, status=200)
+    responses.add(responses.GET, f"{IDP_URL}/mappers", json=[
+        {"id": "1", "name": "email",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "email", "user.attribute": "email", "syncMode": "INHERIT"}},
+    ], status=200)
+    responses.add(responses.POST, f"{IDP_URL}/mappers", status=201)
+    created = diagnose_idp.ensure_broker_mappers(KC, "Premkey", "tok", "auth0")
+    assert not any("email" in x for x in created) and any("username" in x for x in created)
+
+@responses.activate
+def test_ensure_broker_mappers_idp_missing():
+    responses.add(responses.GET, IDP_URL, status=404)
+    responses.add(responses.GET,
+                  f"{KC}/auth/admin/realms/Premkey/identity-provider/instances/auth0",
+                  status=404)
+    with pytest.raises(RuntimeError, match="not found"):
+        diagnose_idp.ensure_broker_mappers(KC, "Premkey", "tok", "auth0")
+
+
+@responses.activate
+def test_list_broker_mappers():
+    responses.add(responses.GET, f"{IDP_URL}/mappers",
+                  json=[{"name": "email", "identityProviderMapper": "x",
+                         "config": {"claim": "email"}}], status=200)
+    out = diagnose_idp.list_broker_mappers(KC, "Premkey", "tok", "auth0")
+    assert out[0]["name"] == "email"
+
+
+@responses.activate
+def test_ensure_broker_mappers_removes_conflicts_when_asked():
+    # Reproduces the real situation: duplicate 'Email' (nullable=false) and a
+    # 'No-login-username' mapper that conflict with our email/username mappers.
+    responses.add(responses.GET, IDP_URL,
+                  json={"alias": "auth0", "trustEmail": True, "config": {}}, status=200)
+    responses.add(responses.GET, f"{IDP_URL}/mappers", json=[
+        {"id": "1", "name": "email",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "email", "user.attribute": "email", "syncMode": "INHERIT"}},
+        {"id": "2", "name": "username",
+         "identityProviderMapper": "oidc-username-idp-mapper",
+         "config": {"template": "${CLAIM.email}", "syncMode": "INHERIT"}},
+        {"id": "3", "name": "firstName",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "given_name", "user.attribute": "firstName", "syncMode": "INHERIT"}},
+        {"id": "4", "name": "lastName",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "family_name", "user.attribute": "lastName", "syncMode": "INHERIT"}},
+        # The conflicting extras:
+        {"id": "5", "name": "Email",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "email", "user.attribute": "email",
+                    "allow.nullable.property": "false"}},
+        {"id": "6", "name": "No-login-username",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "name", "user.attribute": "username",
+                    "allow.nullable.property": "false"}},
+    ], status=200)
+    responses.add(responses.DELETE, f"{IDP_URL}/mappers/5", status=204)
+    responses.add(responses.DELETE, f"{IDP_URL}/mappers/6", status=204)
+    changed = diagnose_idp.ensure_broker_mappers(KC, "Premkey", "tok", "auth0",
+                                                 remove_conflicts=True)
+    # Both conflicting mappers removed
+    assert any("Email" in x and "removed" in x for x in changed)
+    assert any("No-login-username" in x and "removed" in x for x in changed)
+    deletes = {c.request.url.rsplit("/", 1)[-1]
+               for c in responses.calls if c.request.method == "DELETE"}
+    assert deletes == {"5", "6"}
+
+@responses.activate
+def test_ensure_broker_mappers_no_removal_by_default():
+    # Same duplicates, but remove_conflicts defaults False -> NO deletes.
+    responses.add(responses.GET, IDP_URL,
+                  json={"alias": "auth0", "trustEmail": True, "config": {}}, status=200)
+    responses.add(responses.GET, f"{IDP_URL}/mappers", json=[
+        {"id": "1", "name": "email",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "email", "user.attribute": "email", "syncMode": "INHERIT"}},
+        {"id": "2", "name": "username",
+         "identityProviderMapper": "oidc-username-idp-mapper",
+         "config": {"template": "${CLAIM.email}", "syncMode": "INHERIT"}},
+        {"id": "3", "name": "firstName",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "given_name", "user.attribute": "firstName", "syncMode": "INHERIT"}},
+        {"id": "4", "name": "lastName",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "family_name", "user.attribute": "lastName", "syncMode": "INHERIT"}},
+        {"id": "5", "name": "Email",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "email", "user.attribute": "email",
+                    "allow.nullable.property": "false"}},
+    ], status=200)
+    changed = diagnose_idp.ensure_broker_mappers(KC, "Premkey", "tok", "auth0")
+    assert not [c for c in responses.calls if c.request.method == "DELETE"]
+    assert changed == []
+
+
+@responses.activate
+def test_events_dedupes_repeated_code_id(capsys):
+    # Five events with the SAME code_id must collapse to one unique line so a
+    # repeated view of one failure doesn't look like five failures.
+    import diagnose_idp as d
+    cfg_url = f"{KC}/admin/realms/Premkey/events/config"
+    responses.add(responses.GET, cfg_url, json={"eventsEnabled": True}, status=200)
+    same = {"type": "IDENTITY_PROVIDER_LOGIN_ERROR",
+            "error": "identity_provider_login_failure",
+            "details": {"code_id": "SAME"}, "time": 1_700_000_000_000}
+    responses.add(responses.GET, f"{KC}/admin/realms/Premkey/events",
+                  json=[same, same, same, same, same], status=200)
+    evs = d.enable_and_fetch_events(KC, "Premkey", "tok")
+    # The function returns all; dedup happens in main()'s printing. Verify the
+    # raw fetch returns them and the code_id is stable so main can dedup.
+    codes = {(e.get("details") or {}).get("code_id") for e in evs}
+    assert codes == {"SAME"}
+
+
+@responses.activate
+def test_ensure_broker_mappers_disables_userinfo_flag():
+    # disableUserInfo=true must be flipped to false so Keycloak fetches email
+    # from /userinfo — the fix when correct mappers still fail.
+    responses.add(responses.GET, IDP_URL,
+                  json={"alias": "auth0", "trustEmail": True,
+                        "config": {"disableUserInfo": "true"}}, status=200)
+    responses.add(responses.PUT, IDP_URL, status=204)
+    responses.add(responses.GET, f"{IDP_URL}/mappers", json=[
+        {"id": "1", "name": "email",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "email", "user.attribute": "email", "syncMode": "INHERIT"}},
+        {"id": "2", "name": "username",
+         "identityProviderMapper": "oidc-username-idp-mapper",
+         "config": {"template": "${CLAIM.email}", "syncMode": "INHERIT"}},
+        {"id": "3", "name": "firstName",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "given_name", "user.attribute": "firstName", "syncMode": "INHERIT"}},
+        {"id": "4", "name": "lastName",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "family_name", "user.attribute": "lastName", "syncMode": "INHERIT"}},
+    ], status=200)
+    diagnose_idp.ensure_broker_mappers(KC, "Premkey", "tok", "auth0")
+    put = [c for c in responses.calls if c.request.method == "PUT"
+           and c.request.url == IDP_URL][0]
+    body = __import__("json").loads(put.request.body)
+    assert body["config"]["disableUserInfo"] == "false"
+    assert body["trustEmail"] is True

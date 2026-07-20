@@ -333,12 +333,153 @@ def explain_login_error(error: str, details: dict) -> str:
     return f"Keycloak login error '{error}'. Details: {details}"
 
 
+def ensure_broker_mappers(kc_url: str, realm: str, token: str, alias: str,
+                          remove_conflicts: bool = False,
+                          timeout: int = 10) -> list[str]:
+    """
+    Fix Keycloak's first-broker-login 'identity_provider_login_failure' by
+    ensuring the IdP has the mappers needed to build a local user from the Auth0
+    token, and by trusting the email so an unverified address doesn't stall the
+    flow. Idempotent: existing mappers with the same name are corrected if their
+    config is wrong.
+
+    Adds/corrects, if needed:
+      - email      : oidc-user-attribute-idp-mapper  (claim 'email' -> user email)
+      - username   : oidc-username-idp-mapper         (username from email claim)
+      - first/last : oidc-user-attribute-idp-mapper  (given_name/family_name)
+    And sets the IdP's trustEmail=true.
+
+    If remove_conflicts=True, also DELETES other mappers that write the same
+    user attributes (e.g. a duplicate 'Email' mapper with
+    allow.nullable.property=false, which hard-fails when the claim is absent).
+    This is destructive, so it's opt-in.
+
+    Returns a list describing what changed.
+    """
+    headers = {"authorization": f"Bearer {token}",
+               "content-type": "application/json"}
+    # Resolve the working admin base + IdP url.
+    base = None
+    for prefix in ("/admin/realms", "/auth/admin/realms"):
+        idp_url = f"{kc_url}{prefix}/{realm}/identity-provider/instances/{alias}"
+        probe = requests.get(idp_url, headers=headers, timeout=timeout)
+        if probe.status_code == 404:
+            continue
+        probe.raise_for_status()
+        base = f"{kc_url}{prefix}/{realm}/identity-provider/instances/{alias}"
+        idp_rep = probe.json()
+        break
+    if base is None:
+        raise RuntimeError(f"IdP '{alias}' not found in realm '{realm}'")
+
+    # 1. trustEmail so unverified Auth0 emails don't block first login, and
+    #    disableUserInfo=false so Keycloak fetches email from /userinfo when the
+    #    ID token omits it (the likely cause when correct mappers still fail).
+    idp_cfg = dict(idp_rep.get("config") or {})
+    need_update = (not idp_rep.get("trustEmail")
+                   or str(idp_cfg.get("disableUserInfo")).lower() == "true")
+    if need_update:
+        idp_cfg["disableUserInfo"] = "false"
+        requests.put(base, headers=headers,
+                     json={**idp_rep, "trustEmail": True, "config": idp_cfg},
+                     timeout=timeout)
+
+    # 2. Add or CORRECT mappers. Matching only by name is not enough: a
+    #    pre-existing mapper with the right name but wrong config would silently
+    #    leave the bug in place. So we compare config and fix mismatches too.
+    existing = requests.get(f"{base}/mappers", headers=headers, timeout=timeout)
+    existing.raise_for_status()
+    by_name = {m.get("name"): m for m in existing.json()}
+
+    wanted = [
+        {"name": "email",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "email", "user.attribute": "email",
+                    "syncMode": "INHERIT"}},
+        {"name": "username",
+         "identityProviderMapper": "oidc-username-idp-mapper",
+         "config": {"template": "${CLAIM.email}", "syncMode": "INHERIT"}},
+        {"name": "firstName",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "given_name", "user.attribute": "firstName",
+                    "syncMode": "INHERIT"}},
+        {"name": "lastName",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "family_name", "user.attribute": "lastName",
+                    "syncMode": "INHERIT"}},
+    ]
+    changed = []
+    # Optionally remove CONFLICTING mappers: any *other* mapper that writes the
+    # same user.attribute as one of ours, or an extra username mapper. A
+    # duplicate mapper with allow.nullable.property=false aborts first-broker-
+    # login when its claim is absent — a common cause of the generic failure.
+    if remove_conflicts:
+        our_names = {m["name"] for m in wanted}
+        our_attrs = {m["config"].get("user.attribute") for m in wanted
+                     if m["config"].get("user.attribute")}
+        # Our 'username' mapper uses a template (no user.attribute), so add
+        # 'username' explicitly — otherwise a rogue attribute-mapper writing
+        # 'username' (like a 'No-login-username' mapper) wouldn't be caught.
+        our_attrs.add("username")
+        for existing_m in list(by_name.values()):
+            nm = existing_m.get("name")
+            if nm in our_names:
+                continue
+            cfg = existing_m.get("config") or {}
+            writes_attr = cfg.get("user.attribute") in our_attrs
+            is_username = (existing_m.get("identityProviderMapper")
+                           == "oidc-username-idp-mapper")
+            if writes_attr or is_username:
+                r = requests.delete(f"{base}/mappers/{existing_m['id']}",
+                                    headers=headers, timeout=timeout)
+                if r.status_code in (200, 204):
+                    changed.append(nm + " (removed: conflicting)")
+    for m in wanted:
+        cur = by_name.get(m["name"])
+        if cur is None:
+            body = {**m, "identityProviderAlias": alias}
+            r = requests.post(f"{base}/mappers", headers=headers, json=body,
+                              timeout=timeout)
+            r.raise_for_status()
+            changed.append(m["name"] + " (created)")
+            continue
+        # Exists — verify the important config keys match; fix if not.
+        cur_cfg = cur.get("config") or {}
+        wrong_type = cur.get("identityProviderMapper") != m["identityProviderMapper"]
+        wrong_cfg = any(cur_cfg.get(k) != v for k, v in m["config"].items())
+        if wrong_type or wrong_cfg:
+            fixed = {**cur, "identityProviderMapper": m["identityProviderMapper"],
+                     "config": {**cur_cfg, **m["config"]}}
+            r = requests.put(f"{base}/mappers/{cur['id']}", headers=headers,
+                             json=fixed, timeout=timeout)
+            r.raise_for_status()
+            changed.append(m["name"] + " (corrected)")
+    return changed
+
+
+def list_broker_mappers(kc_url: str, realm: str, token: str, alias: str,
+                        timeout: int = 10) -> list[dict]:
+    """Return the IdP's current mappers (name, type, config) for inspection."""
+    headers = {"authorization": f"Bearer {token}"}
+    for prefix in ("/admin/realms", "/auth/admin/realms"):
+        url = (f"{kc_url}{prefix}/{realm}/identity-provider/instances/"
+               f"{alias}/mappers")
+        r = requests.get(url, headers=headers, timeout=timeout)
+        if r.status_code == 404:
+            continue
+        r.raise_for_status()
+        return r.json()
+    return []
+
+
 def main() -> int:
     c = _cfg()
     fix = "--fix-secret" in sys.argv
     dump = "--dump" in sys.argv
     fix_alg = "--fix-alg" in sys.argv
     events = "--events" in sys.argv
+    fix_mappers = "--fix-mappers" in sys.argv
+    clean_mappers = "--fix-mappers-clean" in sys.argv
     set_secret = None
     if "--set-idp-secret" in sys.argv:
         i = sys.argv.index("--set-idp-secret")
@@ -392,6 +533,7 @@ def main() -> int:
     print(f"    issuer            : {conf.get('issuer')}")
     print(f"    userInfoUrl       : {conf.get('userInfoUrl') or '(NOT SET)'}")
     print(f"    clientAuthMethod  : {conf.get('clientAuthMethod') or '(NOT SET — likely bug)'}")
+    print(f"    disableUserInfo   : {conf.get('disableUserInfo', '(not set / false)')}")
     print(f"    validateSignature : {conf.get('validateSignature')}")
     print(f"    useJwksUrl        : {conf.get('useJwksUrl')}")
 
@@ -406,6 +548,13 @@ def main() -> int:
             "/userinfo to load the profile; without it (or with 'Disable User "
             "Info' off) the login can fail. Expected: "
             f"https://{c['domain']}/userinfo")
+    if str(conf.get("disableUserInfo")).lower() == "true":
+        problems.append(
+            "IdP has 'Disable User Info' = ON. Keycloak then relies only on the "
+            "ID token's claims — if Auth0 puts email in /userinfo but not the ID "
+            "token, Keycloak never sees it and first-broker-login fails. Turn it "
+            "OFF so Keycloak fetches the profile from /userinfo (--fix-mappers "
+            "now ensures this).")
     if conf.get("clientId") != c["client_id"]:
         problems.append(
             f"IdP authenticates as Auth0 client '{conf.get('clientId')}' but "
@@ -510,6 +659,33 @@ def main() -> int:
         print("  --set-idp-secret <s>    set the IdP's secret explicitly — use the")
         print("                          secret of the IdP's OWN Auth0 app")
 
+    if fix_mappers or clean_mappers:
+        if clean_mappers:
+            print("\n→ Ensuring mappers + REMOVING conflicting duplicates ...")
+        else:
+            print("\n→ Ensuring first-broker-login mappers + trustEmail on IdP ...")
+        try:
+            changed = ensure_broker_mappers(c["kc_url"], c["realm"], token,
+                                            c["alias"],
+                                            remove_conflicts=clean_mappers)
+            if changed:
+                print(f"✓ Mappers changed: {', '.join(changed)}. trustEmail ensured.")
+            else:
+                print("✓ Mappers already correct. trustEmail ensured.")
+            print("\n  Current IdP mappers:")
+            for m in list_broker_mappers(c["kc_url"], c["realm"], token, c["alias"]):
+                print(f"    - {m.get('name')}: type={m.get('identityProviderMapper')} "
+                      f"config={m.get('config')}")
+            if not clean_mappers:
+                print("\n  NOTE: if you see DUPLICATE mappers writing the same "
+                      "attribute (e.g. 'email' and 'Email'), one may have "
+                      "allow.nullable.property=false and abort the login. Re-run "
+                      "with --fix-mappers-clean to remove the conflicting extras.")
+            print("\n  Retry the browser login now.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"✗ {exc}")
+            return 1
+
     if fix_alg:
         idp_client = conf.get("clientId")
         print(f"\n→ Setting ID-token algorithm to RS256 on app {idp_client} ...")
@@ -531,16 +707,37 @@ def main() -> int:
         if not evs:
             print("(no error events found — reproduce the login, then re-run "
                   "with --events)")
+        # Dedupe by code_id so repeated views of the SAME failed login collapse
+        # into one line — otherwise five copies of one failure look like five
+        # failures and hide whether a NEW attempt happened.
+        seen_codes = set()
+        unique = []
         for e in evs:
+            code = (e.get("details") or {}).get("code_id")
+            key = code or id(e)
+            if key in seen_codes:
+                continue
+            seen_codes.add(key)
+            unique.append(e)
+        import datetime as _dt
+        for e in unique:
             if e.get("_note"):
                 print("NOTE: " + e["_note"])
                 continue
-            print(f"  type={e.get('type')}  error={e.get('error')}  "
-                  f"client={e.get('clientId')}  idp={(e.get('details') or {}).get('identity_provider')}")
+            ts = e.get("time")
+            when = ""
+            if isinstance(ts, (int, float)):
+                when = _dt.datetime.fromtimestamp(ts / 1000).strftime("%H:%M:%S")
             det = e.get("details") or {}
-            if det:
-                print(f"    details: {det}")
+            print(f"  [{when}] type={e.get('type')}  error={e.get('error')}  "
+                  f"code_id={det.get('code_id')}")
             print("    → " + explain_login_error(e.get("error", ""), det))
+        if len(evs) > len(unique):
+            print(f"\n  ({len(evs)} events collapsed to {len(unique)} unique by "
+                  "code_id — repeated lines were the SAME failed login.)")
+        print("\n  If you just changed config, the code_id above must be NEWER than")
+        print("  your last attempt. Same code_id = you're seeing the old failure;")
+        print("  retry the browser login, then run --events again.")
 
     if dump:
         import json as _json
