@@ -546,3 +546,27 @@ def test_check_jwks_failure():
                   json={}, status=500)
     ok, _ = diagnose_idp.check_jwks(DOMAIN)
     assert ok is False
+
+
+# ── config consistency across tools ─────────────────────────────────────────
+def test_login_flow_loads_dotenv():
+    # Regression: login_flow must load .env like the other operational tools,
+    # or it silently uses default KEYCLOAK_URL/REALM/APP_REDIRECT_URI while
+    # diagnose_idp/fix_redirect_uri use the .env values — a config mismatch.
+    import login_flow, inspect
+    src = inspect.getsource(login_flow)
+    assert "load_dotenv" in src
+
+def test_login_flow_url_normalizes_trailing_slash():
+    from login_flow import build_broker_login_url
+    with_slash = build_broker_login_url("http://kc:8080/", "R", "c", "http://cb")
+    without = build_broker_login_url("http://kc:8080", "R", "c", "http://cb")
+    assert with_slash == without
+    assert "//realms" not in with_slash.replace("http://", "")
+
+def test_all_operational_tools_load_dotenv():
+    # All CLI tools that read config should load .env for consistency.
+    import inspect
+    import diagnose_idp, fix_redirect_uri, rotate_secret, login_flow
+    for mod in (diagnose_idp, fix_redirect_uri, rotate_secret, login_flow):
+        assert "load_dotenv" in inspect.getsource(mod), mod.__name__

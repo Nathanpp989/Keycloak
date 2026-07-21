@@ -18,6 +18,16 @@ import logging
 import os
 from urllib.parse import urlencode
 
+# Load .env so this tool reads the same KEYCLOAK_URL / REALM / APP_REDIRECT_URI
+# as diagnose_idp.py, fix_redirect_uri.py, and rotate_secret.py. Without this,
+# running login_flow.py would silently use built-in defaults while the other
+# tools used your .env values — a confusing config mismatch.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import requests
 
 logger = logging.getLogger(__name__)
