@@ -219,6 +219,68 @@ exchange succeeded** - check Auth0's logs before concluding anything.
 Note: the client **ID** is not the client **secret**. Pasting the ID where a
 secret belongs produces `access_denied`; `--verify-idp-secret` detects this.
 
+
+## OpenBao (the "Z-axis"): Keycloak + Auth0 <-> OpenBao
+
+OpenBao is wired in three ways, all in `openbao_connect.py`, ADDED alongside the
+existing Azure Key Vault (Key Vault stays; nothing is removed). Runtime target
+is a local dev server:
+
+```bash
+bao server -dev -dev-root-token-id=root      # or: docker compose up openbao
+export OPENBAO_ADDR=http://127.0.0.1:8200
+export OPENBAO_TOKEN=root
+```
+
+**1. Keycloak -> OpenBao** (`configure_keycloak_oidc`) — OpenBao's OIDC auth
+method trusts your Keycloak realm, so a Keycloak user can log into OpenBao and
+receive a Vault token scoped by policy. The OpenBao role maps the
+`preferred_username` claim and registers OpenBao's own callback URIs; the
+Keycloak client must list those as valid redirect URIs and allow the
+authorization-code flow.
+
+**2. Auth0 -> OpenBao** (`configure_auth0_jwt`, `login_auth0_jwt`) — OpenBao's
+JWT auth method trusts Auth0's issuer/JWKS, so an Auth0-issued token
+authenticates to OpenBao directly (machine-to-machine, no browser).
+`login_auth0_jwt(jwt)` exchanges an Auth0 JWT for an OpenBao token.
+
+**3. OpenBao as a secret store** (`OpenBaoSecrets`, `resolve_secret`) — read and
+write secrets in OpenBao's KV v2 engine. `resolve_secret(name)` tries OpenBao
+first and FALLS BACK to Key Vault, so you can migrate secrets incrementally.
+OpenBao is only attempted when `OPENBAO_TOKEN` is set, so environments without
+it transparently keep using Key Vault.
+
+Configure all three at once:
+
+```bash
+OPENBAO_TOKEN=root AUTH0_DOMAIN=... OPENBAO_KC_CLIENT_SECRET=...   python openbao_connect.py
+```
+
+Each step is idempotent (safe to re-run). The `compose.yaml` stack now includes
+an `openbao` dev service on `:8200`; the app talks to it at
+`http://openbao:8200`. Dev mode is in-memory and insecure — LOCAL USE ONLY.
+
+### Live smoke test
+
+`test_openbao.py` mocks the API; to verify against a REAL server, run
+`openbao_smoke.py` (validated against OpenBao v2.6.1):
+
+```bash
+bao server -dev -dev-root-token-id=root      # terminal 1
+OPENBAO_ADDR=http://127.0.0.1:8200 OPENBAO_TOKEN=root python openbao_smoke.py
+```
+
+It uses throwaway `smoke-*` mounts/secrets and cleans them up. It also stands up
+a tiny local OIDC discovery stub, because of one important gotcha:
+
+**OpenBao validates the OIDC discovery URL by FETCHING it at config-write time.**
+`configure_keycloak_oidc` / `configure_auth0_jwt` will fail if the IdP's
+`<issuer>/.well-known/openid-configuration` is not reachable *from the OpenBao
+server*. The error is made explicit ("OpenBao could not reach the OIDC discovery
+URL ... the IdP must be reachable FROM the OpenBao server"). In the compose
+stack this works because all services share a network; for a local dev server
+talking to a container, ensure the URLs resolve from OpenBao's point of view.
+
 ## Secret rotation
 
 Rotate the Auth0 client secret and sync it into Keycloak:
