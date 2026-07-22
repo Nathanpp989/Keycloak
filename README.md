@@ -152,6 +152,73 @@ python login_flow.py
 | GET | `/keys` | none | Public RSA key |
 | WS | `/ws/github` | Token on connect | Authenticated WebSocket GitHub relay (send `{resource, params}`) |
 
+
+## Brokered browser login: how it works and how to debug it
+
+The full chain is: your app -> Keycloak -> Auth0 -> Keycloak -> your app.
+Verify it end-to-end with a real token round trip:
+
+```bash
+LOGIN_FLOW_CATCH=1 python login_flow.py
+```
+
+Open the printed URL, log in via Auth0, and it reports
+`Round trip OK - user=..., idp=auth0`. If the client secret isn't in the
+environment it is fetched from Keycloak automatically (needs admin creds).
+
+### Two Auth0 applications (by design)
+
+| App | Purpose | Where its ID/secret lives |
+|---|---|---|
+| M2M app (`non_interactive`) | Management API calls | `.env` `AUTH0_CLIENT_ID` / `AUTH0_CLIENT_SECRET` |
+| `keycloak-oidc-client` (`regular_web`) | The browser login Keycloak brokers through | Stored inside Keycloak's IdP config |
+
+They are different apps with different secrets. `rotate_secret.py` refuses to
+push the M2M secret into the IdP (it would break every brokered login), and
+`diagnose_idp.py --fix-secret` refuses for the same reason. Use
+`--set-idp-secret '<secret>'` with the browser-login app's own secret.
+
+### Diagnosing a failed login
+
+`diagnose_idp.py` inspects both sides and can repair most problems:
+
+```bash
+python diagnose_idp.py                       # full report
+python diagnose_idp.py --events              # Keycloak's recorded login errors
+python diagnose_idp.py --dump                # full IdP config JSON
+python diagnose_idp.py --verify-idp-secret 'S'   # is this secret valid at Auth0?
+python diagnose_idp.py --set-idp-secret 'S'      # verify, then store it
+python diagnose_idp.py --fix-alg             # force RS256 ID-token signing
+python diagnose_idp.py --fix-mappers         # add first-broker-login mappers
+python diagnose_idp.py --fix-mappers-clean   # also remove conflicting duplicates
+```
+
+**Auth0's own logs are the authoritative source.** Auth0 Dashboard ->
+Monitoring -> Logs, find the attempt:
+
+- `type=feacft` ("Failed Exchange: Authorization Code") / `Unauthorized`
+  -> Auth0 rejected Keycloak's credentials. The IdP's client secret is wrong.
+- `type=seacft` ("Success Exchange") -> the exchange worked; any remaining
+  failure is in Keycloak's first-broker-login (user creation/linking).
+
+Keycloak's own `IDENTITY_PROVIDER_LOGIN_ERROR` event is often generic and
+records no provider detail. **Its lack of detail does not mean the token
+exchange succeeded** - check Auth0's logs before concluding anything.
+
+### Failure modes hit in practice
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `Invalid parameter: redirect_uri` | Client's Valid Redirect URIs missing the callback | App startup provisions it (`ensure_keycloak_client`); or `fix_redirect_uri.py` |
+| Generic broker error, Auth0 log `feacft` | Wrong client secret in the IdP | `--verify-idp-secret` then `--set-idp-secret` |
+| Generic broker error, ID token alg not RS256 | Auth0 signs ID tokens HS256; Keycloak validates via RS256 JWKS | `--fix-alg` |
+| Generic broker error, no `clientAuthMethod` | Keycloak doesn't know how to authenticate at the token endpoint | `--fix-secret` / re-register the IdP |
+| Login reaches Keycloak then fails creating the user | Missing/duplicate IdP mappers, or `disableUserInfo=true` | `--fix-mappers-clean` |
+| `Invalid client or Invalid client credentials` from **Keycloak** | The app<->Keycloak leg: the app client's secret wasn't sent | set `KEYCLOAK_CLIENT_SECRET` (Clients -> your client -> Credentials) |
+
+Note: the client **ID** is not the client **secret**. Pasting the ID where a
+secret belongs produces `access_denied`; `--verify-idp-secret` detects this.
+
 ## Secret rotation
 
 Rotate the Auth0 client secret and sync it into Keycloak:

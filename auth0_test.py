@@ -400,8 +400,23 @@ def _auth0_for_kc():
 def test_integrate_with_keycloak_created():
     url = f"{KC_URL}/admin/realms/{REALM}/identity-provider/instances"
     responses.add(responses.POST, url, status=201)
+    # After registering the IdP it also provisions the first-broker-login
+    # mappers, so a fresh environment can complete a login without manual setup.
+    responses.add(responses.GET, f"{url}/auth0/mappers", json=[], status=200)
+    responses.add(responses.POST, f"{url}/auth0/mappers", status=201)
     integrate_with_keycloak(_auth0_for_kc(), KC_URL, REALM, "kc-tok", "oid", "osec")
-    assert len(responses.calls) == 1
+    idp_post = [c for c in responses.calls
+                if c.request.method == "POST" and c.request.url.endswith("/instances")]
+    assert len(idp_post) == 1
+    # IdP config carries the settings this whole integration needed.
+    body = json.loads(idp_post[0].request.body)
+    assert body["trustEmail"] is True
+    assert body["config"]["disableUserInfo"] == "false"
+    assert body["config"]["clientAuthMethod"] == "client_secret_post"
+    # All four mappers created.
+    made = [json.loads(c.request.body)["name"] for c in responses.calls
+            if c.request.method == "POST" and c.request.url.endswith("/mappers")]
+    assert set(made) == {"email", "username", "firstName", "lastName"}
 
 @responses.activate
 def test_integrate_with_keycloak_conflict_is_ok():
@@ -416,8 +431,16 @@ def test_integrate_with_keycloak_falls_back_to_legacy_path():
     legacy = f"{KC_URL}/auth/admin/realms/{REALM}/identity-provider/instances"
     responses.add(responses.POST, modern, status=404)   # modern path missing
     responses.add(responses.POST, legacy, status=201)   # legacy path works
+    responses.add(responses.GET, f"{legacy}/auth0/mappers", json=[], status=200)
+    responses.add(responses.POST, f"{legacy}/auth0/mappers", status=201)
     integrate_with_keycloak(_auth0_for_kc(), KC_URL, REALM, "kc-tok", "oid", "osec")
-    assert len(responses.calls) == 2  # tried modern, then legacy
+    instance_posts = [c for c in responses.calls
+                      if c.request.method == "POST"
+                      and c.request.url.endswith("/instances")]
+    assert len(instance_posts) == 2          # tried modern, then legacy
+    # Mappers are provisioned against the LEGACY path that actually worked.
+    assert all("/auth/admin/" in c.request.url for c in responses.calls
+               if c.request.url.endswith("/mappers"))
 
 @responses.activate
 def test_integrate_with_keycloak_realm_not_found():
@@ -2366,3 +2389,94 @@ def test_create_client_forces_rs256_and_auth_method():
         assert body["jwt_configuration"]["alg"] == "RS256"
         assert body["token_endpoint_auth_method"] == "client_secret_post"
     run()
+
+
+# ──────────────────────────────────────────────
+# fetch_client_secret + the app<->Keycloak 401 diagnosis
+# ──────────────────────────────────────────────
+@responses.activate
+def test_fetch_client_secret_success():
+    from login_flow import fetch_client_secret
+    responses.add(responses.GET, f"{KC}/admin/realms/Premkey/clients",
+                  json=[{"id": "uuid-1", "clientId": "Hello-World-app"}], status=200)
+    responses.add(responses.GET,
+                  f"{KC}/admin/realms/Premkey/clients/uuid-1/client-secret",
+                  json={"type": "secret", "value": "kc-app-secret"}, status=200)
+    assert fetch_client_secret(KC, "Premkey", "tok", "Hello-World-app") == "kc-app-secret"
+
+@responses.activate
+def test_fetch_client_secret_missing_client():
+    from login_flow import fetch_client_secret
+    responses.add(responses.GET, f"{KC}/admin/realms/Premkey/clients",
+                  json=[], status=200)
+    with pytest.raises(RuntimeError, match="not found"):
+        fetch_client_secret(KC, "Premkey", "tok", "ghost")
+
+@responses.activate
+def test_fetch_client_secret_public_client_explains():
+    from login_flow import fetch_client_secret
+    responses.add(responses.GET, f"{KC}/admin/realms/Premkey/clients",
+                  json=[{"id": "u1", "clientId": "app"}], status=200)
+    responses.add(responses.GET, f"{KC}/admin/realms/Premkey/clients/u1/client-secret",
+                  json={}, status=200)   # no 'value' -> public client
+    with pytest.raises(RuntimeError, match="public"):
+        fetch_client_secret(KC, "Premkey", "tok", "app")
+
+@responses.activate
+def test_exchange_401_names_missing_client_secret():
+    # Regression for the real failure: no client_secret sent -> Keycloak 401.
+    # The message must point at the app<->Keycloak leg, not Auth0.
+    from login_flow import exchange_code_for_tokens
+    responses.add(responses.POST, TOKEN_URL,
+                  json={"error": "unauthorized_client",
+                        "error_description": "Invalid client or Invalid client credentials"},
+                  status=401)
+    with pytest.raises(RuntimeError) as e:
+        exchange_code_for_tokens(KC, "Premkey", "Hello-World-app",
+                                 "http://cb", "code", client_secret=None)
+    msg = str(e.value)
+    assert "NOT Auth0" in msg
+    assert "sent no client_secret" in msg
+    assert "KEYCLOAK_CLIENT_SECRET" in msg
+
+@responses.activate
+def test_exchange_401_names_rejected_secret():
+    from login_flow import exchange_code_for_tokens
+    responses.add(responses.POST, TOKEN_URL,
+                  json={"error": "unauthorized_client",
+                        "error_description": "Invalid client credentials"},
+                  status=401)
+    with pytest.raises(RuntimeError, match="rejected"):
+        exchange_code_for_tokens(KC, "Premkey", "app", "http://cb", "code",
+                                 client_secret="wrong")
+
+
+def test_run_callback_catcher_accepts_secret_error():
+    # The catcher must accept the fetch-failure reason so the final output can
+    # explain WHY no client secret was available (the warning scrolls away).
+    import inspect
+    from login_flow import run_callback_catcher
+    assert "secret_error" in inspect.signature(run_callback_catcher).parameters
+
+
+@responses.activate
+def test_integrate_mapper_failure_is_not_fatal():
+    # Mapper provisioning is best-effort: if Keycloak rejects it, the IdP is
+    # still registered (the operator can run diagnose_idp --fix-mappers).
+    url = f"{KC_URL}/admin/realms/{REALM}/identity-provider/instances"
+    responses.add(responses.POST, url, status=201)
+    responses.add(responses.GET, f"{url}/auth0/mappers", status=403)
+    integrate_with_keycloak(_auth0_for_kc(), KC_URL, REALM, "kc-tok", "oid", "osec")
+    # No exception == success.
+
+@responses.activate
+def test_integrate_skips_existing_mappers():
+    url = f"{KC_URL}/admin/realms/{REALM}/identity-provider/instances"
+    responses.add(responses.POST, url, status=409)   # IdP already exists
+    responses.add(responses.GET, f"{url}/auth0/mappers",
+                  json=[{"name": "email"}, {"name": "username"},
+                        {"name": "firstName"}, {"name": "lastName"}], status=200)
+    integrate_with_keycloak(_auth0_for_kc(), KC_URL, REALM, "kc-tok", "oid", "osec")
+    made = [c for c in responses.calls
+            if c.request.method == "POST" and c.request.url.endswith("/mappers")]
+    assert made == []   # nothing recreated

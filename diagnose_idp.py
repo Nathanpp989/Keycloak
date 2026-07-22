@@ -297,6 +297,45 @@ def enable_and_fetch_events(kc_url: str, realm: str, token: str,
     return events
 
 
+def verify_idp_secret(domain: str, client_id: str, client_secret: str,
+                      timeout: int = 10) -> tuple[bool, str]:
+    """
+    Check whether `client_secret` is the CURRENT secret for `client_id` at Auth0,
+    without needing a browser login.
+
+    Trick: POST an authorization_code grant with a deliberately bogus code.
+      - Wrong client credentials -> Auth0 answers 'invalid_client'/Unauthorized.
+      - Correct credentials, bad code -> Auth0 answers 'invalid_grant'.
+    So an 'invalid_grant' reply PROVES the secret is right. This works for
+    regular web apps that have no client_credentials grant, which is exactly the
+    IdP's app.
+
+    Returns (secret_is_valid, human_detail).
+    """
+    try:
+        r = requests.post(f"https://{domain}/oauth/token", timeout=timeout, data={
+            "grant_type": "authorization_code",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "code": "diagnostic-probe-not-a-real-code",
+            "redirect_uri": "http://localhost/diagnostic-probe",
+        })
+    except requests.RequestException as exc:
+        return False, f"cannot reach Auth0: {exc}"
+    try:
+        body = r.json()
+    except ValueError:
+        return False, f"non-JSON reply ({r.status_code})"
+    err = body.get("error", "")
+    if err == "invalid_grant":
+        # Credentials accepted; only the (deliberately fake) code was rejected.
+        return True, "secret is CORRECT (Auth0 rejected only the dummy code)"
+    if err in ("invalid_client", "access_denied", "unauthorized_client"):
+        return False, (f"secret is WRONG — Auth0 says '{err}'. This is exactly "
+                       "the 'feacft / Unauthorized' failure seen in Auth0 logs.")
+    return False, f"unexpected reply ({r.status_code}): {body}"
+
+
 def explain_login_error(error: str, details: dict) -> str:
     """
     Map a Keycloak IDENTITY_PROVIDER_LOGIN_ERROR event to a concrete cause and
@@ -316,21 +355,27 @@ def explain_login_error(error: str, details: dict) -> str:
                     "--set-idp-secret.")
         return f"Provider-side error: {ipe}"
     if error == "identity_provider_login_failure":
-        # No provider error => token exchange SUCCEEDED; failure is post-login.
+        # CORRECTION (learned the hard way): the ABSENCE of identity_provider_error
+        # does NOT prove the token exchange succeeded. Keycloak often records this
+        # generic error with no provider detail even when Auth0 rejected the
+        # credentials outright. Diagnosing this as a post-login mapping problem
+        # sent a real debugging session chasing mappers for many rounds while the
+        # actual cause was a bad client secret. Check the AUTHORITATIVE source
+        # first: Auth0's own logs.
         return (
-            "Token exchange and signature validation SUCCEEDED (no provider "
-            "error recorded). The failure is in Keycloak's FIRST BROKER LOGIN "
-            "step — it received a valid token but could not create/link a local "
-            "user. Almost always this means the Auth0 profile returned NO EMAIL "
-            "(or no username) claim. Fixes:\n"
-            "      1. In Keycloak: realm -> Identity Providers -> auth0 -> "
-            "Mappers -> add an 'Attribute Importer' mapping the Auth0 claim "
-            "'email' to the Keycloak user attribute 'email' (and 'name'->username).\n"
-            "      2. Ensure the Auth0 login actually returns email: the user/"
-            "connection must have an email, and scope must include 'email' "
-            "(the IdP defaultScope already does).\n"
-            "      3. Or set the IdP 'trustEmail' = ON and first-login flow to "
-            "not require a verified email, if emails are unverified.")
+            "Generic broker failure — Keycloak recorded NO provider detail, so "
+            "this alone does NOT tell us whether the token exchange succeeded.\n"
+            "      CHECK AUTH0 LOGS FIRST (authoritative): Auth0 -> Monitoring -> "
+            "Logs, find the attempt.\n"
+            "        type=feacft ('Failed Exchange: Authorization Code') / "
+            "'Unauthorized' => Auth0 REJECTED Keycloak's credentials. The IdP's "
+            "client secret is wrong. Verify it with --verify-idp-secret <secret> "
+            "and push the correct one with --set-idp-secret <secret>.\n"
+            "        type=seacft ('Success Exchange') => the exchange DID work, "
+            "and the failure is in first-broker-login (user creation/linking). "
+            "Only then investigate: email/username claim present, mappers "
+            "(--fix-mappers-clean), trustEmail, or a duplicate Keycloak user with "
+            "the same email.")
     return f"Keycloak login error '{error}'. Details: {details}"
 
 
@@ -489,6 +534,13 @@ def main() -> int:
             print("✗ --set-idp-secret needs a value")
             return 1
         set_secret = sys.argv[i + 1]
+    verify_secret = None
+    if "--verify-idp-secret" in sys.argv:
+        i = sys.argv.index("--verify-idp-secret")
+        if i + 1 >= len(sys.argv):
+            print("✗ --verify-idp-secret needs a value")
+            return 1
+        verify_secret = sys.argv[i + 1]
 
     print("=" * 72)
     print("KEYCLOAK <-> AUTH0 IDENTITY-PROVIDER DIAGNOSTIC")
@@ -633,13 +685,34 @@ def main() -> int:
     print("  Allowed Callback URLs must include:")
     print(f"    {c['kc_url']}/realms/{c['realm']}/broker/{c['alias']}/endpoint")
 
+    if verify_secret is not None:
+        idp_client = conf.get("clientId")
+        print(f"\n→ Verifying the supplied secret against Auth0 app {idp_client} ...")
+        ok_s, detail_s = verify_idp_secret(c["domain"], idp_client, verify_secret)
+        print(("✓ " if ok_s else "✗ ") + detail_s)
+        return 0 if ok_s else 1
+
     if set_secret is not None:
-        print("\n→ Setting the IdP's client secret to the value you supplied ...")
+        idp_client = conf.get("clientId")
+        # Verify BEFORE writing: pushing a wrong secret is what produced the
+        # 'feacft / Unauthorized' failures, and Keycloak masks the stored value
+        # so a bad push is invisible afterwards.
+        print(f"\n→ Verifying the supplied secret against Auth0 app {idp_client} ...")
+        ok_s, detail_s = verify_idp_secret(c["domain"], idp_client, set_secret)
+        if not ok_s:
+            print(f"✗ {detail_s}")
+            print("  REFUSING to write a secret Auth0 does not accept. Copy the "
+                  "current secret from Auth0 -> Applications -> that app -> "
+                  "Settings (or Rotate it), and quote it in single quotes so the "
+                  "shell can't mangle special characters.")
+            return 1
+        print(f"✓ {detail_s}")
+        print("\n→ Setting the IdP's client secret ...")
         try:
             used = fix_idp_config(c["kc_url"], c["realm"], token, c["alias"],
                                   set_secret)   # no expect check: explicit intent
             print(f"✓ IdP updated via {used}")
-            print("  Retry the browser login now.")
+            print("  Retry the browser login now (use a fresh/incognito window).")
         except Exception as exc:  # noqa: BLE001
             print(f"✗ Update failed: {exc}")
             return 1

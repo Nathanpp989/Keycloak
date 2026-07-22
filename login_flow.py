@@ -102,6 +102,16 @@ def exchange_code_for_tokens(
             detail = body.get("error_description") or body.get("error") or detail
         except ValueError:
             pass
+        if resp.status_code == 401 and "client" in str(detail).lower():
+            raise RuntimeError(
+                f"Token exchange failed (401): {detail}. This is the "
+                f"app<->Keycloak leg, NOT Auth0: the '{client_id}' client is "
+                "confidential and the request "
+                + ("sent no client_secret." if not client_secret
+                   else "sent a client_secret Keycloak rejected.")
+                + " Get the value from Keycloak admin -> Clients -> "
+                f"{client_id} -> Credentials -> Client secret, and set "
+                "KEYCLOAK_CLIENT_SECRET (single-quoted).")
         raise RuntimeError(
             f"Token exchange failed ({resp.status_code}): {detail}. "
             "Common causes: redirect_uri mismatch, wrong client_secret, or an "
@@ -166,7 +176,7 @@ def process_callback_query(query: dict, keycloak_url: str, realm: str,
 
 def run_callback_catcher(keycloak_url: str, realm: str, client_id: str,
                          redirect_uri: str, client_secret: str | None,
-                         port: int) -> int:
+                         port: int, secret_error: str | None = None) -> int:
     """
     Start a one-shot local HTTP server on `port` to catch the browser redirect,
     exchange the authorization code for tokens, and print a diagnostic summary.
@@ -210,6 +220,9 @@ def run_callback_catcher(keycloak_url: str, realm: str, client_id: str,
         print(f"✓ Round trip OK — user={outcome['username']}, idp={outcome['idp']}")
         return 0
     print(f"✗ Login flow failed — {outcome.get('error')}")
+    if secret_error:
+        print(f"  NOTE: no client secret was available. Auto-fetch failed with: "
+              f"{secret_error}")
     return 1
 
 
@@ -338,6 +351,45 @@ def ensure_client_redirect_uri(keycloak_url: str, realm: str, admin_token: str,
     raise RuntimeError(f"Keycloak realm '{realm}' not found at {base}")
 
 
+def fetch_client_secret(keycloak_url: str, realm: str, admin_token: str,
+                        client_id: str, timeout: int = 10) -> str:
+    """
+    Look up a Keycloak client's secret via the admin API.
+
+    The app's client (e.g. Hello-World-app) is confidential, so the
+    authorization-code exchange must send client_secret. Without it Keycloak
+    answers 401 "Invalid client or Invalid client credentials" — which looks
+    like an Auth0 problem but is purely the app<->Keycloak leg.
+    """
+    base = keycloak_url.rstrip("/")
+    headers = {"authorization": f"Bearer {admin_token}"}
+    for prefix in ("/admin/realms", "/auth/admin/realms"):
+        try:
+            r = requests.get(f"{base}{prefix}/{realm}/clients", headers=headers,
+                             params={"clientId": client_id}, timeout=timeout)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Could not reach Keycloak at {base}: {exc}") from exc
+        if r.status_code == 404 and prefix == "/admin/realms":
+            continue
+        r.raise_for_status()
+        clients = r.json()
+        if not clients:
+            raise RuntimeError(
+                f"Keycloak client '{client_id}' not found in realm '{realm}'")
+        uuid = clients[0]["id"]
+        sr = requests.get(f"{base}{prefix}/{realm}/clients/{uuid}/client-secret",
+                          headers=headers, timeout=timeout)
+        sr.raise_for_status()
+        value = sr.json().get("value")
+        if not value:
+            raise RuntimeError(
+                f"Client '{client_id}' has no secret — it may be a public "
+                "client. Either enable client authentication on it, or run the "
+                "flow without a secret.")
+        return value
+    raise RuntimeError(f"Realm '{realm}' not found at {base}")
+
+
 def main() -> None:
     keycloak_url = os.environ.get("KEYCLOAK_URL", "http://localhost:8080")
     realm        = os.environ.get("KEYCLOAK_REALM", "Premkey")
@@ -376,8 +428,39 @@ def main() -> None:
         parsed = urlparse(redirect_uri)
         port = parsed.port or 8000
         secret = os.environ.get("KEYCLOAK_CLIENT_SECRET")
+        secret_error = None
+        if not secret:
+            # Not in the environment — fetch it from Keycloak so the exchange
+            # doesn't fail with "Invalid client or Invalid client credentials".
+            try:
+                from fix_redirect_uri import get_admin_token
+                admin_tok = get_admin_token(
+                    keycloak_url.rstrip("/"),
+                    os.environ.get("KEYCLOAK_ADMIN_REALM", "master"),
+                    os.environ.get("KEYCLOAK_ADMIN_USER", "admin"),
+                    os.environ.get("KEYCLOAK_ADMIN_PASSWORD", "admin"))
+                secret = fetch_client_secret(keycloak_url, realm, admin_tok,
+                                             client_id)
+                print(f"\n(fetched client secret for '{client_id}' from Keycloak)")
+            except Exception as exc:  # noqa: BLE001
+                secret_error = str(exc)
+                print("\n" + "!" * 70)
+                print("NO CLIENT SECRET — the token exchange will almost "
+                      "certainly fail.")
+                print(f"  Auto-fetch failed: {secret_error}")
+                print("  Fix either way:")
+                print("    a) supply admin creds so it can be fetched:")
+                print("       KEYCLOAK_ADMIN_USER='..' KEYCLOAK_ADMIN_PASSWORD='..' \\")
+                print("       LOGIN_FLOW_CATCH=1 python login_flow.py")
+                print("    b) or copy it from Keycloak admin -> realm "
+                      f"'{realm}' -> Clients -> {client_id}")
+                print("       -> Credentials -> Client secret, then:")
+                print("       KEYCLOAK_CLIENT_SECRET='...' LOGIN_FLOW_CATCH=1 "
+                      "python login_flow.py")
+                print("!" * 70)
         raise SystemExit(run_callback_catcher(
-            keycloak_url, realm, client_id, redirect_uri, secret, port))
+            keycloak_url, realm, client_id, redirect_uri, secret, port,
+            secret_error=secret_error))
     print("=" * 70)
 
 

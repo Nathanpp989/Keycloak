@@ -244,11 +244,15 @@ def test_events_falls_back_to_all_errors():
 
 # ── explain_login_error: map event error codes to causes ────────────────────
 def test_explain_first_broker_login_failure():
-    # The user's actual event: no provider error -> post-login mapping failure.
+    # CORRECTED: this test used to assert the message claimed a first-broker-
+    # login/email problem. That inference was wrong — a generic failure with no
+    # provider detail can also mean Auth0 rejected the credentials outright.
+    # The message must now send the operator to Auth0's logs to tell which.
     msg = diagnose_idp.explain_login_error(
         "identity_provider_login_failure", {"code_id": "abc"})
-    assert "FIRST BROKER LOGIN" in msg
-    assert "EMAIL" in msg
+    assert "feacft" in msg          # credentials-rejected branch named
+    assert "seacft" in msg          # exchange-succeeded branch named
+    assert "SUCCEEDED" not in msg   # must not assert success outright
 
 def test_explain_signature_provider_error():
     msg = diagnose_idp.explain_login_error(
@@ -570,3 +574,53 @@ def test_all_operational_tools_load_dotenv():
     import diagnose_idp, fix_redirect_uri, rotate_secret, login_flow
     for mod in (diagnose_idp, fix_redirect_uri, rotate_secret, login_flow):
         assert "load_dotenv" in inspect.getsource(mod), mod.__name__
+
+
+# ── verify_idp_secret: prove a secret without a browser login ───────────────
+@responses.activate
+def test_verify_idp_secret_correct_secret():
+    # Correct credentials + bogus code -> Auth0 says invalid_grant => secret OK.
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"error": "invalid_grant",
+                        "error_description": "Invalid authorization code"},
+                  status=403)
+    ok, detail = diagnose_idp.verify_idp_secret(DOMAIN, "cid", "right-secret")
+    assert ok is True and "CORRECT" in detail
+
+@responses.activate
+def test_verify_idp_secret_wrong_secret():
+    # Wrong credentials -> invalid_client => exactly the feacft/Unauthorized case.
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"error": "invalid_client",
+                        "error_description": "Unauthorized"}, status=401)
+    ok, detail = diagnose_idp.verify_idp_secret(DOMAIN, "cid", "stale-secret")
+    assert ok is False and "WRONG" in detail and "feacft" in detail
+
+@responses.activate
+def test_verify_idp_secret_network_error():
+    def boom(req):
+        raise __import__("requests").exceptions.ConnectionError("down")
+    responses.add_callback(responses.POST, f"https://{DOMAIN}/oauth/token",
+                           callback=boom)
+    ok, detail = diagnose_idp.verify_idp_secret(DOMAIN, "cid", "s")
+    assert ok is False and "cannot reach" in detail
+
+@responses.activate
+def test_verify_idp_secret_sends_authorization_code_grant():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"error": "invalid_grant"}, status=403)
+    diagnose_idp.verify_idp_secret(DOMAIN, "cid", "sec")
+    body = responses.calls[0].request.body
+    assert "grant_type=authorization_code" in body
+    assert "client_secret=sec" in body
+
+
+# ── explain_login_error must NOT claim the exchange succeeded ───────────────
+def test_explain_generic_failure_does_not_assert_success():
+    # Regression for the misdiagnosis: absence of identity_provider_error does
+    # NOT prove the token exchange worked. The guidance must point at Auth0 logs.
+    msg = diagnose_idp.explain_login_error(
+        "identity_provider_login_failure", {"code_id": "abc"})
+    assert "SUCCEEDED" not in msg
+    assert "feacft" in msg and "seacft" in msg
+    assert "Monitoring" in msg or "Auth0" in msg

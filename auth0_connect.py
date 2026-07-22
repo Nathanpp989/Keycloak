@@ -293,6 +293,58 @@ def get_keycloak_admin_token(
     raise RuntimeError(f"Keycloak token endpoint not found at {base}")
 
 
+def _ensure_idp_mappers(base: str, path_prefix: str, realm_name: str,
+                        admin_token: str, alias: str = "auth0",
+                        timeout: int = 10) -> None:
+    """
+    Create the identity-provider mappers Keycloak needs to build a local user
+    from the Auth0 token. Without these, first-broker-login fails with the
+    opaque "Unexpected error when authenticating with identity provider" even
+    though the token exchange succeeded. Idempotent — existing mappers by name
+    are left alone. Best-effort: a failure here is logged, not fatal, so IdP
+    registration still counts as done.
+    """
+    url = (f"{base}{path_prefix}/{realm_name}/identity-provider/instances/"
+           f"{alias}/mappers")
+    headers = {"content-type": "application/json",
+               "authorization": f"Bearer {admin_token}"}
+    wanted = [
+        {"name": "email",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "email", "user.attribute": "email",
+                    "syncMode": "INHERIT"}},
+        {"name": "username",
+         "identityProviderMapper": "oidc-username-idp-mapper",
+         "config": {"template": "${CLAIM.email}", "syncMode": "INHERIT"}},
+        {"name": "firstName",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "given_name", "user.attribute": "firstName",
+                    "syncMode": "INHERIT"}},
+        {"name": "lastName",
+         "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+         "config": {"claim": "family_name", "user.attribute": "lastName",
+                    "syncMode": "INHERIT"}},
+    ]
+    try:
+        existing = requests.get(url, headers=headers, timeout=timeout)
+        existing.raise_for_status()
+        have = {m.get("name") for m in existing.json()}
+    except (requests.RequestException, ValueError) as exc:
+        logger.warning("Could not list IdP mappers (%s); skipping mapper setup", exc)
+        return
+    for mapper in wanted:
+        if mapper["name"] in have:
+            continue
+        try:
+            resp = requests.post(url, headers=headers, timeout=timeout,
+                                 json={**mapper, "identityProviderAlias": alias})
+            resp.raise_for_status()
+            logger.info("Created IdP mapper '%s'", mapper["name"])
+        except requests.RequestException as exc:
+            logger.warning("Could not create IdP mapper '%s': %s",
+                           mapper["name"], exc)
+
+
 def integrate_with_keycloak(
     auth0: Auth0Connect,
     keycloak_url: str,
@@ -318,9 +370,16 @@ def integrate_with_keycloak(
             "alias":      "auth0",
             "providerId": "oidc",
             "enabled":    True,
+            # Trust the email Auth0 asserts, so an unverified address doesn't
+            # stall Keycloak's first-broker-login flow.
+            "trustEmail": True,
             "config": {
                 "clientId":          oidc_client_id,
                 "clientSecret":      oidc_client_secret,
+                # Keycloak must call Auth0's /userinfo to load the profile:
+                # Auth0 often returns 'email' there rather than in the ID token,
+                # and without it first-broker-login cannot create the user.
+                "disableUserInfo":   "false",
                 # How Keycloak presents its credentials at Auth0's token
                 # endpoint. Without this, Keycloak has no client-auth method
                 # configured and the code->token exchange fails with the generic
@@ -344,9 +403,13 @@ def integrate_with_keycloak(
 
         if response.status_code == 201:
             logger.info("Auth0 IdP registered in Keycloak realm '%s'", realm_name)
+            _ensure_idp_mappers(base, path_prefix, realm_name,
+                                keycloak_admin_token)
             return
         if response.status_code == 409:
             logger.info("Auth0 IdP already exists in Keycloak; skipping creation")
+            _ensure_idp_mappers(base, path_prefix, realm_name,
+                                keycloak_admin_token)
             return
         if response.status_code == 404:
             # Modern path 404 -> try legacy path. Legacy path 404 -> realm
