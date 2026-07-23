@@ -390,6 +390,57 @@ def scaffold_all(
     return summary
 
 
+def login_checklist(openbao_addr: str | None = None) -> str:
+    """
+    Return a step-by-step checklist for the two OpenBao login round trips that
+    require a live Keycloak/Auth0 (and, for the browser flow, a human). The JWT
+    *mechanics* are already proven by openbao_login_smoke.py; this covers the
+    real-IdP wiring those live flows additionally need.
+    """
+    addr = (openbao_addr or OPENBAO_ADDR).rstrip("/")
+    kc_cb = f"{addr}/ui/vault/auth/{OIDC_MOUNT_KEYCLOAK}/oidc/callback"
+    return f"""
+OpenBao login round trips — live verification checklist
+=======================================================
+
+A) Keycloak -> OpenBao (browser OIDC)  [needs live Keycloak + a human]
+  1. In Keycloak, create/confirm a confidential client for OpenBao
+     (e.g. clientId 'openbao') with the Authorization Code flow enabled.
+  2. Add these to that client's Valid Redirect URIs:
+        {kc_cb}
+        http://localhost:8250/oidc/callback
+  3. Configure OpenBao (OpenBao must be able to REACH Keycloak's realm URL):
+        OPENBAO_TOKEN=... python -c "import openbao_connect as o; \\
+          o.configure_keycloak_oidc('<KEYCLOAK_URL>','<REALM>', \\
+          'openbao','<CLIENT_SECRET>')"
+  4. Log in from the CLI:
+        bao login -method=oidc -path={OIDC_MOUNT_KEYCLOAK}
+     A browser opens; complete the Keycloak login. Success prints a token.
+  5. If it fails, check (in order):
+        - OpenBao logs for 'error checking oidc discovery URL' -> OpenBao can't
+          reach Keycloak. Fix networking/URL.
+        - Keycloak 'Invalid redirect_uri' -> the URIs in step 2 don't match.
+        - login works but no policy -> map claims to policies on the role.
+
+B) Auth0 -> OpenBao (JWT)  [needs live Auth0 for a real token]
+  MECHANICS ALREADY PROVEN LIVE by openbao_login_smoke.py. To confirm with a
+  REAL Auth0 token:
+  1. configure_auth0_jwt('<AUTH0_DOMAIN>', bound_audiences=['<API_IDENTIFIER>'])
+     (OpenBao must be able to reach https://<domain>/.well-known/... )
+  2. Get a real token via client-credentials:
+        curl --request POST 'https://<AUTH0_DOMAIN>/oauth/token' \\
+          --data grant_type=client_credentials \\
+          --data client_id=<M2M_ID> --data client_secret=<M2M_SECRET> \\
+          --data audience=<API_IDENTIFIER>
+  3. Exchange it for an OpenBao token:
+        python -c "import openbao_connect as o; \\
+          print(o.login_auth0_jwt('<THE_JWT>'))"
+  4. If it fails: 'no key found' -> discovery/JWKS unreachable or wrong issuer;
+     'invalid audience' -> bound_audiences != token's aud; 'token is expired'
+     -> mint a fresh one.
+""".strip()
+
+
 def main() -> int:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
     if not OPENBAO_TOKEN:

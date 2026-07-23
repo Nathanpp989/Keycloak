@@ -260,6 +260,59 @@ Each step is idempotent (safe to re-run). The `compose.yaml` stack now includes
 an `openbao` dev service on `:8200`; the app talks to it at
 `http://openbao:8200`. Dev mode is in-memory and insecure — LOCAL USE ONLY.
 
+### Running OpenBao with your live Keycloak & Auth0
+
+`openbao_setup.py` is the executable mechanism that wires OpenBao to your REAL
+IdPs. It reads config from `.env` and checks every precondition before writing.
+
+```bash
+# 0. Fill in .env (OPENBAO_TOKEN, KEYCLOAK_*, AUTH0_*), start OpenBao:
+bao server -dev -dev-root-token-id=root
+
+# 1. Verify preconditions WITHOUT changing anything:
+python openbao_setup.py check
+
+# 2. Configure Keycloak -> OpenBao (prints the redirect URIs to register + login cmd):
+python openbao_setup.py keycloak
+
+# 3. Configure Auth0 -> OpenBao (verifies with a REAL Auth0 token if M2M creds set):
+python openbao_setup.py auth0
+
+# Or do check + both at once:
+python openbao_setup.py all
+
+# Print the manual checklist any time:
+python openbao_setup.py checklist
+```
+
+`check` confirms OpenBao is up and your token works, and that each IdP's
+discovery URL is not just reachable but a VALID OIDC discovery document (a bare
+200 that isn't real discovery is reported as a failure — OpenBao would reject
+it too). The `keycloak` step configures OIDC auth then tells you the exact
+Keycloak Valid Redirect URIs to add and the `bao login -method=oidc` command;
+the browser step needs a human. The `auth0` step configures JWT auth and, if
+`AUTH0_CLIENT_ID/SECRET/AUDIENCE` are set, fetches a real client-credentials
+token and exchanges it for an OpenBao token — proving that leg end to end.
+
+### Login round-trip verification
+
+The JWT login *mechanics* are proven live by `openbao_login_smoke.py` — it mints
+a real RS256 token, configures OpenBao's JWT auth against a local JWKS, and
+asserts `login_auth0_jwt` returns a usable token (and that expired / wrong-
+audience tokens are rejected):
+
+```bash
+bao server -dev -dev-root-token-id=root
+OPENBAO_ADDR=http://127.0.0.1:8200 OPENBAO_TOKEN=root python openbao_login_smoke.py
+```
+
+The two flows that need a live IdP (a browser login through Keycloak, and a real
+Auth0-issued JWT) are covered by a step-by-step checklist:
+
+```python
+python -c "import openbao_connect as o; print(o.login_checklist())"
+```
+
 ### Live smoke test
 
 `test_openbao.py` mocks the API; to verify against a REAL server, run

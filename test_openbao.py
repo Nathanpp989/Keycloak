@@ -361,3 +361,29 @@ def test_enable_idempotent_variant_messages():
         responses.add(responses.POST, f"{ADDR}/v1/sys/auth/m",
                       json={"errors": [msg]}, status=400)
         assert ob.enable_auth_method("jwt", "m", token=TOK, addr=ADDR) is True
+
+
+# ── login round-trip mechanics (mocked; live version in openbao_login_smoke.py) ──
+@responses.activate
+def test_login_auth0_jwt_success_returns_client_token():
+    responses.add(responses.POST, f"{ADDR}/v1/auth/custom-mount/login",
+                  json={"auth": {"client_token": "s.tok", "policies": ["p"]}},
+                  status=200)
+    tok = ob.login_auth0_jwt("j.w.t", mount="custom-mount", openbao_addr=ADDR)
+    assert tok == "s.tok"
+
+@responses.activate
+def test_login_auth0_jwt_rejected_jwt_raises():
+    # OpenBao rejects a bad/expired/wrong-aud JWT with 400; must surface clearly.
+    responses.add(responses.POST, f"{ADDR}/v1/auth/auth0-jwt/login",
+                  json={"errors": ["error validating token: token is expired"]},
+                  status=400)
+    with pytest.raises(ob.OpenBaoError, match="JWT login failed"):
+        ob.login_auth0_jwt("expired.jwt", openbao_addr=ADDR)
+
+def test_login_checklist_mentions_both_flows():
+    text = ob.login_checklist(openbao_addr=ADDR)
+    assert "Keycloak -> OpenBao" in text
+    assert "Auth0 -> OpenBao" in text
+    # Includes the concrete callback URL OpenBao expects.
+    assert "/oidc/callback" in text
