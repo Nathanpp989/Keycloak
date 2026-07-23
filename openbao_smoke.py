@@ -73,9 +73,11 @@ class _DiscoveryStub:
     def __init__(self):
         import http.server
         import threading
-        port = 8271
-        issuer = f"http://127.0.0.1:{port}"
-        self.issuer = issuer
+        # Port 0 -> the OS assigns a free port. A fixed port would raise a bare
+        # 'Address already in use' if taken (e.g. two smoke runs at once),
+        # which tells the operator nothing useful.
+        port = 0
+        holder = {}
 
         class _H(http.server.BaseHTTPRequestHandler):
             def log_message(self, *a):
@@ -83,6 +85,7 @@ class _DiscoveryStub:
 
             def do_GET(self):
                 import json as _j
+                issuer = holder["issuer"]
                 if self.path.endswith("/.well-known/openid-configuration"):
                     body = _j.dumps({
                         "issuer": issuer,
@@ -106,6 +109,8 @@ class _DiscoveryStub:
                 self.wfile.write(body)
 
         self._srv = http.server.HTTPServer(("127.0.0.1", port), _H)
+        self.issuer = f"http://127.0.0.1:{self._srv.server_address[1]}"
+        holder["issuer"] = self.issuer
         self._t = threading.Thread(target=self._srv.serve_forever, daemon=True)
         self._t.start()
 

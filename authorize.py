@@ -66,7 +66,67 @@ def _get_kv_client() -> SecretClient:
             _kv_client = SecretClient(vault_url=vault_url, credential=DefaultAzureCredential())
     return _kv_client
 
+def _openbao_first_names() -> set[str]:
+    """
+    Names of secrets that should be read from OpenBao FIRST (Key Vault remains
+    the fallback). Opt-in via env, comma-separated:
+
+        OPENBAO_SECRETS=AUTH0_AUDIENCE            # pilot one secret
+        OPENBAO_SECRETS=AUTH0_AUDIENCE,AUTH0_CLIENT_ID
+        OPENBAO_SECRETS=*                         # all secrets
+
+    Default is EMPTY, so behaviour is byte-for-byte what it was before OpenBao
+    existed. This makes the migration incremental and instantly reversible:
+    remove the name from the env var and you are back on Key Vault.
+    """
+    raw = os.environ.get("OPENBAO_SECRETS", "").strip()
+    if not raw:
+        return set()
+    return {p.strip() for p in raw.split(",") if p.strip()}
+
+
+def _try_openbao(secret_name: str) -> str | None:
+    """
+    Attempt to read `secret_name` from OpenBao. Returns None (never raises) if
+    OpenBao is disabled/unreachable or the read fails, so Key Vault can take
+    over — a secret store being down must not become a new single point of
+    failure.
+    """
+    try:
+        # features is consulted first so OPENBAO_MODE=off short-circuits without
+        # any network call, and OPENBAO_MODE=auto self-disables when OpenBao
+        # isn't running instead of paying a timeout on every lookup.
+        from features import openbao_state
+        state = openbao_state()
+        if not state.enabled:
+            logger.debug("OpenBao lookup for '%s' skipped: %s",
+                         secret_name, state.reason)
+            return None
+        # Imported lazily: keeps the OpenBao dependency off the hot path and
+        # avoids a circular import (openbao_connect.resolve_secret imports this
+        # module for its own Key Vault fallback).
+        from openbao_connect import OpenBaoSecrets
+        value = OpenBaoSecrets().get_secret(secret_name)
+        if value:
+            logger.info("Secret '%s' resolved from OpenBao", secret_name)
+            return value
+        return None
+    except Exception as exc:  # noqa: BLE001 — fall back to Key Vault
+        logger.warning("OpenBao lookup for '%s' failed (%s); "
+                       "falling back to Key Vault", secret_name, exc)
+        return None
+
+
 def get_secret(secret_name: str) -> str:
+    # OpenBao-first, opt-in per secret name (see _openbao_first_names). When the
+    # name isn't opted in, or OpenBao isn't configured/available, this falls
+    # straight through to the original Key Vault path below.
+    wanted = _openbao_first_names()
+    if secret_name in wanted or "*" in wanted:
+        value = _try_openbao(secret_name)
+        if value is not None:
+            return value
+
     # R3 FIX: Azure Key Vault secret names allow only [0-9a-zA-Z-]. Callers use
     # env-style names (AUTH0_CLIENT_SECRET); map underscores to hyphens so the
     # KV object name is valid (stored as AUTH0-CLIENT-SECRET by convention).

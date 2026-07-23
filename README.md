@@ -260,6 +260,37 @@ Each step is idempotent (safe to re-run). The `compose.yaml` stack now includes
 an `openbao` dev service on `:8200`; the app talks to it at
 `http://openbao:8200`. Dev mode is in-memory and insecure — LOCAL USE ONLY.
 
+### Migrating secrets to OpenBao (incremental, reversible)
+
+`authorize.get_secret()` can read from OpenBao first, per secret, opt-in via
+`OPENBAO_SECRETS`. Key Vault remains the fallback, so nothing breaks if OpenBao
+is down or the secret isn't there yet.
+
+```bash
+# Default: empty -> Key Vault only, byte-for-byte the original behaviour.
+OPENBAO_SECRETS=
+
+# Pilot ONE secret:
+OPENBAO_SECRETS=AUTH0_AUDIENCE
+
+# Expand as you gain confidence:
+OPENBAO_SECRETS=AUTH0_AUDIENCE,AUTH0_CLIENT_ID
+
+# Everything:
+OPENBAO_SECRETS=*
+```
+
+Write the secret into OpenBao first, then add its name:
+
+```bash
+python -c "import openbao_connect as o; \
+  o.OpenBaoSecrets().put_secret('AUTH0_AUDIENCE','https://your-api')"
+```
+
+Rollback is removing the name from `OPENBAO_SECRETS` — no code change. If
+OpenBao is unreachable or the secret is missing, the lookup logs a warning and
+falls through to Key Vault rather than failing the request.
+
 ### Running OpenBao with your live Keycloak & Auth0
 
 `openbao_setup.py` is the executable mechanism that wires OpenBao to your REAL
@@ -333,6 +364,49 @@ server*. The error is made explicit ("OpenBao could not reach the OIDC discovery
 URL ... the IdP must be reachable FROM the OpenBao server"). In the compose
 stack this works because all services share a network; for a local dev server
 talking to a container, ensure the URLs resolve from OpenBao's point of view.
+
+## Turning subsystems on and off
+
+`features.py` gives each OPTIONAL subsystem three modes. Check live state at
+`GET /status/subsystems` or `python features.py`.
+
+| Env var | Values | Default | Controls |
+|---|---|---|---|
+| `OPENBAO_MODE` | on / off / auto | auto | OpenBao secret lookups |
+| `AUTH0_MANAGEMENT_MODE` | on / off / auto | auto | Auth0 Management API (users, orgs, IdP provisioning) |
+| `KEYCLOAK_REQUIRED` | true / false | true | whether an unreachable Keycloak is fatal at startup |
+
+- **on** — always enabled; failures surface as errors.
+- **off** — always disabled; calls short-circuit with a clear reason (no network call).
+- **auto** — enabled only if configured AND reachable, probed and cached for
+  `FEATURE_PROBE_TTL` seconds. This is the "based on circumstances" mode: start
+  OpenBao and it switches on; stop it and the app degrades to Key Vault.
+
+**An important limit.** Auth0 has two roles here and only one is switchable:
+
+1. **Brokered-login IdP** (Keycloak → Auth0) — ARCHITECTURAL. There is
+   deliberately no flag, because disabling it would not degrade login, it would
+   break it. A flag implying otherwise would be misleading.
+2. **Management API** — genuinely optional, controlled by
+   `AUTH0_MANAGEMENT_MODE`. With it off the app still starts and Keycloak-native
+   auth works; user/org endpoints return 503 and say why.
+
+`KEYCLOAK_REQUIRED=false` starts the app in degraded mode when Keycloak is down,
+so `/status/subsystems` is reachable for diagnosis. Auth endpoints then fail
+with a clear reason instead of the whole process being unreachable.
+
+## Testing real endpoints with a real token
+
+```bash
+uvicorn main:app --port 8000                    # terminal 1
+LOGIN_FLOW_CATCH=1 python login_flow.py         # get a brokered token
+APP_TOKEN='<paste>' python endpoint_smoke.py    # exercise the API
+APP_TOKEN='<paste>' python endpoint_smoke.py --write   # also create/delete throwaway objects
+```
+
+Read-only by default. It asserts `/protected` REJECTS an anonymous caller (a
+security check, not a formality), and treats 503 from a disabled subsystem as a
+skip rather than a failure.
 
 ## Secret rotation
 

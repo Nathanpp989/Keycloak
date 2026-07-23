@@ -44,8 +44,7 @@ except ImportError:
 
 import openbao_connect as ob
 
-_STUB_PORT = 8272
-_ISSUER = f"http://127.0.0.1:{_STUB_PORT}"
+# The issuer stub binds a free port at runtime (see _start_issuer_stub).
 
 
 def _b64u(n: int) -> str:
@@ -64,18 +63,27 @@ def _make_key_and_jwks() -> tuple[bytes, dict]:
     return priv, jwks
 
 
-def _start_issuer_stub(jwks: dict) -> http.server.HTTPServer:
+def _start_issuer_stub(jwks: dict) -> tuple[http.server.HTTPServer, str]:
+    """
+    Start the local issuer stub on a FREE port (port 0 = OS picks one) and
+    return (server, issuer_url). Binding a fixed port would raise a bare
+    'Address already in use' if the port were taken — e.g. running this twice
+    concurrently — which tells the operator nothing useful.
+    """
+    issuer_holder = {}
+
     class _H(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
 
         def do_GET(self):
+            iss = issuer_holder["issuer"]
             if "openid-configuration" in self.path:
                 body = json.dumps({
-                    "issuer": _ISSUER + "/",
-                    "jwks_uri": _ISSUER + "/jwks",
-                    "authorization_endpoint": _ISSUER + "/authorize",
-                    "token_endpoint": _ISSUER + "/token",
+                    "issuer": iss + "/",
+                    "jwks_uri": iss + "/jwks",
+                    "authorization_endpoint": iss + "/authorize",
+                    "token_endpoint": iss + "/token",
                     "response_types_supported": ["code"],
                     "subject_types_supported": ["public"],
                     "id_token_signing_alg_values_supported": ["RS256"],
@@ -92,10 +100,16 @@ def _start_issuer_stub(jwks: dict) -> http.server.HTTPServer:
             self.end_headers()
             self.wfile.write(body)
 
-    srv = http.server.HTTPServer(("127.0.0.1", _STUB_PORT), _H)
+    try:
+        srv = http.server.HTTPServer(("127.0.0.1", 0), _H)
+    except OSError as exc:
+        raise RuntimeError(
+            f"could not start the local issuer stub: {exc}") from exc
+    issuer = f"http://127.0.0.1:{srv.server_address[1]}"
+    issuer_holder["issuer"] = issuer
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     time.sleep(0.4)
-    return srv
+    return srv, issuer
 
 
 def run() -> int:
@@ -122,28 +136,41 @@ def run() -> int:
     mount = f"login-smoke-{sfx}"
     h = {"X-Vault-Token": token}
     priv, jwks = _make_key_and_jwks()
-    stub = _start_issuer_stub(jwks)
+    stub, _ISSUER = _start_issuer_stub(jwks)
     failures = []
 
     try:
         # Configure JWT auth against the local issuer stub.
-        requests.post(f"{addr}/v1/sys/auth/{mount}", headers=h,
-                      json={"type": "jwt"}, timeout=5)
+        # Every SETUP step is checked: an unchecked setup failure would surface
+        # later as a confusing "login failed"/"policy missing" and send you
+        # debugging the login code when the real problem was here.
+        def _must(resp, what: str):
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"SETUP step failed — {what} ({resp.status_code}): "
+                    f"{resp.text[:150]}. This is a harness/permissions problem, "
+                    "NOT a failure of the login code under test.")
+            return resp
+
+        _must(requests.post(f"{addr}/v1/sys/auth/{mount}", headers=h,
+                            json={"type": "jwt"}, timeout=5),
+              f"enable jwt auth at {mount}")
         r = requests.post(f"{addr}/v1/auth/{mount}/config", headers=h,
                           json={"oidc_discovery_url": _ISSUER + "/",
                                 "bound_issuer": _ISSUER + "/"}, timeout=5)
         if r.status_code >= 400:
             print(f"✗ JWT config failed: {r.status_code} {r.text[:150]}")
             return 1
-        requests.put(f"{addr}/v1/sys/policies/acl/login-smoke", headers=h,
-                     json={"policy": 'path "secret/*" { capabilities=["read"] }'},
-                     timeout=5)
-        requests.post(f"{addr}/v1/auth/{mount}/role/auth0", headers=h,
-                      json={"role_type": "jwt", "user_claim": "sub",
-                            "bound_issuer": _ISSUER + "/",
-                            "bound_audiences": ["https://smoke.api"],
-                            "policies": ["login-smoke"], "token_ttl": "1h"},
-                      timeout=5)
+        _must(requests.put(f"{addr}/v1/sys/policies/acl/login-smoke", headers=h,
+                           json={"policy":
+                                 'path "secret/*" { capabilities=["read"] }'},
+                           timeout=5), "write login-smoke policy")
+        _must(requests.post(f"{addr}/v1/auth/{mount}/role/auth0", headers=h,
+                            json={"role_type": "jwt", "user_claim": "sub",
+                                  "bound_issuer": _ISSUER + "/",
+                                  "bound_audiences": ["https://smoke.api"],
+                                  "policies": ["login-smoke"], "token_ttl": "1h"},
+                            timeout=5), "write jwt role")
 
         # Mint a real RS256 JWT, exactly as Auth0 would sign one.
         now = int(time.time())
@@ -197,6 +224,11 @@ def run() -> int:
             failures.append(f"wrong-aud check: {exc}")
             print(f"✗ [3] wrong-aud check errored: {exc}")
 
+    except RuntimeError as exc:
+        # A checked SETUP step failed (see _must). Report it as a harness
+        # problem so it is never mistaken for a failure of the code under test.
+        print(f"✗ {exc}")
+        failures.append(str(exc))
     finally:
         stub.shutdown()
         requests.delete(f"{addr}/v1/sys/auth/{mount}", headers=h, timeout=5)

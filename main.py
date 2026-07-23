@@ -21,10 +21,6 @@ from keycloak.exceptions import KeycloakAuthenticationError
 from auth0_connect import Auth0Connect, get_keycloak_admin_token
 from auth0_talk import KeycloakAdminAPI, Auth0UsersAPI, Auth0AuthzExtensionAPI, Auth0OrganizationsAPI
 from auth0_type import UserManager
-from login_flow import diagnose_redirect_uri
-import json
-tok = get_keycloak_admin_token('http://localhost:8080','master','admin','admin')
-print(json.dumps(diagnose_redirect_uri('http://localhost:8080','Premkey',tok,'Hello-World-app','http://localhost:8000/callback'), indent=2))
 
 # I3 FIX: configure logging before anything else so all logger.* calls produce output
 logging.basicConfig(
@@ -227,8 +223,28 @@ def _build_user_manager() -> UserManager | None:
     """
     Wire up the UserManager from auth0_type using a fresh Keycloak admin token
     and an Auth0 M2M client. Returns None (with a warning) if the required
-    Auth0 env vars are missing, so the rest of the app can still start.
+    Auth0 env vars are missing, or if the Auth0 management subsystem is turned
+    off / auto-disabled (see features.py), so the rest of the app still starts.
+
+    NOTE: this controls the Auth0 MANAGEMENT surface only. Keycloak still
+    brokers browser logins through Auth0 regardless — that link is
+    architectural and has no off switch.
     """
+    # Explicit AUTH0_MANAGEMENT_MODE=off, or auto-disable when Auth0 is
+    # unreachable, short-circuits before any network call.
+    try:
+        from features import auth0_management_state
+        state = auth0_management_state()
+        if not state.enabled:
+            logger.warning(
+                "Auth0 management disabled (%s) — user/organization endpoints "
+                "will return 503. Brokered login through Auth0 is unaffected.",
+                state.reason)
+            return None
+    except Exception as exc:  # noqa: BLE001 - never let flag logic break startup
+        logger.warning("feature-flag check failed (%s); continuing with the "
+                       "env-var check below", exc)
+
     keycloak_url = KEYCLOAK_URL
     realm        = KEYCLOAK_REALM
     admin_user   = os.environ.get("KEYCLOAK_ADMIN_USER", "admin")
@@ -310,6 +326,21 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.error("Keycloak setup failed after retries — check KEYCLOAK_URL "
                      "and credentials: %s", exc)
+        # By default this is fatal: Keycloak is the core of this service, and
+        # starting without it would serve endpoints that cannot possibly work.
+        # KEYCLOAK_REQUIRED=false opts into a DEGRADED start instead, so the
+        # process comes up and /status/subsystems can be used to diagnose why
+        # — useful in dev and during an outage. Auth endpoints then return 503
+        # with a clear reason rather than the app being unreachable entirely.
+        if os.environ.get("KEYCLOAK_REQUIRED", "true").strip().lower() \
+                in ("false", "0", "no", "off"):
+            logger.warning(
+                "KEYCLOAK_REQUIRED=false — starting in DEGRADED mode. "
+                "Auth endpoints will fail until Keycloak is reachable.")
+            keycloak_oidc = None
+            user_manager = None
+            yield
+            return
         raise
     if not client_secret:
         logger.warning(
@@ -369,6 +400,28 @@ def require_keycloak_auth(credentials=Depends(http_bearer)) -> dict:
 @app.get("/")
 def read_root():
     return {"message": "Hello, World!"}
+
+@app.get("/status/subsystems")
+def subsystem_status():
+    """
+    Which optional subsystems are live right now, and why. Useful when an
+    endpoint returns 503: this says whether the backend is off by config, or
+    auto-disabled because it's unreachable.
+
+    Note: 'auth0_management' covers the Auth0 Management API only. Keycloak
+    brokers browser logins through Auth0 regardless of this flag.
+    """
+    try:
+        from features import auth0_management_state, openbao_state
+        out = {}
+        for st in (auth0_management_state(), openbao_state()):
+            out[st.name] = {"enabled": st.enabled, "mode": st.mode,
+                            "reason": st.reason}
+        out["note"] = ("auth0 brokered-login IdP is architectural and has no "
+                       "off switch; these flags cover optional surfaces only")
+        return out
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not resolve subsystem status: {exc}"}
 
 @app.get("/hello")
 def read_hello(email: str, username: str):

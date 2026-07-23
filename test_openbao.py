@@ -387,3 +387,72 @@ def test_login_checklist_mentions_both_flows():
     assert "Auth0 -> OpenBao" in text
     # Includes the concrete callback URL OpenBao expects.
     assert "/oidc/callback" in text
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PILOT: authorize.get_secret with opt-in OpenBao-first resolution
+# ════════════════════════════════════════════════════════════════════════════
+def test_openbao_first_names_parsing(monkeypatch):
+    import authorize
+    monkeypatch.delenv("OPENBAO_SECRETS", raising=False)
+    assert authorize._openbao_first_names() == set()
+    monkeypatch.setenv("OPENBAO_SECRETS", "AUTH0_AUDIENCE")
+    assert authorize._openbao_first_names() == {"AUTH0_AUDIENCE"}
+    monkeypatch.setenv("OPENBAO_SECRETS", " A , B ,, C ")
+    assert authorize._openbao_first_names() == {"A", "B", "C"}
+    monkeypatch.setenv("OPENBAO_SECRETS", "*")
+    assert authorize._openbao_first_names() == {"*"}
+
+def test_get_secret_default_does_not_touch_openbao(monkeypatch):
+    # Default (no OPENBAO_SECRETS) must NOT consult OpenBao at all — the
+    # migration is opt-in and must not change existing behaviour.
+    import authorize
+    monkeypatch.delenv("OPENBAO_SECRETS", raising=False)
+    called = {"n": 0}
+    monkeypatch.setattr(authorize, "_try_openbao",
+                        lambda n: called.__setitem__("n", called["n"] + 1))
+    fake_kv = type("KV", (), {"get_secret": lambda self, n: type(
+        "S", (), {"value": "from-kv"})()})()
+    monkeypatch.setattr(authorize, "_get_kv_client", lambda: fake_kv)
+    assert authorize.get_secret("AUTH0_AUDIENCE") == "from-kv"
+    assert called["n"] == 0            # OpenBao never consulted
+
+def test_get_secret_opted_in_uses_openbao(monkeypatch):
+    import authorize
+    monkeypatch.setenv("OPENBAO_SECRETS", "AUTH0_AUDIENCE")
+    monkeypatch.setattr(authorize, "_try_openbao",
+                        lambda n: "from-openbao" if n == "AUTH0_AUDIENCE" else None)
+    assert authorize.get_secret("AUTH0_AUDIENCE") == "from-openbao"
+
+def test_get_secret_opted_in_falls_back_to_kv_when_openbao_misses(monkeypatch):
+    # OpenBao configured but the secret isn't there -> Key Vault still serves it.
+    import authorize
+    monkeypatch.setenv("OPENBAO_SECRETS", "AUTH0_AUDIENCE")
+    monkeypatch.setattr(authorize, "_try_openbao", lambda n: None)
+    fake_kv = type("KV", (), {"get_secret": lambda self, n: type(
+        "S", (), {"value": "from-kv"})()})()
+    monkeypatch.setattr(authorize, "_get_kv_client", lambda: fake_kv)
+    assert authorize.get_secret("AUTH0_AUDIENCE") == "from-kv"
+
+def test_get_secret_wildcard_applies_to_all(monkeypatch):
+    import authorize
+    monkeypatch.setenv("OPENBAO_SECRETS", "*")
+    monkeypatch.setattr(authorize, "_try_openbao", lambda n: f"ob-{n}")
+    assert authorize.get_secret("ANYTHING") == "ob-ANYTHING"
+
+def test_try_openbao_never_raises(monkeypatch):
+    # A broken OpenBao must degrade to None (so KV takes over), never raise —
+    # adding a secret store must not add a new single point of failure.
+    import authorize
+    import openbao_connect
+    monkeypatch.setattr(openbao_connect, "OPENBAO_TOKEN", "tok")
+    def boom(self, name):
+        raise RuntimeError("openbao exploded")
+    monkeypatch.setattr(openbao_connect.OpenBaoSecrets, "get_secret", boom)
+    assert authorize._try_openbao("X") is None
+
+def test_try_openbao_returns_none_when_unconfigured(monkeypatch):
+    import authorize
+    import openbao_connect
+    monkeypatch.setattr(openbao_connect, "OPENBAO_TOKEN", "")
+    assert authorize._try_openbao("X") is None
