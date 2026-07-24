@@ -395,6 +395,33 @@ talking to a container, ensure the URLs resolve from OpenBao's point of view.
 so `/status/subsystems` is reachable for diagnosis. Auth endpoints then fail
 with a clear reason instead of the whole process being unreachable.
 
+## Container build
+
+Validate the build statically first — no engine needed, runs in CI:
+
+```bash
+python container_check.py
+```
+
+It catches silent-failure classes that a passing build would hide:
+
+- **Comments inside a line continuation.** Modern BuildKit strips them; older
+  Docker and some buildah versions do NOT, truncating the instruction. Here
+  that would drop `HOST=0.0.0.0` and `KEY_DIR` — the app would bind loopback
+  inside the container and be unreachable from the host, while the healthcheck
+  (which runs INSIDE the container against 127.0.0.1) still reported healthy.
+- `HOST` not `0.0.0.0`, in the Dockerfile or compose.
+- A module imported from `main.py` that `.dockerignore` excludes from the image.
+- A third-party import missing from `requirements.txt`.
+- `Dockerfile` and `Containerfile` drifting apart.
+
+Then build for real:
+
+```bash
+docker build -t auth-broker .
+podman build --format docker -t auth-broker .   # --format docker keeps HEALTHCHECK
+```
+
 ## Testing real endpoints with a real token
 
 ```bash

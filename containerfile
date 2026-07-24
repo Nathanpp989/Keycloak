@@ -3,7 +3,11 @@
 # This file uses only standard, OCI-compliant instructions, so it builds
 # identically with either engine:
 #     docker build -t auth-broker .
-#     podman build -t auth-broker .
+#     podman build --format docker -t auth-broker .
+#
+# NOTE (Podman): the default OCI image format does not store HEALTHCHECK, and
+# podman will warn and ignore it. Build with `--format docker` (as above) to
+# keep the healthcheck, or supply one at run time with `--health-cmd`.
 #
 # (Podman reads "Containerfile" by default; Docker reads "Dockerfile". A
 #  Dockerfile is included too — it's a copy of this file — so both engines work
@@ -12,9 +16,12 @@
 FROM python:3.12-slim
 
 # Don't write .pyc files; unbuffer stdout/stderr so logs stream in real time.
+# App defaults below can be overridden at run time with -e / --env-file.
+# NOTE: no comments inside this continuation — some builders (older Docker,
+# certain buildah versions) do not strip them, which would silently truncate
+# the ENV and drop KEY_DIR. Keep comments above the instruction.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    # App defaults (override at run time with -e / --env-file)
     HOST=0.0.0.0 \
     PORT=8000 \
     KEY_DIR=/data/keys

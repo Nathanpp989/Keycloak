@@ -70,6 +70,20 @@ services:
       AUTH0_AUTHZ_EXTENSION_URL: ${AUTH0_AUTHZ_EXTENSION_URL:-}
       KEY_VAULT_URL: ${KEY_VAULT_URL:-}
       KEY_DIR: /data/keys
+      # Bind all interfaces explicitly. The image sets this too, but relying on
+      # an implicit image ENV is fragile: if it were ever dropped the app would
+      # bind 127.0.0.1 inside the container, the published port would reach
+      # nothing, and the healthcheck (which runs INSIDE the container against
+      # 127.0.0.1) would still report healthy. Stating it here removes that
+      # silent-failure mode.
+      HOST: 0.0.0.0
+      PORT: 8000
+      # Runtime on/off control (see features.py). 'auto' enables each subsystem
+      # only when it is configured and reachable.
+      OPENBAO_MODE: ${OPENBAO_MODE:-auto}
+      AUTH0_MANAGEMENT_MODE: ${AUTH0_MANAGEMENT_MODE:-auto}
+      # Which secrets resolve from OpenBao first (empty = Key Vault only).
+      OPENBAO_SECRETS: ${OPENBAO_SECRETS:-}
       # OpenBao (the Z-axis) — dev server on the compose network. Alongside Key
       # Vault, not replacing it. resolve_secret() tries OpenBao then falls back.
       OPENBAO_ADDR: http://openbao:8200
@@ -85,3 +99,4 @@ services:
 
 volumes:
   keys:
+  

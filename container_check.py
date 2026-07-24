@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+# container_check.py
+# Static validation of the container build — catches real, silent-failure bugs
+# WITHOUT needing a container engine, so it runs anywhere (CI, this sandbox).
+#
+#     python container_check.py
+#
+# It is not a substitute for an actual build; it is the cheap check that runs
+# first. Actually building still needs an engine:
+#     docker build -t auth-broker .
+#     podman build --format docker -t auth-broker .
+#
+# WHY EACH CHECK EXISTS (all of these were found or nearly missed for real):
+#
+#  - Comments inside a line continuation. Modern BuildKit strips them; older
+#    Docker and some buildah versions do not, silently TRUNCATING the
+#    instruction. On this project that would have dropped HOST=0.0.0.0 and
+#    KEY_DIR — and the container would have bound 127.0.0.1 internally, been
+#    unreachable from the host, while the healthcheck (which runs INSIDE the
+#    container against 127.0.0.1) still reported healthy.
+#
+#  - HOST not set to 0.0.0.0. Same silent failure: healthy but unreachable.
+#
+#  - Every module the app imports must actually be COPYed into the image and
+#    every third-party package must be in requirements.txt, or the container
+#    dies at import time on first run.
+#
+#  - .dockerignore must exclude tests and secrets from the build context.
+#
+#  - Dockerfile and Containerfile must stay identical (they are meant to be
+#    copies so both engines work with no extra flags).
+
+from __future__ import annotations
+
+import ast
+import fnmatch
+import os
+import re
+import sys
+
+
+class Check:
+    def __init__(self):
+        self.failed: list[str] = []
+        self.warned: list[str] = []
+
+    def ok(self, msg: str):
+        print(f"  \u2713 {msg}")
+
+    def fail(self, msg: str):
+        self.failed.append(msg)
+        print(f"  \u2717 {msg}")
+
+    def warn(self, msg: str):
+        self.warned.append(msg)
+        print(f"  ! {msg}")
+
+
+def _instructions_with_continuations(text: str) -> list[str]:
+    """
+    Join line continuations WITHOUT stripping comments — i.e. emulate the
+    least-forgiving builder. If an instruction contains a '#' after joining,
+    a strict builder would truncate it there.
+    """
+    joined, buf = [], ""
+    for raw in text.split("\n"):
+        line = raw.rstrip()
+        if buf:
+            buf += " " + line.strip()
+        elif line.endswith("\\"):
+            buf = line[:-1].strip()
+            continue
+        else:
+            joined.append(line)
+            continue
+        if buf.endswith("\\"):
+            buf = buf[:-1].strip()
+            continue
+        joined.append(buf)
+        buf = ""
+    if buf:
+        joined.append(buf)
+    return joined
+
+
+def check_dockerfile(path: str, c: Check) -> None:
+    if not os.path.exists(path):
+        c.fail(f"{path} is missing")
+        return
+    text = open(path).read()
+
+    # 1. No comment inside a continuation (silent truncation risk).
+    bad = []
+    for instr in _instructions_with_continuations(text):
+        if not instr or instr.lstrip().startswith("#"):
+            continue
+        # A '#' that appears after the instruction keyword, in a line that was
+        # built from a continuation, is the dangerous case.
+        if re.match(r"^(ENV|RUN|COPY|ARG|LABEL)\b", instr) and "#" in instr:
+            bad.append(instr[:90])
+    if bad:
+        for b in bad:
+            c.fail(f"{path}: comment inside a line continuation would truncate: "
+                   f"{b}...")
+    else:
+        c.ok(f"{path}: no comments inside line continuations")
+
+    # 2. HOST must be 0.0.0.0 or the container is unreachable from the host
+    #    while still passing its own internal healthcheck.
+    env_line = next((i for i in _instructions_with_continuations(text)
+                     if i.startswith("ENV") and "HOST" in i), "")
+    if "HOST=0.0.0.0" in env_line:
+        c.ok(f"{path}: HOST=0.0.0.0 (reachable from outside the container)")
+    else:
+        c.fail(f"{path}: HOST is not set to 0.0.0.0 — the app would bind "
+               "loopback inside the container and be unreachable, while the "
+               "internal healthcheck still passed")
+
+    # 3. KEY_DIR must survive and be created/chowned.
+    if "KEY_DIR=" in env_line:
+        c.ok(f"{path}: KEY_DIR present in ENV")
+    else:
+        c.fail(f"{path}: KEY_DIR missing from ENV")
+
+    # 4. Non-root user.
+    if re.search(r"^USER\s+\w+", text, re.M):
+        c.ok(f"{path}: runs as a non-root USER")
+    else:
+        c.warn(f"{path}: no USER instruction — container would run as root")
+
+
+def check_dockerignore(c: Check) -> None:
+    if not os.path.exists(".dockerignore"):
+        c.fail(".dockerignore is missing — tests and secrets would be sent to "
+               "the build context")
+        return
+    pats = [l.strip() for l in open(".dockerignore")
+            if l.strip() and not l.startswith("#")]
+
+    def ignored(name: str) -> bool:
+        return any(fnmatch.fnmatch(name, p) or fnmatch.fnmatch(name, p.rstrip("/"))
+                   for p in pats)
+
+    for must in ("test_main.py", "auth0_test.py", ".env", "private.pem"):
+        if ignored(must):
+            c.ok(f".dockerignore excludes {must}")
+        else:
+            c.fail(f".dockerignore does NOT exclude {must} — it would be baked "
+                   "into the image")
+
+
+def check_imports_shipped(c: Check) -> None:
+    """Every module the app imports must be COPYed in, and every third-party
+    package must be in requirements.txt, or the container dies on first run."""
+    dockerignore = [l.strip() for l in open(".dockerignore")
+                    if l.strip() and not l.startswith("#")] \
+        if os.path.exists(".dockerignore") else []
+
+    def shipped(name: str) -> bool:
+        return not any(fnmatch.fnmatch(name, p) or
+                       fnmatch.fnmatch(name, p.rstrip("/")) for p in dockerignore)
+
+    local = {f[:-3] for f in os.listdir(".") if f.endswith(".py")}
+    stdlib = set(sys.stdlib_module_names)
+    reqs = open("requirements.txt").read().lower().replace("-", "") \
+        if os.path.exists("requirements.txt") else ""
+
+    # Walk the import graph from main.py through local modules only.
+    seen, queue, third = set(), ["main.py"], set()
+    missing_local = []
+    while queue:
+        f = queue.pop()
+        if f in seen or not os.path.exists(f):
+            continue
+        seen.add(f)
+        if not shipped(f):
+            missing_local.append(f)
+            continue
+        for node in ast.walk(ast.parse(open(f).read())):
+            mods = []
+            if isinstance(node, ast.Import):
+                mods = [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                mods = [node.module.split(".")[0]]
+            for m in mods:
+                if m in local:
+                    queue.append(m + ".py")
+                elif m not in stdlib:
+                    third.add(m)
+
+    if missing_local:
+        for m in missing_local:
+            c.fail(f"{m} is imported (transitively from main.py) but excluded "
+                   "from the image by .dockerignore")
+    else:
+        c.ok(f"all {len(seen)} local modules reachable from main.py are shipped")
+
+    unmet = [m for m in sorted(third) if m.lower().split("_")[0] not in reqs]
+    if unmet:
+        for m in unmet:
+            c.fail(f"third-party import '{m}' is not in requirements.txt — the "
+                   "container would fail at import time")
+    else:
+        c.ok(f"all {len(third)} third-party imports are in requirements.txt")
+
+
+def check_twins(c: Check) -> None:
+    if not (os.path.exists("Dockerfile") and os.path.exists("Containerfile")):
+        c.warn("only one of Dockerfile/Containerfile present")
+        return
+    if open("Dockerfile").read() == open("Containerfile").read():
+        c.ok("Dockerfile and Containerfile are identical")
+    else:
+        c.fail("Dockerfile and Containerfile have DIVERGED — the two engines "
+               "would build different images")
+
+
+def check_compose(c: Check) -> None:
+    if not os.path.exists("compose.yaml"):
+        c.warn("no compose.yaml")
+        return
+    try:
+        import yaml
+    except ImportError:
+        c.warn("pyyaml not installed; skipping compose checks")
+        return
+    try:
+        conf = yaml.safe_load(open("compose.yaml"))
+    except Exception as exc:  # noqa: BLE001
+        c.fail(f"compose.yaml is not valid YAML: {exc}")
+        return
+    c.ok("compose.yaml is valid YAML")
+    app = (conf.get("services") or {}).get("app") or {}
+    env = app.get("environment") or {}
+    if str(env.get("HOST", "")) == "0.0.0.0":
+        c.ok("compose: app HOST=0.0.0.0 set explicitly")
+    else:
+        c.fail("compose: app does not set HOST=0.0.0.0 explicitly — it would "
+               "rely on an implicit image ENV, and bind loopback if that ever "
+               "changed (healthy but unreachable)")
+    if app.get("ports"):
+        c.ok(f"compose: app publishes {app['ports']}")
+
+
+def run() -> int:
+    print("=" * 68)
+    print("CONTAINER BUILD — STATIC CHECK (no engine required)")
+    print("=" * 68)
+    c = Check()
+    print("\n[Dockerfile]")
+    check_dockerfile("Dockerfile", c)
+    print("\n[Containerfile]")
+    check_dockerfile("Containerfile", c)
+    check_twins(c)
+    print("\n[build context]")
+    check_dockerignore(c)
+    print("\n[imports & dependencies]")
+    check_imports_shipped(c)
+    print("\n[compose]")
+    check_compose(c)
+
+    print("-" * 68)
+    if c.failed:
+        print(f"\u2717 {len(c.failed)} problem(s):")
+        for f in c.failed:
+            print("   - " + f)
+        return 1
+    if c.warned:
+        print(f"({len(c.warned)} warning(s))")
+    print("ALL CONTAINER CHECKS PASSED")
+    print("\nStatic checks only. Build for real with:")
+    print("    docker build -t auth-broker .")
+    print("    podman build --format docker -t auth-broker .")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(run())
