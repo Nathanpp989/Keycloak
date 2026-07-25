@@ -508,9 +508,31 @@ python e2e_smoke.py     # exit 0 = all checks passed
 every module and all HTTP endpoints. CI (`.github/workflows/ci.yml`) runs lint
 (`pyflakes`) and the full suite on every push against Python 3.11 and 3.12.
 
-## Production hardening (not yet implemented)
+## Production hardening
 
-- Rate limiting on `/token` and `/register`
-- HTTPS enforcement / TLS termination (the generated cert is self-signed, dev only)
-- Persisting registered users to your own database where applicable
-- Zero-downtime secret rotation (see above)
+### Rate limiting (implemented)
+
+`/token` (credential brute-force) and `/register` (signup spam) are rate-limited
+per client IP with an in-process sliding window (`rate_limit.py`) — no Redis or
+extra infrastructure. Defaults: 10 logins and 5 registrations per minute per IP,
+tunable via `RATE_LIMIT_*`. A blocked request gets `429` with a `Retry-After`
+header. Two deliberate properties: it is **fail-open** (a limiter error allows
+the request — a security add-on must not break login), and it does **not trust
+`X-Forwarded-For`** unless `RATE_LIMIT_TRUST_PROXY=true`, since a spoofable key
+lets an attacker dodge the limit and lock out victims. Limitation: counters are
+per-process, so behind N replicas the effective limit is N x the value.
+
+### Secrets out of the environment (implemented)
+
+`GITHUB_TOKEN` resolves through the secret store first (`authorize.get_secret`,
+honouring `OPENBAO_SECRETS` and the feature flags), falling back to the env var
+only for local dev — so in production it lives in OpenBao/Key Vault, not the
+process environment. The same pattern applies to any secret.
+
+### Still deployment-side (not code)
+
+- HTTPS / TLS termination at your ingress or proxy (the generated cert is
+  self-signed, dev only).
+- Keycloak realm SMTP, so email-verification and password-reset flows send mail.
+- Persisting registered users to your own database where applicable.
+- Zero-downtime secret rotation (see "Secret rotation" above).

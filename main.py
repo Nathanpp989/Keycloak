@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 import requests
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
-from fastapi import FastAPI, Depends, HTTPException, Form, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, HTTPException, Form, WebSocket, WebSocketDisconnect, Request
 from fastapi.security import HTTPBearer
 from authorize import router as auth0_router, oauth2_scheme
 from keycloak import KeycloakOpenID, KeycloakAdmin
@@ -428,7 +428,21 @@ def read_hello(email: str, username: str):
     return {"email": email, "username": username}
 
 @app.post("/token")
-def login(username: str = Form(...), password: str = Form(...)):
+def login(request: Request,
+          username: str = Form(...), password: str = Form(...)):
+    # Rate-limit BEFORE touching Keycloak: a brute-force attempt shouldn't even
+    # reach the auth server. Fail-open — a limiter bug must not block all logins.
+    try:
+        from rate_limit import login_limiter, client_key
+        allowed, retry = login_limiter().check_and_consume(client_key(request))
+        if not allowed:
+            raise HTTPException(
+                status_code=429, detail="Too many login attempts; slow down.",
+                headers={"Retry-After": str(int(retry) + 1)})
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("rate limiter error on /token (allowing): %s", exc)
     if keycloak_oidc is None:
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
     try:
@@ -459,10 +473,24 @@ def oidc_login(token: str = Depends(oauth2_scheme)):
 
 @app.post("/register")
 def register(
+    request: Request,
     email: str = Form(...),
     password: str = Form(...),
     username: str | None = Form(default=None),
 ):
+    # Rate-limit account creation to curb automated signup spam. Fail-open.
+    try:
+        from rate_limit import register_limiter, client_key
+        allowed, retry = register_limiter().check_and_consume(client_key(request))
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many registration attempts; slow down.",
+                headers={"Retry-After": str(int(retry) + 1)})
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("rate limiter error on /register (allowing): %s", exc)
     """
     Register a new user in BOTH Keycloak and Auth0 via the UserManager.
     If 'username' is omitted, one is derived from the email address.
@@ -855,6 +883,26 @@ def get_keys():
 
 # ── GitHub relay over WebSocket ────────────────────────────────────────────────
 GITHUB_API = "https://api.github.com"
+
+
+def _resolve_github_token() -> str | None:
+    """
+    Resolve the optional GitHub token, preferring a managed secret store.
+
+    Order: OpenBao/Key Vault via authorize.get_secret('GITHUB_TOKEN') (which
+    itself honours OPENBAO_SECRETS and the feature flags), then the GITHUB_TOKEN
+    env var for local dev. Any store error is swallowed — the token is optional,
+    so a missing/broken store just means unauthenticated GitHub calls, never a
+    request failure.
+    """
+    try:
+        from authorize import get_secret
+        val = get_secret("GITHUB_TOKEN")
+        if val:
+            return val
+    except Exception:  # noqa: BLE001 - optional; fall through to env
+        pass
+    return os.environ.get("GITHUB_TOKEN")
 # Only these resource shapes are allowed, so a client can't drive the server to
 # fetch arbitrary URLs (SSRF guard). Each maps to a GitHub REST path builder.
 _GITHUB_ROUTES = {
@@ -888,7 +936,10 @@ def fetch_github(resource: str, params: dict) -> dict:
     headers = {"Accept": "application/vnd.github+json",
                "User-Agent": "keycloak-auth0-broker"}
     # Optional token lifts rate limits / allows private repos; never required.
-    gh_token = os.environ.get("GITHUB_TOKEN")
+    # Prefer a managed secret store (OpenBao/Key Vault) over a bare env var so
+    # the token isn't sitting in the process environment in production; fall
+    # back to the env var for local dev.
+    gh_token = _resolve_github_token()
     if gh_token:
         headers["Authorization"] = f"Bearer {gh_token}"
     try:

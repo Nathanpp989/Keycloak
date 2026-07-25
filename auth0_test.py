@@ -1804,11 +1804,43 @@ def test_fetch_github_network_error_is_502():
 @responses.activate
 def test_fetch_github_sends_token_when_present(monkeypatch):
     import main
+    # No secret store configured in tests -> resolver falls back to the env var.
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+    # Force the store lookup to miss so we exercise the env fallback cleanly
+    # (a real KV/OpenBao would be consulted first in production).
+    monkeypatch.setattr(main, "_resolve_github_token",
+                        lambda: os.environ.get("GITHUB_TOKEN"))
     responses.add(responses.GET, "https://api.github.com/users/octocat",
                   json={"login": "octocat"}, status=200)
     main.fetch_github("user", {"username": "octocat"})
     assert responses.calls[0].request.headers.get("Authorization") == "Bearer ghp_secret"
+
+
+def test_resolve_github_token_prefers_secret_store(monkeypatch):
+    import main
+    import authorize
+    # Store returns a value -> that wins over the env var.
+    monkeypatch.setattr(authorize, "get_secret", lambda n: "from-store")
+    monkeypatch.setenv("GITHUB_TOKEN", "from-env")
+    assert main._resolve_github_token() == "from-store"
+
+def test_resolve_github_token_falls_back_to_env(monkeypatch):
+    import main
+    import authorize
+    def boom(n):
+        raise RuntimeError("no store")
+    monkeypatch.setattr(authorize, "get_secret", boom)
+    monkeypatch.setenv("GITHUB_TOKEN", "from-env")
+    assert main._resolve_github_token() == "from-env"
+
+def test_resolve_github_token_none_when_nowhere(monkeypatch):
+    import main
+    import authorize
+    def boom(n):
+        raise RuntimeError("no store")
+    monkeypatch.setattr(authorize, "get_secret", boom)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    assert main._resolve_github_token() is None
 
 
 # ──────────────────────────────────────────────

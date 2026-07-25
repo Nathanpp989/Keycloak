@@ -1146,3 +1146,54 @@ def test_ensure_client_survives_unexpected_representation(monkeypatch):
     admin.get_client.return_value = []          # unexpected shape
     assert main.ensure_keycloak_client(admin) == "uuid-1"
     admin.update_client.assert_not_called()
+
+
+# ── rate limiting on /token and /register ───────────────────────────────────
+def test_token_rate_limited_after_threshold(client, monkeypatch):
+    import rate_limit
+    monkeypatch.setenv("RATE_LIMIT_LOGIN_MAX", "3")
+    monkeypatch.setenv("RATE_LIMIT_LOGIN_WINDOW", "60")
+    rate_limit.reset_all()
+    # keycloak_oidc is None in tests -> endpoint returns 503, but the RATE LIMIT
+    # runs first. The 4th call within the window must be 429 regardless.
+    monkeypatch.setattr(main, "keycloak_oidc", None)
+    statuses = [client.post("/token", data={"username": "u", "password": "p"}).status_code
+                for _ in range(4)]
+    assert statuses[:3] == [503, 503, 503]   # allowed through to the handler
+    assert statuses[3] == 429                 # blocked by the limiter
+    rate_limit.reset_all()
+
+def test_token_429_includes_retry_after(client, monkeypatch):
+    import rate_limit
+    monkeypatch.setenv("RATE_LIMIT_LOGIN_MAX", "1")
+    rate_limit.reset_all()
+    monkeypatch.setattr(main, "keycloak_oidc", None)
+    client.post("/token", data={"username": "u", "password": "p"})
+    r = client.post("/token", data={"username": "u", "password": "p"})
+    assert r.status_code == 429
+    assert "Retry-After" in r.headers
+    rate_limit.reset_all()
+
+def test_register_rate_limited(client, monkeypatch):
+    import rate_limit
+    monkeypatch.setenv("RATE_LIMIT_REGISTER_MAX", "2")
+    rate_limit.reset_all()
+    monkeypatch.setattr(main, "user_manager", None)   # -> 503 from handler
+    statuses = [client.post("/register",
+                            data={"email": f"a{i}@b.com", "password": "x"}).status_code
+                for i in range(3)]
+    assert statuses[2] == 429     # third within window blocked
+    rate_limit.reset_all()
+
+def test_rate_limit_fails_open_on_limiter_error(client, monkeypatch):
+    # If the limiter itself raises, the request must still be ALLOWED through to
+    # the handler (fail-open) — a security add-on must not break login.
+    import rate_limit
+    rate_limit.reset_all()
+    def boom():
+        raise RuntimeError("limiter exploded")
+    monkeypatch.setattr(rate_limit, "login_limiter", boom)
+    monkeypatch.setattr(main, "keycloak_oidc", None)
+    r = client.post("/token", data={"username": "u", "password": "p"})
+    assert r.status_code == 503    # reached the handler, not blocked
+    rate_limit.reset_all()
