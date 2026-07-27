@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 from unittest.mock import MagicMock, create_autospec
 
 import pytest
+import responses
 from fastapi.testclient import TestClient
 
 import main
@@ -267,6 +268,7 @@ def test_setup_keycloak_returns_existing_secret(monkeypatch):
     fake_admin.get_client_id.return_value = "uuid-1"
     fake_admin.get_client_secrets.return_value = {"value": "real-kc-secret"}
     monkeypatch.setattr(m, "KeycloakAdmin", lambda **kw: fake_admin)
+    monkeypatch.setattr(m, "_ensure_realm", lambda *a, **k: None)
     monkeypatch.setattr(m, "create_keycloak_user", lambda *a, **k: "uid")
     monkeypatch.delenv("KEYCLOAK_CLIENT_SECRET", raising=False)
     secret = m.setup_keycloak()
@@ -280,6 +282,7 @@ def test_setup_keycloak_creates_secret_when_missing(monkeypatch):
     fake_admin.get_client_secrets.return_value = {"value": None}
     fake_admin.generate_client_secrets.return_value = {"value": "newly-created"}
     monkeypatch.setattr(m, "KeycloakAdmin", lambda **kw: fake_admin)
+    monkeypatch.setattr(m, "_ensure_realm", lambda *a, **k: None)
     monkeypatch.setattr(m, "create_keycloak_user", lambda *a, **k: "uid")
     monkeypatch.delenv("KEYCLOAK_CLIENT_SECRET", raising=False)
     secret = m.setup_keycloak()
@@ -293,6 +296,7 @@ def test_setup_keycloak_env_override_wins(monkeypatch):
     fake_admin.get_client_id.return_value = "uuid-1"
     fake_admin.get_client_secrets.return_value = {"value": "kc-secret"}
     monkeypatch.setattr(m, "KeycloakAdmin", lambda **kw: fake_admin)
+    monkeypatch.setattr(m, "_ensure_realm", lambda *a, **k: None)
     monkeypatch.setattr(m, "create_keycloak_user", lambda *a, **k: "uid")
     monkeypatch.setenv("KEYCLOAK_CLIENT_SECRET", "env-override")
     secret = m.setup_keycloak()
@@ -971,6 +975,34 @@ def test_create_keycloak_user_creates_group_if_missing():
     admin.create_group.assert_called_once_with({"name": "users"})
     admin.group_user_add.assert_called_once_with("u-new", "g-new")
 
+def test_create_keycloak_user_finalizes_account():
+    # Regression: a live Keycloak leaves the account "not fully set up" unless
+    # we set email/emailVerified and clear required actions, which makes the
+    # password grant fail with a generic 503. Assert the new user is created
+    # with those fields AND finalized via update + password reset.
+    admin = MagicMock()
+    admin.get_users.return_value = []
+    admin.get_groups.return_value = [{"id": "g", "name": "users"}]
+    admin.create_user.return_value = "u-new"
+    main.create_keycloak_user(admin, "user", "pw", "users")
+    created = admin.create_user.call_args[0][0]
+    assert created["emailVerified"] is True
+    assert created["requiredActions"] == []
+    assert created["email"]                       # a unique email is set
+    admin.update_user.assert_called_once()
+    admin.set_user_password.assert_called_once_with("u-new", "pw", temporary=False)
+
+def test_create_keycloak_user_finalize_failure_is_not_fatal():
+    # Finalization is best-effort: if update_user fails, the user id is still
+    # returned (startup shouldn't crash over a profile tweak).
+    admin = MagicMock()
+    admin.get_users.return_value = []
+    admin.get_groups.return_value = [{"id": "g", "name": "users"}]
+    admin.create_user.return_value = "u-new"
+    admin.update_user.side_effect = RuntimeError("kc rejected update")
+    out = main.create_keycloak_user(admin, "user", "pw", "users")
+    assert out == "u-new"     # no exception propagated
+
 
 # ──────────────────────────────────────────────
 # Endpoint error branches (RuntimeError -> 502, Exception -> 500)
@@ -1133,6 +1165,7 @@ def test_setup_keycloak_provisions_client(monkeypatch):
     fake_admin.get_authentication_flows.return_value = [{"alias": "Hello-World-flow"}]
     fake_admin.get_client_secrets.return_value = {"value": "sec"}
     monkeypatch.setattr(main, "KeycloakAdmin", lambda **kw: fake_admin)
+    monkeypatch.setattr(main, "_ensure_realm", lambda *a, **k: None)
     monkeypatch.setattr(main, "create_keycloak_user", lambda *a, **k: "u-1")
     monkeypatch.delenv("KEYCLOAK_CLIENT_SECRET", raising=False)
     assert main.setup_keycloak() == "sec"
@@ -1197,3 +1230,58 @@ def test_rate_limit_fails_open_on_limiter_error(client, monkeypatch):
     r = client.post("/token", data={"username": "u", "password": "p"})
     assert r.status_code == 503    # reached the handler, not blocked
     rate_limit.reset_all()
+
+
+# ── _ensure_realm: the fresh-Keycloak bootstrap fix ─────────────────────────
+@responses.activate
+def test_ensure_realm_creates_when_missing():
+    import main
+    base = "http://kc:8080"
+    responses.add(responses.POST,
+                  f"{base}/realms/master/protocol/openid-connect/token",
+                  json={"access_token": "adm"}, status=200)
+    responses.add(responses.GET, f"{base}/admin/realms/Premkey", status=404)
+    responses.add(responses.POST, f"{base}/admin/realms", status=201)
+    main._ensure_realm(base, "Premkey", "admin", "admin")
+    # The realm creation POST must have fired with the right body.
+    create = [c for c in responses.calls if c.request.method == "POST"
+              and c.request.url.endswith("/admin/realms")][0]
+    import json as _j
+    body = _j.loads(create.request.body)
+    assert body["realm"] == "Premkey" and body["enabled"] is True
+
+@responses.activate
+def test_ensure_realm_skips_when_present():
+    import main
+    base = "http://kc:8080"
+    responses.add(responses.POST,
+                  f"{base}/realms/master/protocol/openid-connect/token",
+                  json={"access_token": "adm"}, status=200)
+    responses.add(responses.GET, f"{base}/admin/realms/Premkey",
+                  json={"realm": "Premkey"}, status=200)
+    main._ensure_realm(base, "Premkey", "admin", "admin")
+    # No creation POST when the realm already exists.
+    assert not [c for c in responses.calls if c.request.method == "POST"
+                and c.request.url.endswith("/admin/realms")]
+
+@responses.activate
+def test_ensure_realm_tolerates_concurrent_creation():
+    import main
+    base = "http://kc:8080"
+    responses.add(responses.POST,
+                  f"{base}/realms/master/protocol/openid-connect/token",
+                  json={"access_token": "adm"}, status=200)
+    responses.add(responses.GET, f"{base}/admin/realms/Premkey", status=404)
+    responses.add(responses.POST, f"{base}/admin/realms", status=409)  # race
+    # 409 (already created by another worker) must NOT raise.
+    main._ensure_realm(base, "Premkey", "admin", "admin")
+
+@responses.activate
+def test_ensure_realm_raises_on_bad_admin_credentials():
+    import main
+    base = "http://kc:8080"
+    responses.add(responses.POST,
+                  f"{base}/realms/master/protocol/openid-connect/token",
+                  json={"error": "invalid_grant"}, status=401)
+    with pytest.raises(Exception):
+        main._ensure_realm(base, "Premkey", "admin", "wrong")

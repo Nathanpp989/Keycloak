@@ -105,8 +105,32 @@ def create_keycloak_user(admin: KeycloakAdmin, username: str, password: str, gro
     user_id = admin.create_user({
         "username":    username,
         "enabled":     True,
+        "email":         f"{username}@local.invalid",
+        "emailVerified": True,
+        "firstName":     username,
+        "lastName":      username,
+        "requiredActions": [],
         "credentials": [{"type": "password", "value": password, "temporary": False}],
     })
+    # Some Keycloak versions/realm profiles don't persist all fields on create,
+    # leaving the account "not fully set up" so the password grant fails with a
+    # generic invalid_grant (surfaced as a 503 by /token). Explicitly finalize
+    # the account with an update, then (re)set the password non-temporary. This
+    # is idempotent and reliable across versions. Best-effort: a failure here
+    # shouldn't crash startup, so it's guarded.
+    try:
+        admin.update_user(user_id, {
+            "enabled": True,
+            "emailVerified": True,
+            "email": f"{username}@local.invalid",
+            "firstName": username,
+            "lastName": username,
+            "requiredActions": [],
+        })
+        admin.set_user_password(user_id, password, temporary=False)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not finalize user '%s' (login may require manual "
+                       "setup in Keycloak): %s", username, exc)
     admin.group_user_add(user_id, group_id)
     return user_id
 
@@ -177,16 +201,59 @@ def ensure_keycloak_client(admin: KeycloakAdmin) -> str:
     return client_uuid
 
 
+def _ensure_realm(admin_url: str, realm: str, user: str, pw: str,
+                  timeout: int = 10) -> None:
+    """
+    Create the target realm if it doesn't exist yet.
+
+    Without this, a FRESH Keycloak has only the 'master' realm, and every admin
+    call against KEYCLOAK_REALM fails with 404 'Realm not found' — the app could
+    never bootstrap a clean Keycloak, only one where the realm was created by
+    hand. (Mocked tests hid this because KeycloakAdmin was a MagicMock.)
+
+    Uses the admin REST API directly with a master-realm token, since we need to
+    act before a realm-scoped KeycloakAdmin can work.
+    """
+    import requests as _rq
+    base = admin_url.rstrip("/")
+    # Get an admin token from the master realm.
+    tr = _rq.post(
+        f"{base}/realms/master/protocol/openid-connect/token",
+        data={"grant_type": "password", "client_id": "admin-cli",
+              "username": user, "password": pw}, timeout=timeout)
+    tr.raise_for_status()
+    token = tr.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    # Does the realm already exist?
+    r = _rq.get(f"{base}/admin/realms/{realm}", headers=headers, timeout=timeout)
+    if r.status_code == 200:
+        return
+    if r.status_code != 404:
+        r.raise_for_status()
+    # Create it (enabled, with login/registration usable for the app's flows).
+    cr = _rq.post(f"{base}/admin/realms", headers=headers, timeout=timeout,
+                  json={"realm": realm, "enabled": True})
+    if cr.status_code not in (201, 409):   # 409 = created concurrently, fine
+        cr.raise_for_status()
+    logger.info("Created Keycloak realm '%s'", realm)
+
+
 def setup_keycloak() -> str:
     """
     Ensure the realm's auth flow, default user, and client secret exist.
     Returns the client's actual secret so the app can authenticate as a
     confidential client (fixes the secret never being wired into keycloak_oidc).
     """
+    admin_url = os.environ.get("KEYCLOAK_URL", "http://localhost:8080/")
+    admin_user = os.environ.get("KEYCLOAK_ADMIN_USER", "admin")
+    admin_pass = os.environ.get("KEYCLOAK_ADMIN_PASSWORD", "admin")
+    # Create the realm first if it's missing — otherwise every call below 404s
+    # on a fresh Keycloak.
+    _ensure_realm(admin_url, KEYCLOAK_REALM, admin_user, admin_pass)
     admin = KeycloakAdmin(
-        server_url=os.environ.get("KEYCLOAK_URL", "http://localhost:8080/"),
-        username=os.environ.get("KEYCLOAK_ADMIN_USER", "admin"),
-        password=os.environ.get("KEYCLOAK_ADMIN_PASSWORD", "admin"),
+        server_url=admin_url,
+        username=admin_user,
+        password=admin_pass,
         realm_name=KEYCLOAK_REALM,
         user_realm_name="master",
         verify=True

@@ -45,6 +45,14 @@ mocked test suite.
 
 ## Setup
 
+**The app bootstraps a fresh Keycloak automatically.** On startup it creates the
+target realm if missing, provisions the client (with redirect URIs and flows),
+and creates a default `user` account that is fully set up for the password
+grant. You do not need to pre-create the realm by hand — pointing
+`KEYCLOAK_URL` at a clean Keycloak and providing admin credentials is enough.
+This path is verified end to end against a real Keycloak, not just mocks.
+
+
 1. **Create a virtual environment and install dependencies:**
    ```bash
    python3 -m venv venv
