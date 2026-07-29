@@ -56,10 +56,14 @@ def _write_atomic(path: str, data: bytes, mode: int = 0o644):
         os.chmod(tmp, mode)
         os.replace(tmp, path)
     except Exception:
+        # Clean up the temp file, then RE-RAISE. Silently swallowing a failed
+        # key write would leave the app running with no/partial key material and
+        # no signal that anything went wrong — far worse than failing loudly.
         try:
             os.unlink(tmp)
         except OSError:
             pass
+        raise
         raise
 
 def init_rsa_keys():
@@ -445,7 +449,8 @@ def _introspect_token(token: str) -> dict:
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
     try:
         token_info = keycloak_oidc.introspect(token)
-    except Exception:
+    except Exception as exc:
+        logger.error("Token introspection failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
     # P2 FIX: introspect can return None / a non-dict on some error responses;
     # guard before calling .get() so this surfaces as 401, not an unhandled 500.
@@ -517,7 +522,13 @@ def login(request: Request,
         return {"access_token": token_response["access_token"], "token_type": "bearer"}
     except KeycloakAuthenticationError:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    except Exception:
+    except Exception as exc:
+        # Log the REAL cause. Returning a bare 503 with no server-side log is
+        # what made the "Account is not fully set up" startup bug invisible for
+        # so long — an operator saw 503 and had nothing to go on. The client
+        # still gets a generic message; the diagnostic detail goes to the log.
+        logger.error("Token request failed for user '%s': %s",
+                     username, exc, exc_info=True)
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
 
 @app.get("/protected")
@@ -535,7 +546,8 @@ def oidc_login(token: str = Depends(oauth2_scheme)):
         return {"message": f"Hello, {token_info.get('preferred_username', 'user')}!"}
     except HTTPException:
         raise
-    except Exception:
+    except Exception as exc:
+        logger.error("Token introspection failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
 
 @app.post("/register")

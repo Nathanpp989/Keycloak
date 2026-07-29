@@ -1285,3 +1285,38 @@ def test_ensure_realm_raises_on_bad_admin_credentials():
                   json={"error": "invalid_grant"}, status=401)
     with pytest.raises(Exception):
         main._ensure_realm(base, "Premkey", "admin", "wrong")
+
+
+# ── 503 handlers must LOG the real cause (operability regression guard) ──────
+def test_token_503_logs_real_error(client, monkeypatch, caplog):
+    import rate_limit
+    rate_limit.reset_all()
+    class Boom:
+        def token(self, u, p):
+            raise RuntimeError("kc-token-boom")
+    monkeypatch.setattr(main, "keycloak_oidc", Boom())
+    with caplog.at_level("ERROR", logger="main"):
+        r = client.post("/token", data={"username": "u", "password": "p"})
+    assert r.status_code == 503
+    # client gets a generic message, server log has the real cause
+    assert r.json() == {"detail": "Authentication service unavailable"}
+    assert "kc-token-boom" in caplog.text
+    rate_limit.reset_all()
+
+def test_oidc_token_503_logs_real_error(client, monkeypatch, caplog):
+    class Boom:
+        def introspect(self, t):
+            raise RuntimeError("kc-introspect-boom")
+    monkeypatch.setattr(main, "keycloak_oidc", Boom())
+    with caplog.at_level("ERROR", logger="main"):
+        r = client.post("/oidc-token", headers={"Authorization": "Bearer x"})
+    assert r.status_code == 503
+    assert "kc-introspect-boom" in caplog.text
+
+def test_write_atomic_reraises_on_failure(tmp_path, monkeypatch):
+    # A failed key write must propagate, not be silently swallowed.
+    import main
+    target = str(tmp_path / "sub" / "key.pem")   # parent dir doesn't exist
+    # mkstemp will fail because the dir is missing -> must raise, not return None
+    with pytest.raises(Exception):
+        main._write_atomic(target, b"data")
