@@ -316,10 +316,30 @@ class KeycloakAdminAPI:
         return f"{url}/{group_id}" if group_id else url
 
     def list_groups(self) -> list[dict]:
-        """Return top-level realm groups (each may contain subGroups)."""
-        resp = requests.get(self._groups_url(), headers=self.headers, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+        """
+        Return ALL top-level realm groups (each may contain subGroups).
+
+        BUG FIX: Keycloak paginates GET /groups (default 100 per page). The
+        previous single-request version silently returned only the first page,
+        so on a realm with >100 top-level groups, name/path lookups that iterate
+        this list could miss an existing group and create a duplicate. Walk all
+        pages via first/max.
+        """
+        out: list[dict] = []
+        first, page_size = 0, 100
+        while True:
+            resp = requests.get(self._groups_url(), headers=self.headers,
+                                params={"first": first, "max": page_size},
+                                timeout=10)
+            resp.raise_for_status()
+            batch = resp.json()
+            if not isinstance(batch, list) or not batch:
+                break
+            out.extend(batch)
+            if len(batch) < page_size:
+                break
+            first += page_size
+        return out
 
     def _group_children(self, group_id: str) -> list[dict]:
         """

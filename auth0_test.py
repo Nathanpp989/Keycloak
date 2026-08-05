@@ -2512,3 +2512,91 @@ def test_integrate_skips_existing_mappers():
     made = [c for c in responses.calls
             if c.request.method == "POST" and c.request.url.endswith("/mappers")]
     assert made == []   # nothing recreated
+
+
+# ── pagination: _find_by_name must walk ALL pages ───────────────────────────
+@responses.activate
+def test_find_by_name_walks_multiple_pages():
+    # The item is on the SECOND page. A single-page lookup (the old bug) would
+    # miss it and a get-or-create would make a duplicate.
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    # page 0: 100 filler clients, total says there are more
+    page0 = {"clients": [{"name": f"other-{i}", "client_id": f"c{i}"}
+                         for i in range(100)],
+             "total": 150, "start": 0, "limit": 100}
+    # page 1: the one we want
+    page1 = {"clients": [{"name": "keycloak-oidc-client", "client_id": "want"}],
+             "total": 150, "start": 100, "limit": 100}
+    responses.add(responses.GET, f"https://{DOMAIN}/api/v2/clients",
+                  json=page0, status=200)
+    responses.add(responses.GET, f"https://{DOMAIN}/api/v2/clients",
+                  json=page1, status=200)
+    a = Auth0Connect(DOMAIN, "cid", "secret")
+    hit = a.get_client_by_name("keycloak-oidc-client")
+    assert hit is not None and hit["client_id"] == "want"
+
+@responses.activate
+def test_find_by_name_returns_none_when_absent_across_pages():
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    page0 = {"clients": [{"name": f"other-{i}"} for i in range(100)],
+             "total": 150, "start": 0, "limit": 100}
+    page1 = {"clients": [{"name": f"more-{i}"} for i in range(50)],
+             "total": 150, "start": 100, "limit": 100}
+    responses.add(responses.GET, f"https://{DOMAIN}/api/v2/clients",
+                  json=page0, status=200)
+    responses.add(responses.GET, f"https://{DOMAIN}/api/v2/clients",
+                  json=page1, status=200)
+    a = Auth0Connect(DOMAIN, "cid", "secret")
+    assert a.get_client_by_name("does-not-exist") is None
+
+@responses.activate
+def test_find_by_name_stops_after_one_page_when_total_fits():
+    # Only one page needed — must NOT make a second request.
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.GET, f"https://{DOMAIN}/api/v2/connections",
+                  json={"connections": [{"name": "keycloak-google-oauth2",
+                                         "id": "con_1"}],
+                        "total": 1, "start": 0, "limit": 100}, status=200)
+    a = Auth0Connect(DOMAIN, "cid", "secret")
+    hit = a.get_connection_by_name("keycloak-google-oauth2")
+    assert hit["id"] == "con_1"
+    # exactly one GET to /connections (plus the token POST)
+    gets = [c for c in responses.calls if c.request.method == "GET"
+            and "/connections" in c.request.url]
+    assert len(gets) == 1
+
+
+# ── Keycloak list_groups pagination ─────────────────────────────────────────
+@responses.activate
+def test_kc_list_groups_walks_all_pages():
+    from auth0_talk import KeycloakAdminAPI
+    base = "http://kc:8080"
+    url = f"{base}/admin/realms/R/groups"
+    # page 1: exactly 100 -> must fetch page 2
+    responses.add(responses.GET, url,
+                  json=[{"name": f"g{i}", "id": str(i)} for i in range(100)],
+                  status=200)
+    # page 2: 5 more -> stop
+    responses.add(responses.GET, url,
+                  json=[{"name": f"g{i}", "id": str(i)} for i in range(100, 105)],
+                  status=200)
+    api = KeycloakAdminAPI(base, "tok", "R")
+    groups = api.list_groups()
+    assert len(groups) == 105
+    assert groups[-1]["name"] == "g104"
+
+@responses.activate
+def test_kc_list_groups_single_page_stops():
+    from auth0_talk import KeycloakAdminAPI
+    base = "http://kc:8080"
+    url = f"{base}/admin/realms/R/groups"
+    responses.add(responses.GET, url,
+                  json=[{"name": "only", "id": "1"}], status=200)
+    api = KeycloakAdminAPI(base, "tok", "R")
+    groups = api.list_groups()
+    assert len(groups) == 1
+    # exactly one GET (no needless second page)
+    assert len([c for c in responses.calls if c.request.method == "GET"]) == 1

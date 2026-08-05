@@ -94,11 +94,46 @@ class Auth0Connect:
         except ValueError:
             return {}
 
+    def _find_by_name(self, collection: str, name: str,
+                      per_page: int = 100) -> dict | None:
+        """
+        Find an item by its 'name' across ALL pages of an Auth0 Management API
+        collection (e.g. 'clients', 'connections').
+
+        BUG FIX: the previous implementation did a single unpaginated GET, which
+        returns only the first page (Auth0 defaults to 50 for clients, 100 for
+        connections, and hard-caps per_page). On a tenant with more items than
+        one page, an existing item past page 1 was invisible — so a get-or-create
+        would create a DUPLICATE. This walks pages until it finds the name or
+        the collection is exhausted.
+        """
+        page = 0
+        while True:
+            result = self._api("GET", collection, params={
+                "page": page, "per_page": per_page, "include_totals": "true",
+            })
+            # With include_totals=true Auth0 wraps the list in an object keyed by
+            # the collection name, plus paging metadata.
+            if isinstance(result, dict):
+                items = result.get(collection, [])
+                total = result.get("total", len(items))
+                start = result.get("start", page * per_page)
+                limit = result.get("limit", per_page)
+            else:
+                # Defensive: some tenants/tokens may still return a bare list.
+                items = result if isinstance(result, list) else []
+                total, start, limit = len(items), 0, per_page
+            hit = next((i for i in items if i.get("name") == name), None)
+            if hit is not None:
+                return hit
+            # Stop when we've seen everything.
+            if not items or (start + limit) >= total or len(items) < limit:
+                return None
+            page += 1
+
     def get_connection_by_name(self, name: str) -> dict | None:
         """Retrieve an existing Auth0 connection by name (requires read:connections)."""
-        result = self._api("GET", "connections")
-        connections = result if isinstance(result, list) else []
-        return next((c for c in connections if c.get("name") == name), None)
+        return self._find_by_name("connections", name)
 
     def create_connection(self, name: str, strategy: str) -> dict:
         """
@@ -113,10 +148,8 @@ class Auth0Connect:
         return self._api("POST", "connections", json={"name": name, "strategy": strategy})
 
     def get_client_by_name(self, name: str) -> dict | None:
-        """Retrieve an existing Auth0 client by display name."""
-        result = self._api("GET", "clients")
-        clients = result if isinstance(result, list) else []
-        return next((c for c in clients if c.get("name") == name), None)
+        """Retrieve an existing Auth0 client by display name (walks all pages)."""
+        return self._find_by_name("clients", name)
 
     def create_client(self, name: str, callbacks: list[str]) -> dict:
         """
