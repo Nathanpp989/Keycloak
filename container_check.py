@@ -242,6 +242,83 @@ def check_compose(c: Check) -> None:
         c.ok(f"compose: app publishes {app['ports']}")
 
 
+def check_traefik(c: Check) -> None:
+    """
+    Validate the Traefik ForwardAuth wiring. These are the mistakes that would
+    silently break auth or lock you out:
+      - /token, /register, /auth/forward NOT public -> you'd need a token to get
+        a token (chicken-and-egg lockout).
+      - public router priority <= protected -> the protected (catch-all) rule
+        wins and gates everything.
+      - middleware ref not matching the dynamic-config name/provider.
+      - forwardAuth address not pointing at the app's /auth/forward.
+    """
+    if not os.path.exists("compose.yaml"):
+        return
+    try:
+        import yaml
+    except ImportError:
+        c.warn("pyyaml not installed; skipping Traefik checks")
+        return
+    conf = yaml.safe_load(open("compose.yaml"))
+    services = conf.get("services") or {}
+    if "traefik" not in services:
+        return  # Traefik is optional; nothing to check.
+
+    app = services.get("app") or {}
+    labels = app.get("labels") or []
+    label_map = {}
+    for entry in labels:
+        if "=" in entry:
+            k, v = entry.split("=", 1)
+            label_map[k] = v
+
+    pub_rule = label_map.get("traefik.http.routers.app-public.rule", "")
+    for must in ("/token", "/register", "/auth/forward"):
+        if must in pub_rule:
+            c.ok(f"traefik: {must} is on the public router (no auth-to-get-auth)")
+        else:
+            c.fail(f"traefik: {must} is NOT public — it would sit behind "
+                   "ForwardAuth, so a client would need a token to reach the "
+                   "endpoint that issues tokens (lockout)")
+
+    pub_pri = label_map.get("traefik.http.routers.app-public.priority")
+    prot_pri = label_map.get("traefik.http.routers.app-protected.priority")
+    try:
+        if pub_pri and prot_pri and int(pub_pri) > int(prot_pri):
+            c.ok(f"traefik: public router priority ({pub_pri}) > protected "
+                 f"({prot_pri})")
+        else:
+            c.fail(f"traefik: public router priority ({pub_pri}) must exceed "
+                   f"protected ({prot_pri}), or the catch-all protected rule "
+                   "gates the public endpoints")
+    except (TypeError, ValueError):
+        c.fail("traefik: router priorities must be integers")
+
+    mw = label_map.get("traefik.http.routers.app-protected.middlewares", "")
+    if "forward-auth" in mw:
+        c.ok("traefik: protected router references the forward-auth middleware")
+    else:
+        c.fail("traefik: protected router has no forward-auth middleware — it "
+               "would not actually require a token")
+
+    # Dynamic config must define the referenced middleware and point at the app.
+    dyn = "traefik/dynamic/forward-auth.yml"
+    if not os.path.exists(dyn):
+        c.fail(f"traefik: {dyn} is missing — the forward-auth middleware is "
+               "referenced but never defined")
+        return
+    d = yaml.safe_load(open(dyn))
+    mws = ((d or {}).get("http") or {}).get("middlewares") or {}
+    fa = (mws.get("forward-auth") or {}).get("forwardAuth") or {}
+    addr = fa.get("address", "")
+    if "app:8000" in addr and "/auth/forward" in addr:
+        c.ok(f"traefik: forwardAuth address points at the app ({addr})")
+    else:
+        c.fail(f"traefik: forwardAuth address is wrong ({addr!r}); expected "
+               "http://app:8000/auth/forward")
+
+
 def run() -> int:
     print("=" * 68)
     print("CONTAINER BUILD — STATIC CHECK (no engine required)")
@@ -258,6 +335,8 @@ def run() -> int:
     check_imports_shipped(c)
     print("\n[compose]")
     check_compose(c)
+    print("\n[traefik]")
+    check_traefik(c)
 
     print("-" * 68)
     if c.failed:

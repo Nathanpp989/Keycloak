@@ -1143,6 +1143,7 @@ def test_ensure_client_noop_when_already_correct(monkeypatch):
     admin.get_client_id.return_value = "uuid-1"
     admin.get_client.return_value = {
         "clientId": "Hello-World-app", "standardFlowEnabled": True,
+        "directAccessGrantsEnabled": True,
         "redirectUris": ["http://localhost:8000/callback",
                          "http://localhost:8000/*"]}
     main.ensure_keycloak_client(admin)
@@ -1320,3 +1321,102 @@ def test_write_atomic_reraises_on_failure(tmp_path, monkeypatch):
     # mkstemp will fail because the dir is missing -> must raise, not return None
     with pytest.raises(Exception):
         main._write_atomic(target, b"data")
+
+
+def test_ensure_client_heals_direct_access_grants(monkeypatch):
+    # Regression: an EXISTING client created without directAccessGrantsEnabled
+    # must be healed, or every /token password grant fails with
+    # 'unauthorized_client'. The create path set this; the update path did not.
+    admin = MagicMock()
+    admin.get_client_id.return_value = "uuid-1"
+    admin.get_client.return_value = {
+        "clientId": "Hello-World-app",
+        "redirectUris": ["http://localhost:8000/callback",
+                         "http://localhost:8000/*"],
+        "standardFlowEnabled": True,
+        "directAccessGrantsEnabled": False,   # the broken state
+    }
+    main.ensure_keycloak_client(admin)
+    # update_client must have been called with the flag flipped on
+    assert admin.update_client.called
+    sent = admin.update_client.call_args[0][1]
+    assert sent["directAccessGrantsEnabled"] is True
+
+def test_ensure_client_no_update_when_already_correct(monkeypatch):
+    # If the existing client is already fully configured, no update is issued.
+    admin = MagicMock()
+    admin.get_client_id.return_value = "uuid-1"
+    admin.get_client.return_value = {
+        "clientId": "Hello-World-app",
+        "redirectUris": ["http://localhost:8000/callback",
+                         "http://localhost:8000/*"],
+        "standardFlowEnabled": True,
+        "directAccessGrantsEnabled": True,
+    }
+    main.ensure_keycloak_client(admin)
+    admin.update_client.assert_not_called()
+
+
+# ── Traefik ForwardAuth endpoint ────────────────────────────────────────────
+def test_forward_auth_allows_valid_token(client, monkeypatch):
+    # A valid token -> 200 (Traefik reads 2xx as "allow") + identity headers.
+    monkeypatch.setattr(main, "_introspect_token",
+                        lambda t: {"active": True, "preferred_username": "alice",
+                                   "sub": "kc-123"})
+    r = client.get("/auth/forward", headers={"Authorization": "Bearer good"})
+    assert r.status_code == 200
+    assert r.headers.get("X-Auth-User") == "alice"
+    assert r.headers.get("X-Auth-Subject") == "kc-123"
+
+def test_forward_auth_denies_missing_token(client):
+    # No Authorization header -> 401 (Traefik reads non-2xx as "deny").
+    r = client.get("/auth/forward")
+    assert r.status_code == 401
+    assert r.headers.get("WWW-Authenticate") == "Bearer"
+
+def test_forward_auth_denies_non_bearer(client):
+    r = client.get("/auth/forward", headers={"Authorization": "Basic abc"})
+    assert r.status_code == 401
+
+def test_forward_auth_denies_empty_bearer(client):
+    r = client.get("/auth/forward", headers={"Authorization": "Bearer "})
+    assert r.status_code == 401
+
+def test_forward_auth_propagates_401_for_inactive_token(client, monkeypatch):
+    # _introspect_token raises 401 for an inactive token -> deny.
+    def raise_401(t):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="Token is inactive or expired")
+    monkeypatch.setattr(main, "_introspect_token", raise_401)
+    r = client.get("/auth/forward", headers={"Authorization": "Bearer stale"})
+    assert r.status_code == 401
+
+def test_forward_auth_propagates_503_when_backend_down(client, monkeypatch):
+    # Introspection backend unreachable -> 503 (auth temporarily unavailable),
+    # NOT a silent allow. Traefik will deny on 503 too, which is correct.
+    def raise_503(t):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=503, detail="Authentication service unavailable")
+    monkeypatch.setattr(main, "_introspect_token", raise_503)
+    r = client.get("/auth/forward", headers={"Authorization": "Bearer x"})
+    assert r.status_code == 503
+
+def test_forward_auth_works_for_post_method(client, monkeypatch):
+    # Traefik calls ForwardAuth regardless of the original method; POST must work.
+    monkeypatch.setattr(main, "_introspect_token",
+                        lambda t: {"active": True, "preferred_username": "bob",
+                                   "sub": "s"})
+    r = client.post("/auth/forward", headers={"Authorization": "Bearer good"})
+    assert r.status_code == 200
+    assert r.headers.get("X-Auth-User") == "bob"
+
+def test_forward_auth_does_not_trust_inbound_identity_headers(client, monkeypatch):
+    # A client forging X-Auth-User must NOT have it echoed back; the endpoint
+    # sets identity from the validated token only.
+    monkeypatch.setattr(main, "_introspect_token",
+                        lambda t: {"active": True, "preferred_username": "real",
+                                   "sub": "s"})
+    r = client.get("/auth/forward",
+                   headers={"Authorization": "Bearer good",
+                            "X-Auth-User": "attacker"})
+    assert r.headers.get("X-Auth-User") == "real"    # from token, not the forged header

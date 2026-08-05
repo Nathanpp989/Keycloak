@@ -373,6 +373,75 @@ URL ... the IdP must be reachable FROM the OpenBao server"). In the compose
 stack this works because all services share a network; for a local dev server
 talking to a container, ensure the URLs resolve from OpenBao's point of view.
 
+## Traefik (edge proxy + ForwardAuth)
+
+Traefik fronts the whole stack: it terminates TLS and routes to Keycloak,
+OpenBao, and the app by hostname, and it protects the app's non-public routes by
+delegating the auth decision to the app itself via **ForwardAuth**.
+
+Bring it up with the rest of the stack:
+
+```bash
+docker compose up --build     # or podman compose up --build
+```
+
+Add these to `/etc/hosts` (most systems already resolve `*.localhost` to
+127.0.0.1, so this may be unnecessary):
+
+```
+127.0.0.1  app.localhost  keycloak.localhost  openbao.localhost
+```
+
+Then:
+- App:        https://app.localhost/
+- Keycloak:   https://keycloak.localhost/
+- OpenBao:    https://openbao.localhost/
+- Dashboard:  http://localhost:8090/dashboard/
+
+### How ForwardAuth works here
+
+On every request to a *protected* app route, Traefik calls the app's
+`GET/POST /auth/forward` endpoint, forwarding the original request's headers. The
+endpoint validates the bearer token (the same Keycloak introspection path the
+app's own endpoints use) and returns:
+
+- **2xx** -> Traefik proceeds to the app, adding `X-Auth-User` / `X-Auth-Subject`
+  from the *validated token*.
+- **401/503** -> Traefik denies, returning that status to the client.
+
+The public routes (`/token`, `/register`, `/auth/forward`, `/`, `/keys`,
+`/status/*`) are deliberately NOT behind ForwardAuth — otherwise you'd need a
+token to reach the endpoint that issues tokens. This is enforced by router
+priority (public > protected) and validated by `container_check.py`.
+
+### Verifying the whole stack end to end
+
+`container_check.py` validates the config statically, and the ForwardAuth
+endpoint is unit-tested — but to confirm real requests route and gate correctly
+through the actual proxy, run the end-to-end smoke once you have an engine:
+
+```bash
+./traefik_smoke.sh            # brings the stack up and tests it
+./traefik_smoke.sh --down     # also tears it down afterwards
+COMPOSE="podman compose" ./traefik_smoke.sh   # use podman
+```
+
+It asserts the things only a live proxy can prove: public routes answer without
+a token, `/protected` is DENIED (401) without one and ALLOWED (200) with a valid
+token through Traefik, a forged `X-Auth-User` cannot impersonate, and the other
+services are routed. On failure it points you at the Traefik dashboard
+(http://localhost:8090/dashboard/) and the relevant logs.
+
+### Trust boundary
+
+`X-Auth-User`/`X-Auth-Subject` are set by the app from the validated token and
+copied back onto the upstream request by Traefik (`authResponseHeaders`). The
+endpoint never echoes client-supplied `X-Auth-*` headers, and `container_check`
+plus the test suite guard that a forged header cannot impersonate a user. The app
+also trusts `X-Forwarded-For` for rate limiting only now that Traefik fronts it
+(`RATE_LIMIT_TRUST_PROXY=true`) — never enable that when the app is directly
+reachable.
+
 ## Turning subsystems on and off
 
 `features.py` gives each OPTIONAL subsystem three modes. Check live state at

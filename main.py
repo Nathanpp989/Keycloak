@@ -12,6 +12,7 @@ import requests
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
 from fastapi import FastAPI, Depends, HTTPException, Form, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer
 from authorize import router as auth0_router, oauth2_scheme
 from keycloak import KeycloakOpenID, KeycloakAdmin
@@ -198,10 +199,18 @@ def ensure_keycloak_client(admin: KeycloakAdmin) -> str:
         updates["redirectUris"] = uris
     if not rep.get("standardFlowEnabled"):
         updates["standardFlowEnabled"] = True
+    # Heal directAccessGrantsEnabled too. The /token endpoint uses the password
+    # (direct access) grant; if an existing client was created without this flag
+    # (e.g. by hand, or by an older version of this code), every /token login
+    # fails with 'unauthorized_client: Client not allowed for direct access
+    # grants'. The create path sets this, so the update path must too — otherwise
+    # a pre-existing client silently can't serve /token.
+    if not rep.get("directAccessGrantsEnabled"):
+        updates["directAccessGrantsEnabled"] = True
     if updates:
         admin.update_client(client_uuid, {**rep, **updates})
-        logger.info("Updated Keycloak client '%s': redirect URIs now %s",
-                    KEYCLOAK_CLIENT_ID, uris)
+        logger.info("Updated Keycloak client '%s': %s",
+                    KEYCLOAK_CLIENT_ID, ", ".join(sorted(updates)))
     return client_uuid
 
 
@@ -534,6 +543,67 @@ def login(request: Request,
 @app.get("/protected")
 def protected_route(token_info: dict = Depends(require_keycloak_auth)):
     return {"message": f"Hello, {token_info.get('preferred_username', 'user')}!"}
+
+
+@app.api_route("/auth/forward", methods=["GET", "POST", "PUT", "DELETE",
+                                          "PATCH", "HEAD", "OPTIONS"])
+def traefik_forward_auth(request: Request):
+    """
+    Traefik ForwardAuth endpoint.
+
+    Traefik's ForwardAuth middleware calls this on every request to a protected
+    service, forwarding the ORIGINAL request's headers. A 2xx response means
+    "allow" and Traefik proceeds to the upstream; any non-2xx means "deny" and
+    Traefik returns that status to the client instead of proxying.
+
+    Contract details that matter:
+    - Traefik forwards the original Authorization header, so we validate the
+      same bearer token the app's own endpoints use (via _introspect_token) —
+      one source of truth for "is this token valid", reused here.
+    - On allow, we return identity headers (X-Auth-User, X-Auth-Subject). Traefik
+      copies back only the headers named in its `authResponseHeaders` config, so
+      the upstream service can trust these WITHOUT re-validating — but only
+      because they arrive from Traefik, which stripped any client-supplied copies
+      first (see the compose/dynamic config). We do not trust inbound X-Auth-*.
+    - The original method/path/host arrive as X-Forwarded-* headers; we log them
+      for auditability but authorization here is authentication-only (valid token
+      => allow). Per-route authorization is enforced by Traefik's routing rules.
+
+    Any missing/invalid token yields 401 (deny) rather than 503, because to
+    Traefik a non-2xx is simply "deny" and 401 is the correct signal to the
+    client; introspection-backend failures still surface as 503.
+    """
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        # No credentials -> deny. 401 tells the client to authenticate.
+        raise HTTPException(status_code=401, detail="Missing bearer token",
+                            headers={"WWW-Authenticate": "Bearer"})
+    token = auth.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Empty bearer token",
+                            headers={"WWW-Authenticate": "Bearer"})
+
+    # Reuse the app's single token-validation path. This raises 401 for an
+    # inactive/expired token and 503 if the introspection backend is unreachable
+    # — both correct signals for Traefik (401 deny, 503 = auth temporarily down).
+    token_info = _introspect_token(token)
+
+    # Allowed. Hand identity back to the upstream via response headers that
+    # Traefik is configured to copy (authResponseHeaders). The upstream must
+    # treat these as trusted ONLY when they arrive via Traefik.
+    username = str(token_info.get("preferred_username", ""))
+    subject = str(token_info.get("sub", ""))
+    fwd_for = request.headers.get("x-forwarded-for", "")
+    fwd_method = request.headers.get("x-forwarded-method", "")
+    fwd_uri = request.headers.get("x-forwarded-uri", "")
+    if fwd_method or fwd_uri:
+        logger.info("ForwardAuth allow: user=%s %s %s (xff=%s)",
+                    username or "?", fwd_method, fwd_uri, fwd_for)
+    return JSONResponse(
+        status_code=200,
+        content={"status": "authenticated"},
+        headers={"X-Auth-User": username, "X-Auth-Subject": subject},
+    )
 
 @app.post("/oidc-token")
 def oidc_login(token: str = Depends(oauth2_scheme)):

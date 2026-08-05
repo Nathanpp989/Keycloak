@@ -10,6 +10,43 @@
 # shell environment before running.
 
 services:
+  # ── Traefik: edge reverse proxy + TLS terminator + ForwardAuth gateway ──────
+  # Routes to keycloak, openbao, and the app by hostname, and protects selected
+  # routes by delegating the auth decision to the app's /auth/forward endpoint
+  # (ForwardAuth). Uses Docker provider labels below for per-service routing.
+  #
+  # Hostnames resolve via /etc/hosts or a local DNS entry pointing at 127.0.0.1:
+  #   127.0.0.1  app.localhost  keycloak.localhost  openbao.localhost
+  # (*.localhost already resolves to 127.0.0.1 on most systems.)
+  traefik:
+    image: traefik:v3.1
+    command:
+      - "--api.dashboard=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      # Dev TLS: Traefik's built-in self-signed cert. For real certs, add an
+      # ACME/Let's Encrypt resolver or mount your own cert (see dynamic config).
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--providers.file.watch=true"
+      - "--log.level=INFO"
+      - "--accesslog=true"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8090:8080"   # Traefik dashboard (http://localhost:8090/dashboard/)
+    volumes:
+      # Read-only access to the Docker socket so Traefik can discover services.
+      # SECURITY NOTE: mounting the Docker socket grants broad host access; for
+      # production, use a socket proxy (e.g. tecnativa/docker-socket-proxy) that
+      # exposes only the read-only endpoints Traefik needs.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/dynamic:/etc/traefik/dynamic:ro
+    depends_on:
+      app:
+        condition: service_started
+
   keycloak:
     image: quay.io/keycloak/keycloak:26.0
     command: start-dev
@@ -19,8 +56,21 @@ services:
       # C1: health endpoints only exist when enabled, and on Keycloak 25+ they
       # are served on the MANAGEMENT port (9000), not 8080.
       KC_HEALTH_ENABLED: "true"
-    ports:
-      - "8080:8080"
+      # Behind a proxy Keycloak must know its external URL and trust the proxy's
+      # forwarded headers, or redirect URIs and issuer come out wrong.
+      KC_PROXY_HEADERS: xforwarded
+      KC_HOSTNAME: http://keycloak.localhost
+      KC_HOSTNAME_STRICT: "false"
+    # No direct host port publish anymore — Traefik fronts it. (Keep the
+    # container port internal to the compose network.)
+    expose:
+      - "8080"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.keycloak.rule=Host(`keycloak.localhost`)"
+      - "traefik.http.routers.keycloak.entrypoints=websecure"
+      - "traefik.http.routers.keycloak.tls=true"
+      - "traefik.http.services.keycloak.loadbalancer.server.port=8080"
     # The Keycloak image has bash but no curl/wget, so use bash's /dev/tcp.
     # C1: check port 9000 (management interface), where /health/ready lives.
     healthcheck:
@@ -37,8 +87,17 @@ services:
     command: server -dev -dev-root-token-id=root -dev-listen-address=0.0.0.0:8200
     environment:
       BAO_DEV_ROOT_TOKEN_ID: root
-    ports:
-      - "8200:8200"
+    expose:
+      - "8200"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.openbao.rule=Host(`openbao.localhost`)"
+      - "traefik.http.routers.openbao.entrypoints=websecure"
+      - "traefik.http.routers.openbao.tls=true"
+      - "traefik.http.services.openbao.loadbalancer.server.port=8200"
+      # OpenBao's own API tokens ARE its auth; we don't put ForwardAuth in front
+      # of it (that would double-gate and break the OIDC/JWT flows). Routed but
+      # not ForwardAuth-protected.
     healthcheck:
       # /v1/sys/health returns 200 when the (dev) server is unsealed & active.
       test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8200 && echo -e 'GET /v1/sys/health HTTP/1.0\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200 OK'"]
@@ -52,8 +111,29 @@ services:
       context: .
       # Explicit so both engines pick the same file; Containerfile == Dockerfile.
       dockerfile: Containerfile
-    ports:
-      - "8000:8000"
+    # No direct host port publish — Traefik fronts it.
+    expose:
+      - "8000"
+    labels:
+      - "traefik.enable=true"
+      # Public router: the auth endpoints themselves (/token, /register,
+      # /auth/forward, /) must NOT sit behind ForwardAuth, or you'd need a token
+      # to get a token. This router carries no auth middleware.
+      - "traefik.http.routers.app-public.rule=Host(`app.localhost`) && (PathPrefix(`/token`) || PathPrefix(`/register`) || PathPrefix(`/auth/forward`) || Path(`/`) || PathPrefix(`/keys`) || PathPrefix(`/status`))"
+      - "traefik.http.routers.app-public.entrypoints=websecure"
+      - "traefik.http.routers.app-public.tls=true"
+      - "traefik.http.routers.app-public.service=app"
+      # Protected router: everything else on the app host requires a valid token,
+      # enforced by the ForwardAuth middleware defined in the dynamic config.
+      - "traefik.http.routers.app-protected.rule=Host(`app.localhost`)"
+      - "traefik.http.routers.app-protected.entrypoints=websecure"
+      - "traefik.http.routers.app-protected.tls=true"
+      - "traefik.http.routers.app-protected.service=app"
+      - "traefik.http.routers.app-protected.middlewares=forward-auth@file"
+      # Higher priority for the public router so its more specific rule wins.
+      - "traefik.http.routers.app-public.priority=100"
+      - "traefik.http.routers.app-protected.priority=1"
+      - "traefik.http.services.app.loadbalancer.server.port=8000"
     environment:
       # Point the app at the Keycloak service by its compose network name.
       KEYCLOAK_URL: http://keycloak:8080
@@ -78,6 +158,11 @@ services:
       # silent-failure mode.
       HOST: 0.0.0.0
       PORT: 8000
+      # The app now sits behind Traefik, so the client IP arrives in
+      # X-Forwarded-For. Trust it for rate limiting — but ONLY because Traefik
+      # sets it and strips client-supplied copies. Never enable this when the
+      # app is directly reachable.
+      RATE_LIMIT_TRUST_PROXY: "true"
       # Runtime on/off control (see features.py). 'auto' enables each subsystem
       # only when it is configured and reachable.
       OPENBAO_MODE: ${OPENBAO_MODE:-auto}
@@ -99,4 +184,3 @@ services:
 
 volumes:
   keys:
-  
