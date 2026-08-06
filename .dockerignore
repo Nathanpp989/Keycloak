@@ -17,3 +17,16 @@ pytest.ini
 .github/
 README.md
 *.md
+# Dev/test tooling that the app never imports at runtime. Excluding these keeps
+# the image slim and, importantly, avoids shipping a file whose imports aren't
+# in requirements.txt (container_check.py imports pyyaml, which is a dev-only
+# dependency). The OPERATIONAL tools (openbao_setup.py, rotate_secret.py,
+# diagnose_idp.py, fix_redirect_uri.py, login_flow.py) are deliberately NOT
+# excluded — you may want to `exec` them inside a running container, and they
+# rely only on packages already in requirements.txt.
+container_check.py
+e2e_smoke.py
+endpoint_smoke.py
+integration_test_live.py
+openbao_smoke.py
+openbao_login_smoke.py

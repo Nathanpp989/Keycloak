@@ -203,6 +203,37 @@ def check_imports_shipped(c: Check) -> None:
     else:
         c.ok(f"all {len(third)} third-party imports are in requirements.txt")
 
+    # Beyond the runtime graph above: COPY *.py bakes in EVERY non-ignored .py
+    # file, and any one of them run inside the container (e.g. via `exec`) needs
+    # its imports satisfiable. A shipped file importing a package not in
+    # requirements is a latent ModuleNotFoundError. (This is how a dev tool that
+    # imported pyyaml — not a runtime dep — slipped into the image before.)
+    shipped_third: dict[str, str] = {}
+    for f in os.listdir("."):
+        if not f.endswith(".py") or not shipped(f):
+            continue
+        try:
+            tree = ast.parse(open(f).read())
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            mods = []
+            if isinstance(node, ast.Import):
+                mods = [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                mods = [node.module.split(".")[0]]
+            for m in mods:
+                if m not in stdlib and m not in local and \
+                        m.lower().split("_")[0] not in reqs:
+                    shipped_third.setdefault(m, f)
+    if shipped_third:
+        for m, f in sorted(shipped_third.items()):
+            c.fail(f"shipped file {f} imports '{m}', not in requirements.txt — "
+                   f"running it inside the container would crash. Either add the "
+                   f"dep or exclude {f} in .dockerignore.")
+    else:
+        c.ok("every shipped .py file's imports are satisfiable in the image")
+
 
 def check_twins(c: Check) -> None:
     if not (os.path.exists("Dockerfile") and os.path.exists("Containerfile")):

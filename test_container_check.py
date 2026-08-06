@@ -104,3 +104,29 @@ def test_real_project_passes_all_container_checks():
         assert cc.run() == 0
     finally:
         os.chdir(cwd)
+
+
+def test_flags_shipped_file_with_unmet_dep(tmp_path, monkeypatch):
+    # A shipped .py importing a package not in requirements must be flagged —
+    # this is the check that catches a dev tool (importing e.g. pyyaml) leaking
+    # into the image.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "requirements.txt").write_text("requests>=2.0\n")
+    (tmp_path / "main.py").write_text("import requests\n")
+    (tmp_path / ".dockerignore").write_text("__pycache__/\n")
+    # a shipped tool importing something NOT in requirements
+    (tmp_path / "sometool.py").write_text("import yaml\n")
+    c = cc.Check()
+    cc.check_imports_shipped(c)
+    assert any("sometool.py" in f and "yaml" in f for f in c.failed)
+
+def test_shipped_file_excluded_is_not_flagged(tmp_path, monkeypatch):
+    # Same tool, but excluded via .dockerignore -> not shipped -> no failure.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "requirements.txt").write_text("requests>=2.0\n")
+    (tmp_path / "main.py").write_text("import requests\n")
+    (tmp_path / ".dockerignore").write_text("__pycache__/\nsometool.py\n")
+    (tmp_path / "sometool.py").write_text("import yaml\n")
+    c = cc.Check()
+    cc.check_imports_shipped(c)
+    assert not any("sometool.py" in f for f in c.failed)
