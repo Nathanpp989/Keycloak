@@ -110,7 +110,7 @@ services:
     build:
       context: .
       # Explicit so both engines pick the same file; Containerfile == Dockerfile.
-      dockerfile: Containerfile
+      dockerfile: Dockerfile
     # No direct host port publish — Traefik fronts it.
     expose:
       - "8000"
