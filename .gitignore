@@ -61,3 +61,6 @@ data/
 *.jar
 version.txt
 LICENSE.txt
+data/
+version.txt
+LICENSE.txt
