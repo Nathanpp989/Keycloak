@@ -74,7 +74,13 @@ services:
     # The Keycloak image has bash but no curl/wget, so use bash's /dev/tcp.
     # C1: check port 9000 (management interface), where /health/ready lives.
     healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && echo -e 'GET /health/ready HTTP/1.0\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200 OK'"]
+      # The Keycloak image ships bash (but NO curl/wget), so we use bash's
+      # /dev/tcp support to probe the health endpoint. This is the approach the
+      # official Keycloak docs recommend. Health endpoints live on the MANAGEMENT
+      # port 9000 (not 8080) and only exist because KC_HEALTH_ENABLED=true above.
+      # We invoke bash explicitly: CMD-SHELL uses /bin/sh, and /dev/tcp is a bash
+      # feature — running it under sh would silently fail.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000; printf 'GET /health/ready HTTP/1.0\\r\\n\\r\\n' >&3; grep -q 'HTTP/1.0 200' <&3"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -99,8 +105,11 @@ services:
       # of it (that would double-gate and break the OIDC/JWT flows). Routed but
       # not ForwardAuth-protected.
     healthcheck:
-      # /v1/sys/health returns 200 when the (dev) server is unsealed & active.
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8200 && echo -e 'GET /v1/sys/health HTTP/1.0\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200 OK'"]
+      # The OpenBao image is Alpine-based: it has NO bash, so a /dev/tcp probe
+      # fails even though the server is fine. It DOES ship wget. Probe the
+      # health endpoint with wget --spider (exit 0 on a 2xx response). In dev
+      # mode OpenBao is initialized+unsealed+active, so /v1/sys/health => 200.
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8200/v1/sys/health || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -184,3 +193,4 @@ services:
 
 volumes:
   keys:
+  

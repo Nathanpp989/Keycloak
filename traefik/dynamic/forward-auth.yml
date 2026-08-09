@@ -1,41 +1,18 @@
 # Traefik dynamic configuration — ForwardAuth middleware.
-#
-# This defines the `forward-auth` middleware referenced by the app's
-# `app-protected` router in compose.yaml. On every request to a protected route,
-# Traefik calls the app's /auth/forward endpoint, forwarding the original
-# request's headers. A 2xx response allows the request through; any other status
-# is returned to the client instead (deny).
-#
-# WHY a file provider (not a Docker label): the middleware points at the app by
-# its compose network name, and keeping it here (watched, hot-reloaded) makes the
-# trust boundary explicit and reviewable in one place.
-
 http:
   middlewares:
     forward-auth:
       forwardAuth:
-        # The app's ForwardAuth endpoint, reachable on the compose network.
         address: "http://app:8000/auth/forward"
-
-        # Copy these identity headers from the auth response back onto the
-        # upstream request. The upstream may trust them BECAUSE Traefik sets them
-        # from the auth response and strips any client-supplied copies first.
-        # If you add headers here, the endpoint must set them from the validated
-        # token, never echo them from the inbound request.
         authResponseHeaders:
           - "X-Auth-User"
           - "X-Auth-Subject"
-
-        # Forward the original method and URI so the auth endpoint can log/audit
-        # (and, if you extend it, make per-route authorization decisions).
-        # Traefik always sends X-Forwarded-For/-Host/-Proto; these add method/uri.
-        # (trustForwardHeader stays false: do NOT trust forward headers the
-        #  CLIENT sent to the auth server; Traefik sets its own.)
         trustForwardHeader: false
 
-  # Optional: a TLS options block hardening the dev endpoints. Real certificates
-  # come from an ACME resolver (add to Traefik static config) or a mounted cert.
-  tls:
-    options:
-      default:
-        minVersion: "VersionTLS12"
+# TLS options are a TOP-LEVEL key (sibling of http, NOT nested under it).
+# Nesting under http makes Traefik reject the whole file with
+# "field not found, node: tls", which drops the middleware above.
+tls:
+  options:
+    default:
+      minVersion: "VersionTLS12"
