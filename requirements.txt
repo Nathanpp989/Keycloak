@@ -1,40 +1,14 @@
-# FastAPI and web framework
 fastapi>=0.110.0
 uvicorn>=0.29.0
-pydantic>=2.0.0
-
-# Authentication and security
-python-jose>=3.3.0
-passlib>=1.7.4
 python-multipart>=0.0.9
-cryptography>=42.0.0
-argon2-cffi>=23.1.0
-pyopenssl>=23.3.0
-
-# Keycloak
 python-keycloak>=3.9.0
-
-# Auth0
-auth0-python>=4.32.0
-
-# Azure Key Vault
+python-jose[cryptography]>=3.3.0
+argon2-cffi>=23.1.0
+cryptography>=42.0.0
 azure-identity>=1.16.0
 azure-keyvault-secrets>=4.8.0
-
-# HTTP requests
 requests>=2.31.0
-
-# Testing
-pytest>=7.4.3
-pytest-cov>=4.1.0
-httpx>=0.25.1
-
-# Database (if needed)
-Flask-SQLAlchemy>=2.5.1
-psycopg2-binary>=2.9.1
-
-# Utilities
+pydantic>=2.0.0
 python-dotenv>=1.0.0
-
-#WebSocket support
 websockets>=12.0
+pyjwt>=2.8.0

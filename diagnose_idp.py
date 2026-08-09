@@ -312,6 +312,12 @@ def verify_idp_secret(domain: str, client_id: str, client_secret: str,
 
     Returns (secret_is_valid, human_detail).
     """
+    if client_secret == client_id:
+        return False, ("you supplied the CLIENT ID, not the client secret. They "
+                       "are different values: in Auth0 -> Applications -> your "
+                       "app -> Settings, the Client Secret is a separate, longer "
+                       "field below Client ID (click the eye/copy icon to reveal "
+                       "it).")
     try:
         r = requests.post(f"https://{domain}/oauth/token", timeout=timeout, data={
             "grant_type": "authorization_code",

@@ -624,3 +624,12 @@ def test_explain_generic_failure_does_not_assert_success():
     assert "SUCCEEDED" not in msg
     assert "feacft" in msg and "seacft" in msg
     assert "Monitoring" in msg or "Auth0" in msg
+
+
+@responses.activate
+def test_verify_idp_secret_rejects_client_id_as_secret():
+    # Common mistake: pasting the Client ID into --set-idp-secret. Must be named
+    # explicitly and must not even hit the network.
+    ok, detail = diagnose_idp.verify_idp_secret(DOMAIN, "SAME-VALUE", "SAME-VALUE")
+    assert ok is False and "CLIENT ID" in detail
+    assert not responses.calls   # short-circuits before any Auth0 request

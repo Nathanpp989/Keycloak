@@ -58,7 +58,7 @@ class UserManager:
     """Detects user presence across systems and creates users in both."""
 
     def __init__(self, keycloak: KeycloakAdminAPI, auth0_users: Auth0UsersAPI,
-                auth0_authz=None, auth0_orgs=None):
+                 auth0_authz=None, auth0_orgs=None):
         self.keycloak = keycloak
         self.auth0_users = auth0_users
         # Optional Auth0AuthzExtensionAPI; group lookup is skipped if not provided.
@@ -70,7 +70,7 @@ class UserManager:
     def _keycloak_user_id(self, username: str, email: str) -> str | None:
         """Return the Keycloak user id for an email (preferred) or username."""
         for params in ({"email": email, "exact": "true"},
-                    {"username": username, "exact": "true"}):
+                       {"username": username, "exact": "true"}):
             resp = requests.get(
                 self.keycloak._users_url(),
                 headers=self.keycloak.headers,
@@ -131,25 +131,25 @@ class UserManager:
 
         Returns:
         {
-        "username": ..., "email": ...,
-        "keycloak": {
-            "found": bool,
-            "groups": [{"name","path","is_subgroup"}],
-            "roles":  {"realm": [...], "client": [...]},
-        },
-        "auth0": {
-            "found": bool,
-            "groups": [{"name","is_subgroup"}],   # [] if no Authz Extension
-            "roles":  [...],
-        },
-        "correlation": {
-            "groups_in_both":      [names present in both systems],
-            "groups_keycloak_only":[...],
-            "groups_auth0_only":   [...],
-            "roles_in_both":       [...],
-            "roles_keycloak_only": [...],
-            "roles_auth0_only":    [...],
-        }
+          "username": ..., "email": ...,
+          "keycloak": {
+              "found": bool,
+              "groups": [{"name","path","is_subgroup"}],
+              "roles":  {"realm": [...], "client": [...]},
+          },
+          "auth0": {
+              "found": bool,
+              "groups": [{"name","is_subgroup"}],   # [] if no Authz Extension
+              "roles":  [...],
+          },
+          "correlation": {
+              "groups_in_both":      [names present in both systems],
+              "groups_keycloak_only":[...],
+              "groups_auth0_only":   [...],
+              "roles_in_both":       [...],
+              "roles_keycloak_only": [...],
+              "roles_auth0_only":    [...],
+          }
         }
         Group/role correlation is by case-insensitive name match.
         """
@@ -180,7 +180,7 @@ class UserManager:
         kc_group_names = {g["name"].lower() for g in result["keycloak"]["groups"]}
         a0_group_names = {g["name"].lower() for g in result["auth0"]["groups"]}
         kc_role_names = {r.lower() for r in
-                        result["keycloak"]["roles"]["realm"] + result["keycloak"]["roles"]["client"]}
+                         result["keycloak"]["roles"]["realm"] + result["keycloak"]["roles"]["client"]}
         a0_role_names = {r.lower() for r in result["auth0"]["roles"]}
 
         result["correlation"] = {
@@ -225,7 +225,7 @@ class UserManager:
         return result
 
     def set_group_membership(self, username: str, email: str, group_name: str,
-                            add: bool = True) -> dict:
+                             add: bool = True) -> dict:
         """
         Add (add=True) or revoke (add=False) a user's membership in a group named
         `group_name`, in whichever systems the user and group exist.
@@ -240,7 +240,7 @@ class UserManager:
             # Fall back: a bare name may be a top-level group
             if not group:
                 group = next((g for g in self.keycloak.list_groups()
-                            if g.get("name", "").lower() == group_name.lower()), None)
+                              if g.get("name", "").lower() == group_name.lower()), None)
             if group:
                 gid = group.get("id")
                 if add:
@@ -276,7 +276,7 @@ class UserManager:
         return summary
 
     def set_role(self, username: str, email: str, role_name: str,
-                assign: bool = True) -> dict:
+                 assign: bool = True) -> dict:
         """
         Assign (assign=True) or revoke (assign=False) a role named `role_name`
         for a user, in whichever systems the user exists. In Keycloak this maps
@@ -353,7 +353,7 @@ class UserManager:
         return summary
 
     def set_email_verified(self, username: str, email: str,
-                        verified: bool = True) -> dict:
+                           verified: bool = True) -> dict:
         """Pair 3a: set the verified flag directly in both systems."""
         summary = {"keycloak": "user-not-found", "auth0": "user-not-found"}
         kc_id, a0_id = self._resolve_ids(username, email)
@@ -384,7 +384,7 @@ class UserManager:
         the summary so the caller can deliver it.
         """
         summary: dict = {"keycloak": "user-not-found", "auth0": "user-not-found",
-                        "auth0_ticket": None}
+                         "auth0_ticket": None}
         kc_id, a0_id = self._resolve_ids(username, email)
         if kc_id:
             self.keycloak.send_reset_password_email(kc_id)
@@ -444,7 +444,7 @@ class UserManager:
         group = self.keycloak.find_group_by_path("/" + group_path_or_name.strip("/"))
         if not group:
             group = next((g for g in self.keycloak.list_groups()
-                        if g.get("name", "").lower() == group_path_or_name.lower()), None)
+                          if g.get("name", "").lower() == group_path_or_name.lower()), None)
         if group:
             self.keycloak.update_group(group.get("id"), name=new_name)
             summary["keycloak"] = "updated"
@@ -474,7 +474,7 @@ class UserManager:
         group = self.keycloak.find_group_by_path("/" + group_path_or_name.strip("/"))
         if not group:
             group = next((g for g in self.keycloak.list_groups()
-                        if g.get("name", "").lower() == group_path_or_name.lower()), None)
+                          if g.get("name", "").lower() == group_path_or_name.lower()), None)
         if group:
             self.keycloak.delete_group(group.get("id"))
             summary["keycloak"] = "deleted"
@@ -494,7 +494,7 @@ class UserManager:
 
     # ── creation ───────────────────────────────────────────────
     def add_user(self, email: str, password: str | None = None,
-                username: str | None = None) -> dict:
+                 username: str | None = None) -> dict:
         """
         Create a user in BOTH Keycloak and Auth0.
         - username defaults to one derived from the email

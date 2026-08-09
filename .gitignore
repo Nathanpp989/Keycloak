@@ -50,17 +50,3 @@ coverage.xml
 
 # ── Container build context leftovers ───────────────────────────────────────
 *.log
-# ── Keycloak server distribution — the project lives inside the unzipped
-#    keycloak folder; never track the server itself ──────────────────────────
-bin/
-conf/
-lib/
-themes/
-providers/
-data/
-*.jar
-version.txt
-LICENSE.txt
-data/
-version.txt
-LICENSE.txt
