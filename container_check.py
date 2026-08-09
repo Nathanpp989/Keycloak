@@ -236,8 +236,12 @@ def check_imports_shipped(c: Check) -> None:
 
 
 def check_twins(c: Check) -> None:
-    if not (os.path.exists("Dockerfile") and os.path.exists("Containerfile")):
-        c.warn("only one of Dockerfile/Containerfile present")
+    # A single Dockerfile is the standard, supported setup (Docker's default).
+    # A Containerfile is OPTIONAL — only relevant if you also build with Podman
+    # using its default filename. If present, it must match Dockerfile so both
+    # engines build the same image; if absent, that's fine, not a failure.
+    if not os.path.exists("Containerfile"):
+        c.ok("single Dockerfile (standard Docker setup; no Containerfile twin)")
         return
     if open("Dockerfile").read() == open("Containerfile").read():
         c.ok("Dockerfile and Containerfile are identical")
@@ -357,8 +361,10 @@ def run() -> int:
     c = Check()
     print("\n[Dockerfile]")
     check_dockerfile("Dockerfile", c)
-    print("\n[Containerfile]")
-    check_dockerfile("Containerfile", c)
+    # Containerfile is optional (Podman-only). Check it only if it exists.
+    if os.path.exists("Containerfile"):
+        print("\n[Containerfile]")
+        check_dockerfile("Containerfile", c)
     check_twins(c)
     print("\n[build context]")
     check_dockerignore(c)
