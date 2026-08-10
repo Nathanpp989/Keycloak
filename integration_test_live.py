@@ -173,6 +173,46 @@ def main_run() -> int:
     except Exception as exc:  # noqa: BLE001
         c.check("second setup run is idempotent", False, str(exc))
 
+    # 5. Groups pagination: list_groups must return ALL groups, walking pages.
+    #    Verified live against real Keycloak — creates >100 groups (crossing the
+    #    page boundary that a single-request implementation could truncate) and
+    #    confirms every one comes back. This exercises the auth0_talk.list_groups
+    #    pagination fix against a real server, not a mock of the response shape.
+    print("\n[5] Groups pagination (list_groups walks all pages)")
+    try:
+        import requests as _rq
+        from auth0_talk import KeycloakAdminAPI
+        realm = os.environ.get("KEYCLOAK_REALM", "Premkey")
+        admin_user = os.environ.get("KEYCLOAK_ADMIN_USER", "admin")
+        admin_pass = os.environ.get("KEYCLOAK_ADMIN_PASSWORD", "admin")
+        tok = _rq.post(
+            kc_url.rstrip("/") + "/realms/master/protocol/openid-connect/token",
+            data={"grant_type": "password", "client_id": "admin-cli",
+                  "username": admin_user, "password": admin_pass},
+            timeout=15).json().get("access_token")
+        if not tok:
+            c.check("obtained admin token for groups test", False, "no token")
+        else:
+            hdr = {"Authorization": f"Bearer {tok}",
+                   "Content-Type": "application/json"}
+            base = kc_url.rstrip("/") + f"/admin/realms/{realm}/groups"
+            # Create 120 groups (crosses the 100/page boundary). Idempotent-ish:
+            # a 409 on re-run is fine.
+            made = 0
+            for i in range(120):
+                r = _rq.post(base, headers=hdr,
+                             json={"name": f"pgtest-{i:04d}"}, timeout=10)
+                if r.status_code in (201, 409):
+                    made += 1
+            api = KeycloakAdminAPI(kc_url.rstrip("/"), tok, realm)
+            all_groups = api.list_groups()
+            pgtest = [g for g in all_groups if g.get("name", "").startswith("pgtest-")]
+            c.check("list_groups returns all >100 groups (paginated)",
+                    len(pgtest) >= 120,
+                    f"expected >=120 pgtest groups, got {len(pgtest)}")
+    except Exception as exc:  # noqa: BLE001
+        c.check("groups pagination", False, str(exc))
+
     print("-" * 68)
     if c.failed:
         print(f"\u2717 {len(c.failed)} check(s) FAILED:")
