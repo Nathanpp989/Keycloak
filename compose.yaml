@@ -32,6 +32,12 @@ services:
       - "--providers.file.watch=true"
       - "--log.level=INFO"
       - "--accesslog=true"
+      # Expose Prometheus metrics on the dashboard/api entrypoint (:8080 inside
+      # the container -> :8090 on the host). Scrape http://localhost:8090/metrics
+      # for per-router/service request counts, latencies, and status codes.
+      - "--metrics.prometheus=true"
+      - "--metrics.prometheus.addEntryPointsLabels=true"
+      - "--metrics.prometheus.addServicesLabels=true"
     ports:
       - "80:80"
       - "443:443"
@@ -56,6 +62,10 @@ services:
       # C1: health endpoints only exist when enabled, and on Keycloak 25+ they
       # are served on the MANAGEMENT port (9000), not 8080.
       KC_HEALTH_ENABLED: "true"
+      # Expose Keycloak's own metrics on the management port (9000):
+      # http://keycloak:9000/metrics inside the compose network. Login rates,
+      # JVM stats, DB pool, etc.
+      KC_METRICS_ENABLED: "true"
       # Behind a proxy Keycloak must know its external URL and trust the proxy's
       # forwarded headers, or redirect URIs and issuer come out wrong.
       KC_PROXY_HEADERS: xforwarded
@@ -130,7 +140,7 @@ services:
       # Public router: the auth endpoints themselves (/token, /register,
       # /auth/forward, /) must NOT sit behind ForwardAuth, or you'd need a token
       # to get a token. This router carries no auth middleware.
-      - "traefik.http.routers.app-public.rule=Host(`app.localhost`) && (PathPrefix(`/token`) || PathPrefix(`/register`) || PathPrefix(`/auth/forward`) || Path(`/`) || PathPrefix(`/keys`) || PathPrefix(`/status`))"
+      - "traefik.http.routers.app-public.rule=Host(`app.localhost`) && (PathPrefix(`/token`) || PathPrefix(`/register`) || PathPrefix(`/auth/forward`) || Path(`/`) || PathPrefix(`/keys`) || PathPrefix(`/status`) || PathPrefix(`/health`) || Path(`/metrics`))"
       - "traefik.http.routers.app-public.entrypoints=websecure"
       - "traefik.http.routers.app-public.tls=true"
       - "traefik.http.routers.app-public.service=app"

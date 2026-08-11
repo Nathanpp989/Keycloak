@@ -13,7 +13,7 @@ import requests
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
 from fastapi import FastAPI, Depends, HTTPException, Form, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPBearer
 from authorize import router as auth0_router, oauth2_scheme
 from keycloak import KeycloakOpenID, KeycloakAdmin
@@ -28,6 +28,10 @@ from auth0_type import UserManager
 # Structured JSON by default (LOG_FORMAT=text for human-readable local dev).
 # This changes only the OUTPUT format — every logger.*() call site is unchanged.
 from logging_config import configure_logging, request_id_var  # noqa: E402
+from metrics import (  # noqa: E402
+    metrics_middleware, render_metrics,
+    record_token_result, record_forward_auth,
+)
 configure_logging()
 logger = logging.getLogger(__name__)
 
@@ -472,6 +476,11 @@ async def correlation_id_middleware(request: Request, call_next):
     return response
 
 
+# Record request count + latency for every request. Registered after the
+# correlation-id middleware so timing wraps the whole handler.
+app.middleware("http")(metrics_middleware)
+
+
 http_bearer     = HTTPBearer()
 
 # ── Auth dependency ───────────────────────────────────────────────────────────
@@ -531,6 +540,44 @@ def subsystem_status():
     except Exception as exc:  # noqa: BLE001
         return {"error": f"could not resolve subsystem status: {exc}"}
 
+@app.get("/metrics")
+def metrics_endpoint():
+    """Prometheus metrics endpoint. Scrape this for request rates, latencies,
+    and auth outcomes. Public (no auth) so a scraper can reach it — it exposes
+    only aggregate counters, no secrets or per-user data. If you need to lock it
+    down, restrict it at the Traefik layer to your monitoring network."""
+    body, content_type = render_metrics()
+    return Response(content=body, media_type=content_type)
+
+
+@app.get("/health/live")
+def health_live():
+    """Liveness: is the process up and serving? This must NOT check external
+    dependencies — a liveness probe failing tells an orchestrator to RESTART the
+    container, and restarting won't fix a downstream outage (it'd just crash-loop
+    while Keycloak is down). So liveness only proves the event loop is running.
+    """
+    return {"status": "alive"}
+
+
+@app.get("/health/ready")
+def health_ready():
+    """Readiness: can the app actually serve auth right now? Unlike liveness,
+    this DOES check the critical dependency: keycloak_oidc is None when the app
+    started degraded (Keycloak unreachable), so it can't issue or validate
+    tokens. A failing readiness probe tells a load balancer to stop sending
+    traffic here WITHOUT restarting — the right response to a transient
+    dependency outage. Returns 503 when not ready so orchestrators/monitors read
+    it correctly."""
+    if keycloak_oidc is None:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready",
+                     "reason": "Keycloak not connected (degraded start or outage)"},
+        )
+    return {"status": "ready"}
+
+
 @app.get("/hello")
 def read_hello(email: str, username: str):
     return {"email": email, "username": username}
@@ -555,14 +602,17 @@ def login(request: Request,
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
     try:
         token_response = keycloak_oidc.token(username, password)
+        record_token_result("success")
         return {"access_token": token_response["access_token"], "token_type": "bearer"}
     except KeycloakAuthenticationError:
+        record_token_result("invalid_credentials")
         raise HTTPException(status_code=401, detail="Invalid credentials")
     except Exception as exc:
         # Log the REAL cause. Returning a bare 503 with no server-side log is
         # what made the "Account is not fully set up" startup bug invisible for
         # so long — an operator saw 503 and had nothing to go on. The client
         # still gets a generic message; the diagnostic detail goes to the log.
+        record_token_result("error")
         logger.error("Token request failed for user '%s': %s",
                      username, exc, exc_info=True)
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
@@ -603,17 +653,24 @@ def traefik_forward_auth(request: Request):
     auth = request.headers.get("authorization", "")
     if not auth.lower().startswith("bearer "):
         # No credentials -> deny. 401 tells the client to authenticate.
+        record_forward_auth("deny")
         raise HTTPException(status_code=401, detail="Missing bearer token",
                             headers={"WWW-Authenticate": "Bearer"})
     token = auth.split(" ", 1)[1].strip()
     if not token:
+        record_forward_auth("deny")
         raise HTTPException(status_code=401, detail="Empty bearer token",
                             headers={"WWW-Authenticate": "Bearer"})
 
     # Reuse the app's single token-validation path. This raises 401 for an
     # inactive/expired token and 503 if the introspection backend is unreachable
     # — both correct signals for Traefik (401 deny, 503 = auth temporarily down).
-    token_info = _introspect_token(token)
+    try:
+        token_info = _introspect_token(token)
+    except HTTPException:
+        # 401 (invalid token) or 503 (backend down) both mean "not allowed".
+        record_forward_auth("deny")
+        raise
 
     # Allowed. Hand identity back to the upstream via response headers that
     # Traefik is configured to copy (authResponseHeaders). The upstream must
@@ -626,6 +683,7 @@ def traefik_forward_auth(request: Request):
     if fwd_method or fwd_uri:
         logger.info("ForwardAuth allow: user=%s %s %s (xff=%s)",
                     username or "?", fwd_method, fwd_uri, fwd_for)
+    record_forward_auth("allow")
     return JSONResponse(
         status_code=200,
         content={"status": "authenticated"},
