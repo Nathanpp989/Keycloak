@@ -71,3 +71,27 @@ def test_metrics_path_uses_route_template_not_raw_path(client):
     body = client.get("/metrics").text
     # the junk path must not appear as its own label
     assert "12345" not in body
+
+
+def test_metrics_endpoint_not_self_recorded(client):
+    # Scraping /metrics must NOT count itself — otherwise frequent scrapes
+    # dominate http_requests_total and make request-rate dashboards useless.
+    for _ in range(3):
+        client.get("/metrics")
+    body = client.get("/metrics").text
+    assert 'path="/metrics"' not in body
+
+def test_health_endpoints_not_recorded(client):
+    # Health probes (every 30s) are infrastructure noise, not app traffic.
+    client.get("/health/live")
+    client.get("/health/ready")
+    body = client.get("/metrics").text
+    assert 'path="/health/live"' not in body
+    assert 'path="/health/ready"' not in body
+
+def test_real_traffic_still_recorded_alongside_excluded(client):
+    # The exclusion must not accidentally drop real traffic.
+    client.get("/")
+    client.get("/metrics")   # excluded
+    body = client.get("/metrics").text
+    assert 'path="/"' in body   # real traffic present

@@ -225,6 +225,7 @@ services:
       - "--storage.tsdb.retention.time=15d"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
       - prometheus_data:/prometheus
     ports:
       # 9091 on the host (9090 is Prometheus's internal port) to avoid clashing
@@ -232,6 +233,23 @@ services:
       - "9091:9090"
     depends_on:
       app:
+        condition: service_started
+
+  # ── Alertmanager: routes firing alerts to receivers ─────────────────────────
+  # Receives alerts from Prometheus and (once you configure a receiver) sends
+  # notifications. With the default config, alerts are visible in its UI at
+  # http://localhost:9093 — add a Slack/email/webhook receiver to get notified.
+  alertmanager:
+    image: prom/alertmanager:v0.28.0
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    ports:
+      - "9093:9093"
+    depends_on:
+      prometheus:
         condition: service_started
 
   # ── Grafana: dashboards over the Prometheus data ────────────────────────────
@@ -259,3 +277,4 @@ volumes:
   keys:
   prometheus_data:
   grafana_data:
+  alertmanager_data:

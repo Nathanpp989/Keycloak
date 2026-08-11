@@ -1,0 +1,46 @@
+# Alertmanager configuration.
+#
+# Alertmanager receives alerts from Prometheus and routes them to receivers
+# (email, Slack, PagerDuty, webhooks, etc). This config uses a single catch-all
+# receiver with no external integration by default — so the stack runs without
+# requiring you to wire up credentials. Alerts are visible in the Alertmanager
+# UI (http://localhost:9093) and you add a real receiver when ready.
+#
+# To actually get notified, fill in one of the commented receivers below (or add
+# a Slack/PagerDuty/webhook config) and point the route at it.
+
+route:
+  # Group alerts by name+job so a burst becomes one notification, not hundreds.
+  group_by: ["alertname", "job"]
+  group_wait: 30s        # wait to batch the initial alerts in a group
+  group_interval: 5m     # wait before sending an updated batch for a group
+  repeat_interval: 4h    # re-send an unresolved alert at most this often
+  receiver: default
+
+receivers:
+  - name: default
+    # No external notifier configured — alerts are visible in the Alertmanager
+    # UI. To get real notifications, add one of the following (examples):
+    #
+    # slack_configs:
+    #   - api_url: "https://hooks.slack.com/services/XXX/YYY/ZZZ"
+    #     channel: "#alerts"
+    #     title: "{{ .CommonAnnotations.summary }}"
+    #     text: "{{ .CommonAnnotations.description }}"
+    #
+    # email_configs:
+    #   - to: "oncall@example.com"
+    #     from: "alertmanager@example.com"
+    #     smarthost: "smtp.example.com:587"
+    #     auth_username: "alertmanager@example.com"
+    #     auth_password: "..."
+    #
+    # webhook_configs:
+    #   - url: "http://your-service/alert-webhook"
+
+# Inhibition: silence a warning if a related critical is already firing for the
+# same job (avoids double-paging when a service is down AND erroring).
+inhibit_rules:
+  - source_matchers: ['severity = "critical"']
+    target_matchers: ['severity = "warning"']
+    equal: ["job"]

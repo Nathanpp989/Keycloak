@@ -80,12 +80,24 @@ def _route_template(request) -> str:
     return "__unmatched__"
 
 
+# Paths that are infrastructure noise, not application traffic: the metrics
+# scrape (every 15s) and health probes (every 30s) would otherwise dominate
+# http_requests_total and make request-rate dashboards meaningless. We skip
+# recording them. (They still work; they're just not counted as app traffic.)
+_EXCLUDED_PATHS = frozenset({"/metrics", "/health/live", "/health/ready"})
+
+
 async def metrics_middleware(request, call_next):
     """Record request count and latency for every request.
 
     Timing wraps the downstream handler. The path label uses the route template
     so cardinality stays bounded regardless of path parameters or junk URLs.
+    Observability endpoints (see _EXCLUDED_PATHS) are not recorded, so frequent
+    scrapes/probes don't drown out real application traffic in the metrics.
     """
+    # request.url.path is the concrete path; the excluded set is exact paths.
+    if request.url.path in _EXCLUDED_PATHS:
+        return await call_next(request)
     start = time.perf_counter()
     status = 500
     try:

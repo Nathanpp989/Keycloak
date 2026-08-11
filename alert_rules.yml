@@ -1,0 +1,88 @@
+# Prometheus alerting rules for the auth-broker stack.
+#
+# These fire on conditions that mean real trouble, based on the metrics the
+# stack exposes. Prometheus evaluates them on its evaluation_interval and, when
+# a rule has been firing for its `for:` duration, sends the alert to
+# Alertmanager (see monitoring/alertmanager.yml) for routing/notification.
+#
+# Thresholds are starting points tuned for a dev/single-host setup — adjust the
+# `for:` windows and comparison values to your traffic and tolerance.
+
+groups:
+  - name: availability
+    rules:
+      # A scrape target being down for a minute means the service is unreachable
+      # (crashed, not started, or network-partitioned). `up` is 1 when Prometheus
+      # can scrape the target, 0 when it can't.
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} is down"
+          description: "Prometheus has been unable to scrape {{ $labels.job }} ({{ $labels.instance }}) for over 1 minute."
+
+  - name: auth
+    rules:
+      # A sustained spike in token issuance FAILURES (backend errors, not just
+      # wrong passwords) means Keycloak or the brokering is broken. We alert on
+      # the 'error' outcome specifically — 'invalid_credentials' is normal user
+      # error and shouldn't page anyone.
+      - alert: HighTokenErrorRate
+        expr: |
+          sum(rate(auth_token_requests_total{outcome="error"}[5m]))
+            /
+          clamp_min(sum(rate(auth_token_requests_total[5m])), 0.001)
+            > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High token issuance error rate"
+          description: "More than 20% of token requests have failed with backend errors over the last 5 minutes — check Keycloak connectivity and the app logs."
+
+      # A flood of ForwardAuth denials can indicate a misconfiguration (tokens
+      # not validating) or an attack. Informational — tune to your baseline.
+      - alert: HighForwardAuthDenyRate
+        expr: |
+          sum(rate(auth_forward_decisions_total{decision="deny"}[5m]))
+            /
+          clamp_min(sum(rate(auth_forward_decisions_total[5m])), 0.001)
+            > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High ForwardAuth denial rate"
+          description: "Over 50% of ForwardAuth decisions have been denials for 10 minutes — check for misconfigured tokens or unusual traffic."
+
+  - name: http
+    rules:
+      # Sustained 5xx responses from the app mean it's erroring on real traffic.
+      - alert: HighServerErrorRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+            /
+          clamp_min(sum(rate(http_requests_total[5m])), 0.001)
+            > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated 5xx error rate"
+          description: "More than 5% of HTTP responses have been 5xx over the last 5 minutes."
+
+      # p95 latency creeping up is an early warning of trouble before it becomes
+      # errors. Threshold is generous for a dev setup; tighten for production.
+      - alert: HighRequestLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(http_request_duration_seconds_bucket[5m]))
+          ) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High p95 request latency"
+          description: "95th-percentile request latency has been above 2s for 10 minutes."

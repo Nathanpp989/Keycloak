@@ -403,6 +403,34 @@ def check_monitoring(c: Check) -> None:
             c.fail(f"monitoring: Grafana {what} provisioning missing ({path}) — "
                    "Grafana would start blank")
 
+    # If alerting is wired, the rules file Prometheus references must exist and
+    # Alertmanager must be a service — otherwise Prometheus fails to start or
+    # alerts fire into the void.
+    if "alertmanager" in services:
+        if os.path.exists("monitoring/alert-rules.yml"):
+            c.ok("monitoring: alert rules file present")
+        else:
+            c.fail("monitoring: alertmanager service present but "
+                   "monitoring/alert-rules.yml missing")
+        if os.path.exists("monitoring/alertmanager.yml"):
+            c.ok("monitoring: Alertmanager config present")
+        else:
+            c.fail("monitoring: Alertmanager service present but "
+                   "monitoring/alertmanager.yml missing")
+        # Prometheus must reference the rules and point at alertmanager.
+        if os.path.exists("monitoring/prometheus.yml"):
+            pbody = open("monitoring/prometheus.yml").read()
+            if "alert-rules.yml" in pbody:
+                c.ok("monitoring: Prometheus loads the alert rules")
+            else:
+                c.fail("monitoring: Prometheus config does not reference "
+                       "alert-rules.yml — alerts won't be evaluated")
+            if "alertmanager" in pbody:
+                c.ok("monitoring: Prometheus points at Alertmanager")
+            else:
+                c.fail("monitoring: Prometheus config has no alerting.alertmanagers "
+                       "— firing alerts go nowhere")
+
     # The datasource UID the dashboard references must match the datasource.
     ds = "monitoring/grafana/provisioning/datasources/prometheus.yml"
     dash_dir = "monitoring/grafana/provisioning/dashboards"

@@ -15,6 +15,16 @@ global:
   scrape_interval: 15s      # how often to pull each target
   evaluation_interval: 15s  # how often to evaluate alert/recording rules
 
+# Load alerting rules from this file (mounted in compose).
+rule_files:
+  - /etc/prometheus/alert-rules.yml
+
+# Send firing alerts to Alertmanager (a compose service on the same network).
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
 scrape_configs:
   # Prometheus scraping itself (useful for confirming Prometheus is healthy).
   - job_name: prometheus
