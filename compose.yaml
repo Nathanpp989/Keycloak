@@ -157,6 +157,11 @@ services:
       # this the app falls back to "change-me", which is easy to hit by surprise
       # when testing /token. Override via .env or your shell.
       DEFAULT_USER_PASSWORD: ${DEFAULT_USER_PASSWORD:-testpass123}
+      # Structured logging: JSON (one object per line) is the default so
+      # `docker compose logs` is searchable and aggregator-ready. Set
+      # LOG_FORMAT=text for human-readable local dev. LOG_LEVEL tunes verbosity.
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
       # Auth0 / Key Vault — supply these via .env or your shell.
       AUTH0_DOMAIN: ${AUTH0_DOMAIN:-}
       AUTH0_CLIENT_ID: ${AUTH0_CLIENT_ID:-}

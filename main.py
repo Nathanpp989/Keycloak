@@ -23,11 +23,11 @@ from auth0_connect import Auth0Connect, get_keycloak_admin_token
 from auth0_talk import KeycloakAdminAPI, Auth0UsersAPI, Auth0AuthzExtensionAPI, Auth0OrganizationsAPI
 from auth0_type import UserManager
 
-# I3 FIX: configure logging before anything else so all logger.* calls produce output
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
-)
+# Configure logging before anything else so all logger.* calls produce output.
+# Structured JSON by default (LOG_FORMAT=text for human-readable local dev).
+# This changes only the OUTPUT format — every logger.*() call site is unchanged.
+from logging_config import configure_logging  # noqa: E402
+configure_logging()
 logger = logging.getLogger(__name__)
 
 # ── Configuration (single source of truth) ────────────────────────────────────
