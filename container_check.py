@@ -309,7 +309,7 @@ def check_traefik(c: Check) -> None:
             label_map[k] = v
 
     pub_rule = label_map.get("traefik.http.routers.app-public.rule", "")
-    for must in ("/token", "/register", "/auth/forward"):
+    for must in ("/token", "/register", "/auth/forward", "/health", "/metrics"):
         if must in pub_rule:
             c.ok(f"traefik: {must} is on the public router (no auth-to-get-auth)")
         else:
@@ -354,6 +354,83 @@ def check_traefik(c: Check) -> None:
                "http://app:8000/auth/forward")
 
 
+def check_monitoring(c: Check) -> None:
+    """Validate the Prometheus + Grafana wiring when present.
+
+    Catches the mistakes that leave you with empty dashboards: Prometheus not
+    targeting the right services, or Grafana's provisioning files missing so it
+    starts up blank.
+    """
+    if not os.path.exists("compose.yaml"):
+        return
+    try:
+        import yaml
+    except ImportError:
+        return
+    conf = yaml.safe_load(open("compose.yaml"))
+    services = conf.get("services") or {}
+    if "prometheus" not in services and "grafana" not in services:
+        return  # monitoring is optional; nothing to check
+
+    # Prometheus config must exist and target the three metrics sources.
+    prom_cfg = "monitoring/prometheus.yml"
+    if not os.path.exists(prom_cfg):
+        c.fail(f"monitoring: {prom_cfg} missing — Prometheus has nothing to scrape")
+    else:
+        pc = yaml.safe_load(open(prom_cfg))
+        targets = set()
+        for job in pc.get("scrape_configs", []):
+            for sc in job.get("static_configs", []):
+                for t in sc.get("targets", []):
+                    targets.add(t.split(":")[0])
+        for svc in ("app", "traefik", "keycloak"):
+            if svc in targets:
+                c.ok(f"monitoring: Prometheus scrapes {svc}")
+            else:
+                c.fail(f"monitoring: Prometheus does not target '{svc}' — its "
+                       "metrics won't be collected")
+
+    # Grafana provisioning files must exist, or Grafana starts up blank.
+    for path, what in [
+        ("monitoring/grafana/provisioning/datasources/prometheus.yml",
+         "datasource"),
+        ("monitoring/grafana/provisioning/dashboards/provider.yml",
+         "dashboard provider"),
+    ]:
+        if os.path.exists(path):
+            c.ok(f"monitoring: Grafana {what} provisioning present")
+        else:
+            c.fail(f"monitoring: Grafana {what} provisioning missing ({path}) — "
+                   "Grafana would start blank")
+
+    # The datasource UID the dashboard references must match the datasource.
+    ds = "monitoring/grafana/provisioning/datasources/prometheus.yml"
+    dash_dir = "monitoring/grafana/provisioning/dashboards"
+    if os.path.exists(ds) and os.path.isdir(dash_dir):
+        ds_conf = yaml.safe_load(open(ds))
+        ds_uids = {d.get("uid") for d in ds_conf.get("datasources", [])}
+        import glob
+        import json as _json
+        for dash in glob.glob(os.path.join(dash_dir, "*.json")):
+            body = open(dash).read()
+            try:
+                _json.loads(body)  # must be valid JSON
+            except ValueError:
+                c.fail(f"monitoring: {dash} is not valid JSON")
+                continue
+            # every datasource uid referenced should exist in provisioning
+            referenced = set(re.findall(r'"uid":\s*"([^"]+)"', body))
+            # dashboard uid itself is also matched; filter to datasource-like refs
+            unknown = {u for u in referenced
+                       if u not in ds_uids and u != "auth-broker-overview"}
+            if unknown:
+                c.warn(f"monitoring: {os.path.basename(dash)} references uid(s) "
+                       f"{unknown} not in datasource provisioning — panels may "
+                       "show 'datasource not found'")
+            else:
+                c.ok(f"monitoring: {os.path.basename(dash)} datasource uid matches")
+
+
 def run() -> int:
     print("=" * 68)
     print("CONTAINER BUILD — STATIC CHECK (no engine required)")
@@ -374,6 +451,8 @@ def run() -> int:
     check_compose(c)
     print("\n[traefik]")
     check_traefik(c)
+    print("\n[monitoring]")
+    check_monitoring(c)
 
     print("-" * 68)
     if c.failed:

@@ -1,0 +1,15 @@
+# Grafana dashboard provisioning.
+# Tells Grafana to load any dashboard JSON files from the mounted directory on
+# startup, so the broker dashboard appears automatically.
+
+apiVersion: 1
+
+providers:
+  - name: broker-dashboards
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /etc/grafana/provisioning/dashboards

@@ -75,6 +75,7 @@ services:
     # container port internal to the compose network.)
     expose:
       - "8080"
+      - "9000"   # management port: /health and /metrics (Prometheus scrapes this)
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.keycloak.rule=Host(`keycloak.localhost`)"
@@ -212,5 +213,49 @@ services:
       openbao:
         condition: service_healthy
 
+  # ── Prometheus: scrapes /metrics from app, Traefik, and Keycloak ────────────
+  # Pulls each target on a schedule (see monitoring/prometheus.yml) and stores
+  # the time series. Reachable at http://localhost:9091 on the host.
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      # Keep 15 days of data — plenty for a dev/single-host setup, bounded disk.
+      - "--storage.tsdb.retention.time=15d"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      # 9091 on the host (9090 is Prometheus's internal port) to avoid clashing
+      # with anything else on 9090.
+      - "9091:9090"
+    depends_on:
+      app:
+        condition: service_started
+
+  # ── Grafana: dashboards over the Prometheus data ────────────────────────────
+  # Auto-provisions the Prometheus datasource and the broker dashboard on start
+  # (see monitoring/grafana/provisioning). Reachable at http://localhost:3000.
+  # Default login admin/admin unless overridden via .env.
+  grafana:
+    image: grafana/grafana:11.4.0
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      # This is a local dashboards tool; disable anonymous signups/telemetry.
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_started
+
 volumes:
   keys:
+  prometheus_data:
+  grafana_data:
