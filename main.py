@@ -6,6 +6,7 @@ import os
 import re
 import stat
 import tempfile
+import uuid
 from contextlib import asynccontextmanager
 
 import requests
@@ -26,7 +27,7 @@ from auth0_type import UserManager
 # Configure logging before anything else so all logger.* calls produce output.
 # Structured JSON by default (LOG_FORMAT=text for human-readable local dev).
 # This changes only the OUTPUT format — every logger.*() call site is unchanged.
-from logging_config import configure_logging  # noqa: E402
+from logging_config import configure_logging, request_id_var  # noqa: E402
 configure_logging()
 logger = logging.getLogger(__name__)
 
@@ -444,6 +445,32 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(auth0_router)
+
+
+@app.middleware("http")
+async def correlation_id_middleware(request: Request, call_next):
+    """Assign every request a correlation ID and thread it through logging.
+
+    - If the caller (Traefik, a client, or an upstream service) already sent an
+      X-Request-ID, we REUSE it so the same ID spans the whole call chain
+      (Traefik -> app -> any downstream). Otherwise we generate one.
+    - The ID is stored in a contextvar, so every log line emitted while handling
+      this request automatically includes it (see logging_config.JSONFormatter).
+    - We echo it back in the X-Request-ID response header so callers and the
+      proxy can correlate their view with ours.
+    """
+    incoming = request.headers.get("X-Request-ID", "").strip()
+    # Reuse a sane inbound id; otherwise mint one. Cap length to avoid a
+    # malicious client stuffing a huge header into every log line.
+    rid = incoming[:128] if incoming else uuid.uuid4().hex
+    token = request_id_var.set(rid)
+    try:
+        response = await call_next(request)
+    finally:
+        request_id_var.reset(token)
+    response.headers["X-Request-ID"] = rid
+    return response
+
 
 http_bearer     = HTTPBearer()
 

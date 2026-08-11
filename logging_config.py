@@ -19,11 +19,19 @@
 
 from __future__ import annotations
 
+import contextvars
 import datetime as _dt
 import json
 import logging
 import os
 import sys
+
+# Holds the current request's correlation ID. contextvars is the right tool:
+# it's async-safe (each request/task sees its own value) and readable from
+# anywhere — including inside the log formatter — without threading the ID
+# through every function signature. Empty string when outside a request.
+request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "request_id", default="")
 
 # Standard LogRecord attributes we DON'T want to duplicate into the JSON body
 # (they're either already emitted as top-level fields or are internal noise).
@@ -53,6 +61,13 @@ class JSONFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
+
+        # Inject the current request's correlation ID, if we're inside a request.
+        # This is what lets you filter every log line for one request across the
+        # whole app: `... | jq 'select(.request_id=="abc123")'`.
+        rid = request_id_var.get()
+        if rid:
+            payload["request_id"] = rid
 
         # Merge any structured extras passed via logger.*(..., extra={...}).
         # These are set as attributes on the record, so we pick up anything that
@@ -106,3 +121,27 @@ def configure_logging() -> None:
     # Replace any existing handlers so we don't double-log (basicConfig or a
     # previous configure_logging call may have installed one).
     root.handlers[:] = [handler]
+
+    # Route UNCAUGHT exceptions through the logger too, so a genuine crash is
+    # emitted in the same (JSON) format as everything else instead of a raw
+    # plain-text traceback from Python's default excepthook. Without this, an
+    # unhandled exception would be the one thing in your logs that ISN'T
+    # structured — exactly when structure matters most (a crash).
+    _install_excepthook()
+
+
+def _install_excepthook() -> None:
+    """Send uncaught exceptions to the root logger.
+
+    KeyboardInterrupt is deliberately left to the default handler: Ctrl+C is a
+    clean, intentional shutdown, not a crash, and logging it as an error would
+    be misleading (and could swallow the normal interrupt behaviour).
+    """
+    def handle(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        logging.getLogger("uncaught").critical(
+            "Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
+
+    sys.excepthook = handle

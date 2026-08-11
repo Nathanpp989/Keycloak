@@ -93,3 +93,35 @@ def _capture_default(monkeypatch) -> io.StringIO:
     buf = io.StringIO()
     logging.getLogger().handlers[0].stream = buf
     return buf
+
+
+def test_excepthook_logs_uncaught_as_json(monkeypatch):
+    import sys
+    buf = _capture("json", monkeypatch)
+    logging_config._install_excepthook()
+    # simulate an uncaught exception reaching the hook
+    try:
+        raise RuntimeError("crash!")
+    except RuntimeError:
+        sys.excepthook(*sys.exc_info())
+    obj = json.loads(buf.getvalue().strip())
+    assert obj["level"] == "CRITICAL"
+    assert "exception" in obj
+    assert "RuntimeError: crash!" in obj["exception"]
+
+
+def test_excepthook_leaves_keyboardinterrupt_to_default(monkeypatch):
+    import sys
+    buf = _capture("json", monkeypatch)
+    logging_config._install_excepthook()
+    called = {"default": False}
+    orig = sys.__excepthook__
+    monkeypatch.setattr(sys, "__excepthook__",
+                        lambda *a: called.__setitem__("default", True))
+    try:
+        sys.excepthook(KeyboardInterrupt, KeyboardInterrupt(), None)
+    finally:
+        sys.__excepthook__ = orig
+    # KeyboardInterrupt must go to the default handler, NOT be logged
+    assert called["default"] is True
+    assert buf.getvalue().strip() == ""   # nothing logged
