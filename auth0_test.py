@@ -2600,3 +2600,76 @@ def test_kc_list_groups_single_page_stops():
     assert len(groups) == 1
     # exactly one GET (no needless second page)
     assert len([c for c in responses.calls if c.request.method == "GET"]) == 1
+
+
+@responses.activate
+def test_find_by_name_exactly_one_full_page_terminates():
+    # EDGE CASE: total == limit and the page returns exactly `limit` items.
+    # A naive pager (which only stops on a short page) would request page 1,
+    # get an empty/short response, and could loop or make a needless call. The
+    # (start+limit)>=total guard must terminate after the single full page.
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    # exactly 100 items, total 100 -> one full page, nothing after it
+    full = {"clients": [{"name": f"c-{i}", "client_id": f"id{i}"}
+                        for i in range(100)],
+            "total": 100, "start": 0, "limit": 100}
+    responses.add(responses.GET, f"https://{DOMAIN}/api/v2/clients",
+                  json=full, status=200)
+    a = Auth0Connect(DOMAIN, "cid", "secret")
+    # look for something NOT present -> must exhaust and return None without hanging
+    hit = a.get_client_by_name("does-not-exist")
+    assert hit is None
+    # exactly ONE GET — the full-page guard prevented a needless second request
+    gets = [c for c in responses.calls if c.request.method == "GET"
+            and "/clients" in c.request.url]
+    assert len(gets) == 1, f"expected 1 GET, made {len(gets)} (pager didn't stop)"
+
+
+@responses.activate
+def test_find_by_name_finds_item_on_exact_page_boundary():
+    # The item is the LAST one on a full first page (total==limit==100). Must be
+    # found without requesting a second page.
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    items = [{"name": f"c-{i}", "client_id": f"id{i}"} for i in range(99)]
+    items.append({"name": "target", "client_id": "found"})
+    responses.add(responses.GET, f"https://{DOMAIN}/api/v2/clients",
+                  json={"clients": items, "total": 100, "start": 0, "limit": 100},
+                  status=200)
+    a = Auth0Connect(DOMAIN, "cid", "secret")
+    hit = a.get_client_by_name("target")
+    assert hit is not None and hit["client_id"] == "found"
+
+
+@responses.activate
+def test_find_by_name_bare_list_fallback():
+    # DEFENSIVE PATH: some tenants/tokens may return a bare list instead of the
+    # include_totals envelope. The method must still work (treat as one page).
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.GET, f"https://{DOMAIN}/api/v2/connections",
+                  json=[{"name": "conn-a", "id": "1"},
+                        {"name": "conn-b", "id": "2"}], status=200)
+    a = Auth0Connect(DOMAIN, "cid", "secret")
+    hit = a.get_connection_by_name("conn-b")
+    assert hit is not None and hit["id"] == "2"
+
+
+@responses.activate
+def test_find_by_name_requests_correct_pagination_params():
+    # Verify the request actually sends page/per_page/include_totals — if these
+    # were dropped, Auth0 would return defaults and pagination would silently
+    # not work as intended.
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.GET, f"https://{DOMAIN}/api/v2/clients",
+                  json={"clients": [], "total": 0, "start": 0, "limit": 100},
+                  status=200)
+    a = Auth0Connect(DOMAIN, "cid", "secret")
+    a.get_client_by_name("anything")
+    get = next(c for c in responses.calls if c.request.method == "GET"
+               and "/clients" in c.request.url)
+    assert "include_totals=true" in get.request.url
+    assert "per_page=" in get.request.url
+    assert "page=" in get.request.url
