@@ -1,0 +1,51 @@
+# Prometheus scrape configuration for the auth-broker stack.
+#
+# Prometheus runs as a compose service and reaches the others by their service
+# name on the shared compose network. Each target exposes /metrics; Prometheus
+# pulls them on the interval below and stores the time series for Grafana to
+# query.
+#
+# Ports are the INTERNAL container ports (not the host-published ones), because
+# scraping happens inside the compose network:
+#   app      :8000  — our FastAPI metrics (http_requests_total, auth_* , latency)
+#   traefik  :8080  — Traefik's own metrics (per-router/service requests, latency)
+#   keycloak :9000  — Keycloak management port (login rates, JVM, DB pool)
+
+global:
+  scrape_interval: 15s      # how often to pull each target
+  evaluation_interval: 15s  # how often to evaluate alert/recording rules
+
+# Load alerting rules from this file (mounted in compose).
+rule_files:
+  - /etc/prometheus/alert-rules.yml
+
+# Send firing alerts to Alertmanager (a compose service on the same network).
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  # Prometheus scraping itself (useful for confirming Prometheus is healthy).
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # The broker app — the metrics we instrumented.
+  - job_name: app
+    static_configs:
+      - targets: ["app:8000"]
+    metrics_path: /metrics
+
+  # Traefik edge proxy — request counts, latencies, status codes per router.
+  - job_name: traefik
+    static_configs:
+      - targets: ["traefik:8080"]
+    metrics_path: /metrics
+
+  # Keycloak — on the management port (9000). Only present because
+  # KC_METRICS_ENABLED=true in compose.
+  - job_name: keycloak
+    static_configs:
+      - targets: ["keycloak:9000"]
+    metrics_path: /metrics

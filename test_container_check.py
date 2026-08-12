@@ -130,3 +130,77 @@ def test_shipped_file_excluded_is_not_flagged(tmp_path, monkeypatch):
     c = cc.Check()
     cc.check_imports_shipped(c)
     assert not any("sometool.py" in f for f in c.failed)
+
+
+def test_monitoring_check_passes_for_real_project(tmp_path, monkeypatch):
+    # The real project's monitoring config should pass check_monitoring.
+    import container_check as cc
+    c = cc.Check()
+    cc.check_monitoring(c)
+    # no failures about monitoring
+    mon_fails = [f for f in c.failed if "monitoring" in f]
+    assert not mon_fails, f"monitoring checks failed: {mon_fails}"
+
+def test_monitoring_check_flags_missing_prometheus_target(tmp_path, monkeypatch):
+    # A prometheus.yml that omits a service must be flagged.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "compose.yaml").write_text(
+        "services:\n  prometheus:\n    image: prom/prometheus\n  grafana:\n    image: grafana/grafana\n")
+    mon = tmp_path / "monitoring"
+    mon.mkdir()
+    # prometheus.yml missing the 'keycloak' target
+    (mon / "prometheus.yml").write_text(
+        "scrape_configs:\n"
+        "  - job_name: app\n    static_configs:\n      - targets: ['app:8000']\n"
+        "  - job_name: traefik\n    static_configs:\n      - targets: ['traefik:8080']\n")
+    import container_check as cc
+    c = cc.Check()
+    cc.check_monitoring(c)
+    assert any("keycloak" in f for f in c.failed)
+
+
+def test_monitoring_check_validates_alerting(tmp_path, monkeypatch):
+    # When alertmanager is a service, the rules file and alertmanager config
+    # must exist and Prometheus must reference both.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "compose.yaml").write_text(
+        "services:\n  prometheus:\n    image: p\n  grafana:\n    image: g\n"
+        "  alertmanager:\n    image: a\n")
+    mon = tmp_path / "monitoring"
+    (mon / "grafana" / "provisioning" / "datasources").mkdir(parents=True)
+    (mon / "grafana" / "provisioning" / "dashboards").mkdir(parents=True)
+    (mon / "grafana" / "provisioning" / "datasources" / "prometheus.yml").write_text(
+        "datasources:\n  - uid: prometheus\n")
+    (mon / "grafana" / "provisioning" / "dashboards" / "provider.yml").write_text("x: 1\n")
+    (mon / "prometheus.yml").write_text(
+        "scrape_configs:\n"
+        "  - job_name: app\n    static_configs:\n      - targets: ['app:8000']\n"
+        "  - job_name: traefik\n    static_configs:\n      - targets: ['traefik:8080']\n"
+        "  - job_name: keycloak\n    static_configs:\n      - targets: ['keycloak:9000']\n"
+        "rule_files:\n  - /etc/prometheus/alert-rules.yml\n"
+        "alerting:\n  alertmanagers:\n    - static_configs:\n        - targets: ['alertmanager:9093']\n")
+    (mon / "alert-rules.yml").write_text("groups: []\n")
+    (mon / "alertmanager.yml").write_text("route:\n  receiver: default\n")
+    import container_check as cc
+    c = cc.Check()
+    cc.check_monitoring(c)
+    mon_fails = [f for f in c.failed if "monitoring" in f]
+    assert not mon_fails, f"unexpected failures: {mon_fails}"
+
+def test_monitoring_check_flags_missing_alert_rules(tmp_path, monkeypatch):
+    # alertmanager service but no rules file -> must be flagged.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "compose.yaml").write_text(
+        "services:\n  prometheus:\n    image: p\n  alertmanager:\n    image: a\n")
+    mon = tmp_path / "monitoring"
+    mon.mkdir()
+    (mon / "prometheus.yml").write_text(
+        "scrape_configs:\n"
+        "  - job_name: app\n    static_configs:\n      - targets: ['app:8000']\n"
+        "  - job_name: traefik\n    static_configs:\n      - targets: ['traefik:8080']\n"
+        "  - job_name: keycloak\n    static_configs:\n      - targets: ['keycloak:9000']\n")
+    # no alert-rules.yml, no alertmanager.yml
+    import container_check as cc
+    c = cc.Check()
+    cc.check_monitoring(c)
+    assert any("alert-rules.yml missing" in f or "alert rules" in f.lower() for f in c.failed)
