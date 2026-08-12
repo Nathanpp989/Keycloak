@@ -32,12 +32,6 @@ services:
       - "--providers.file.watch=true"
       - "--log.level=INFO"
       - "--accesslog=true"
-      # Expose Prometheus metrics on the dashboard/api entrypoint (:8080 inside
-      # the container -> :8090 on the host). Scrape http://localhost:8090/metrics
-      # for per-router/service request counts, latencies, and status codes.
-      - "--metrics.prometheus=true"
-      - "--metrics.prometheus.addEntryPointsLabels=true"
-      - "--metrics.prometheus.addServicesLabels=true"
     ports:
       - "80:80"
       - "443:443"
@@ -62,10 +56,6 @@ services:
       # C1: health endpoints only exist when enabled, and on Keycloak 25+ they
       # are served on the MANAGEMENT port (9000), not 8080.
       KC_HEALTH_ENABLED: "true"
-      # Expose Keycloak's own metrics on the management port (9000):
-      # http://keycloak:9000/metrics inside the compose network. Login rates,
-      # JVM stats, DB pool, etc.
-      KC_METRICS_ENABLED: "true"
       # Behind a proxy Keycloak must know its external URL and trust the proxy's
       # forwarded headers, or redirect URIs and issuer come out wrong.
       KC_PROXY_HEADERS: xforwarded
@@ -75,7 +65,6 @@ services:
     # container port internal to the compose network.)
     expose:
       - "8080"
-      - "9000"   # management port: /health and /metrics (Prometheus scrapes this)
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.keycloak.rule=Host(`keycloak.localhost`)"
@@ -141,7 +130,7 @@ services:
       # Public router: the auth endpoints themselves (/token, /register,
       # /auth/forward, /) must NOT sit behind ForwardAuth, or you'd need a token
       # to get a token. This router carries no auth middleware.
-      - "traefik.http.routers.app-public.rule=Host(`app.localhost`) && (PathPrefix(`/token`) || PathPrefix(`/register`) || PathPrefix(`/auth/forward`) || Path(`/`) || PathPrefix(`/keys`) || PathPrefix(`/status`) || PathPrefix(`/health`) || Path(`/metrics`))"
+      - "traefik.http.routers.app-public.rule=Host(`app.localhost`) && (PathPrefix(`/token`) || PathPrefix(`/register`) || PathPrefix(`/auth/forward`) || Path(`/`) || PathPrefix(`/keys`) || PathPrefix(`/status`))"
       - "traefik.http.routers.app-public.entrypoints=websecure"
       - "traefik.http.routers.app-public.tls=true"
       - "traefik.http.routers.app-public.service=app"
@@ -168,11 +157,6 @@ services:
       # this the app falls back to "change-me", which is easy to hit by surprise
       # when testing /token. Override via .env or your shell.
       DEFAULT_USER_PASSWORD: ${DEFAULT_USER_PASSWORD:-testpass123}
-      # Structured logging: JSON (one object per line) is the default so
-      # `docker compose logs` is searchable and aggregator-ready. Set
-      # LOG_FORMAT=text for human-readable local dev. LOG_LEVEL tunes verbosity.
-      LOG_FORMAT: ${LOG_FORMAT:-json}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
       # Auth0 / Key Vault — supply these via .env or your shell.
       AUTH0_DOMAIN: ${AUTH0_DOMAIN:-}
       AUTH0_CLIENT_ID: ${AUTH0_CLIENT_ID:-}
@@ -213,68 +197,5 @@ services:
       openbao:
         condition: service_healthy
 
-  # ── Prometheus: scrapes /metrics from app, Traefik, and Keycloak ────────────
-  # Pulls each target on a schedule (see monitoring/prometheus.yml) and stores
-  # the time series. Reachable at http://localhost:9091 on the host.
-  prometheus:
-    image: prom/prometheus:v3.1.0
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.path=/prometheus"
-      # Keep 15 days of data — plenty for a dev/single-host setup, bounded disk.
-      - "--storage.tsdb.retention.time=15d"
-    volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./monitoring/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
-      - prometheus_data:/prometheus
-    ports:
-      # 9091 on the host (9090 is Prometheus's internal port) to avoid clashing
-      # with anything else on 9090.
-      - "9091:9090"
-    depends_on:
-      app:
-        condition: service_started
-
-  # ── Alertmanager: routes firing alerts to receivers ─────────────────────────
-  # Receives alerts from Prometheus and (once you configure a receiver) sends
-  # notifications. With the default config, alerts are visible in its UI at
-  # http://localhost:9093 — add a Slack/email/webhook receiver to get notified.
-  alertmanager:
-    image: prom/alertmanager:v0.28.0
-    command:
-      - "--config.file=/etc/alertmanager/alertmanager.yml"
-    volumes:
-      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
-      - alertmanager_data:/alertmanager
-    ports:
-      - "9093:9093"
-    depends_on:
-      prometheus:
-        condition: service_started
-
-  # ── Grafana: dashboards over the Prometheus data ────────────────────────────
-  # Auto-provisions the Prometheus datasource and the broker dashboard on start
-  # (see monitoring/grafana/provisioning). Reachable at http://localhost:3000.
-  # Default login admin/admin unless overridden via .env.
-  grafana:
-    image: grafana/grafana:11.4.0
-    environment:
-      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
-      # This is a local dashboards tool; disable anonymous signups/telemetry.
-      GF_USERS_ALLOW_SIGN_UP: "false"
-      GF_ANALYTICS_REPORTING_ENABLED: "false"
-    volumes:
-      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
-      - grafana_data:/var/lib/grafana
-    ports:
-      - "3000:3000"
-    depends_on:
-      prometheus:
-        condition: service_started
-
 volumes:
   keys:
-  prometheus_data:
-  grafana_data:
-  alertmanager_data:

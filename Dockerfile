@@ -49,7 +49,7 @@ EXPOSE 8000
 # natively; Podman honours it when the image is run with --health-cmd or via
 # podman play. Kept dependency-free (uses Python's stdlib urllib).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/live').status==200 else 1)"
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/').status==200 else 1)"
 
 # Start the API. main.py reads HOST/PORT from the environment.
 CMD ["python", "main.py"]
