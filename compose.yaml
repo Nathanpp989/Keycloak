@@ -168,6 +168,11 @@ services:
       # this the app falls back to "change-me", which is easy to hit by surprise
       # when testing /token. Override via .env or your shell.
       DEFAULT_USER_PASSWORD: ${DEFAULT_USER_PASSWORD:-testpass123}
+      # Role required for admin/write operations (create/delete groups and
+      # organizations, assign roles, edit other users). A valid token WITHOUT
+      # this role gets 403 on those endpoints. Must match a role that exists in
+      # your Keycloak realm and is granted to tenant administrators.
+      ADMIN_ROLE: ${ADMIN_ROLE:-tenant-admin}
       # Structured logging: JSON (one object per line) is the default so
       # `docker compose logs` is searchable and aggregator-ready. Set
       # LOG_FORMAT=text for human-readable local dev. LOG_LEVEL tunes verbosity.

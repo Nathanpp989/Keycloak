@@ -1,0 +1,100 @@
+# Tests for role-based authorization (authz.py) and its enforcement in main.
+import contextlib
+from unittest.mock import patch
+
+import pytest
+from fastapi.testclient import TestClient
+
+import authz
+import main
+
+
+# ── Unit tests for the authz logic ──────────────────────────────────────────
+def test_extract_realm_roles():
+    ti = {"realm_access": {"roles": ["tenant-admin", "user"]}}
+    assert authz.extract_roles(ti) == {"tenant-admin", "user"}
+
+def test_extract_client_roles():
+    ti = {"resource_access": {"myclient": {"roles": ["editor"]}}}
+    assert authz.extract_roles(ti) == {"editor"}
+
+def test_extract_merges_realm_and_client():
+    ti = {"realm_access": {"roles": ["a"]},
+          "resource_access": {"c1": {"roles": ["b"]}, "c2": {"roles": ["c"]}}}
+    assert authz.extract_roles(ti) == {"a", "b", "c"}
+
+def test_extract_handles_missing_sections():
+    assert authz.extract_roles({}) == set()
+
+def test_extract_handles_malformed_sections():
+    # None, wrong types -> empty, never raises
+    assert authz.extract_roles({"realm_access": None}) == set()
+    assert authz.extract_roles({"realm_access": {"roles": "notalist"}}) == set()
+    assert authz.extract_roles({"resource_access": "nope"}) == set()
+
+def test_user_has_any_role():
+    ti = {"realm_access": {"roles": ["tenant-admin"]}}
+    assert authz.user_has_any_role(ti, ["tenant-admin"])
+    assert authz.user_has_any_role(ti, ["superadmin", "tenant-admin"])
+    assert not authz.user_has_any_role(ti, ["superadmin"])
+
+def test_require_role_needs_at_least_one():
+    factory = authz.make_require_role(lambda: {})
+    with pytest.raises(ValueError):
+        factory()  # no roles given
+
+
+# ── Integration: enforcement through the real app ───────────────────────────
+@pytest.fixture
+def client(monkeypatch):
+    monkeypatch.setenv("AUTH0_DOMAIN", "x")
+    monkeypatch.setenv("AUTH0_CLIENT_ID", "x")
+    monkeypatch.setenv("AUTH0_CLIENT_SECRET", "x")
+    monkeypatch.setenv("KEY_DIR", "/tmp/authztest")
+
+    @contextlib.asynccontextmanager
+    async def _noop(app):
+        yield
+    monkeypatch.setattr(main.app.router, "lifespan_context", _noop)
+    with TestClient(main.app) as c:
+        yield c
+
+
+_HDR = {"Authorization": "Bearer faketoken"}
+
+def _introspect_returning(roles):
+    def fake(token):
+        return {"active": True, "realm_access": {"roles": roles}, "sub": "u1"}
+    return fake
+
+
+def test_admin_endpoint_denies_without_role(client):
+    # Valid token, but no admin role -> 403 on an admin write endpoint.
+    with patch.object(main, "_introspect_token", _introspect_returning(["user"])):
+        r = client.post("/groups", json={"name": "g"}, headers=_HDR)
+    assert r.status_code == 403
+
+def test_admin_endpoint_allows_with_role(client):
+    # Valid token WITH admin role -> not 403 (clears auth; may hit body/downstream).
+    with patch.object(main, "_introspect_token",
+                      _introspect_returning(["user", "tenant-admin"])):
+        r = client.post("/groups", json={"name": "g"}, headers=_HDR)
+    assert r.status_code != 403
+
+def test_read_endpoint_open_to_any_authenticated_user(client):
+    # Read endpoints keep plain authentication — no admin role required.
+    with patch.object(main, "_introspect_token", _introspect_returning(["user"])):
+        r = client.get("/users/lookup?email=a@b.com", headers=_HDR)
+    assert r.status_code != 403
+
+def test_delete_org_denied_without_role(client):
+    # The most destructive endpoint must be gated.
+    with patch.object(main, "_introspect_token", _introspect_returning(["user"])):
+        r = client.delete("/organizations/some-id", headers=_HDR)
+    assert r.status_code == 403
+
+def test_403_names_required_role(client):
+    # The 403 detail should name the required role to aid debugging.
+    with patch.object(main, "_introspect_token", _introspect_returning(["user"])):
+        r = client.post("/groups", json={"name": "g"}, headers=_HDR)
+    assert "tenant-admin" in r.json().get("detail", "")

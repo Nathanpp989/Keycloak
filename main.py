@@ -32,6 +32,7 @@ from metrics import (  # noqa: E402
     metrics_middleware, render_metrics,
     record_token_result, record_forward_auth,
 )
+from authz import make_require_role  # noqa: E402
 configure_logging()
 logger = logging.getLogger(__name__)
 
@@ -512,6 +513,18 @@ def require_keycloak_auth(credentials=Depends(http_bearer)) -> dict:
     """
     return _introspect_token(credentials.credentials)
 
+
+# Role-based authorization. require_role("x") is a dependency that validates the
+# token (via require_keycloak_auth) AND checks it carries role "x", raising 403
+# otherwise. Admin endpoints use this instead of bare authentication so that a
+# valid token alone isn't enough — the caller must hold the right role.
+#
+# ADMIN_ROLE is the role that gates tenant-management operations (creating and
+# deleting groups/organizations, assigning roles, editing other users). Override
+# via env so it can match whatever your Keycloak realm actually calls it.
+require_role = make_require_role(require_keycloak_auth)
+ADMIN_ROLE = os.environ.get("ADMIN_ROLE", "tenant-admin")
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -806,7 +819,7 @@ def users_membership(
 def create_group(
     name: str = Form(...),
     parent_path: str | None = Form(default=None),
-    token_info: dict = Depends(require_keycloak_auth),
+    token_info: dict = Depends(require_role(ADMIN_ROLE)),
 ):
     """
     Create a group (or subgroup if parent_path is given) in Keycloak and, if the
@@ -831,7 +844,7 @@ def modify_group_membership(
     email: str = Form(...),
     group_name: str = Form(...),
     action: str = Form(...),  # "add" or "revoke"
-    token_info: dict = Depends(require_keycloak_auth),
+    token_info: dict = Depends(require_role(ADMIN_ROLE)),
 ):
     """
     Add or revoke a user's membership in a group across systems. Protected.
@@ -858,7 +871,7 @@ def modify_user_role(
     email: str = Form(...),
     role_name: str = Form(...),
     action: str = Form(...),  # "assign" or "revoke"
-    token_info: dict = Depends(require_keycloak_auth),
+    token_info: dict = Depends(require_role(ADMIN_ROLE)),
 ):
     """
     Assign or revoke a role for a user across systems (Keycloak realm role +
@@ -883,7 +896,7 @@ def modify_user_role(
 def update_group_endpoint(
     group: str = Form(...),
     new_name: str = Form(...),
-    token_info: dict = Depends(require_keycloak_auth),
+    token_info: dict = Depends(require_role(ADMIN_ROLE)),
 ):
     """Rename a group (by path or name) across systems. Protected."""
     if user_manager is None:
@@ -900,7 +913,7 @@ def update_group_endpoint(
 @app.delete("/groups")
 def delete_group_endpoint(
     group: str,
-    token_info: dict = Depends(require_keycloak_auth),
+    token_info: dict = Depends(require_role(ADMIN_ROLE)),
 ):
     """Delete a group (by path or name) across systems. Protected."""
     if user_manager is None:
@@ -918,7 +931,7 @@ def delete_group_endpoint(
 def create_organization_endpoint(
     name: str = Form(...),
     display_name: str | None = Form(default=None),
-    token_info: dict = Depends(require_keycloak_auth),
+    token_info: dict = Depends(require_role(ADMIN_ROLE)),
 ):
     """Create (or reuse) an Auth0 organization. Protected."""
     if user_manager is None or user_manager.auth0_orgs is None:
@@ -952,7 +965,7 @@ def list_organizations_endpoint(
 def update_organization_endpoint(
     org_id: str,
     display_name: str = Form(...),
-    token_info: dict = Depends(require_keycloak_auth),
+    token_info: dict = Depends(require_role(ADMIN_ROLE)),
 ):
     """Update an Auth0 organization's display name. Protected."""
     if user_manager is None or user_manager.auth0_orgs is None:
@@ -968,7 +981,7 @@ def update_organization_endpoint(
 @app.delete("/organizations/{org_id}")
 def delete_organization_endpoint(
     org_id: str,
-    token_info: dict = Depends(require_keycloak_auth),
+    token_info: dict = Depends(require_role(ADMIN_ROLE)),
 ):
     """Delete an Auth0 organization. Protected."""
     if user_manager is None or user_manager.auth0_orgs is None:
@@ -987,7 +1000,7 @@ def organization_membership_endpoint(
     email: str = Form(...),
     org_name: str = Form(...),
     action: str = Form(...),  # "add" or "remove"
-    token_info: dict = Depends(require_keycloak_auth),
+    token_info: dict = Depends(require_role(ADMIN_ROLE)),
 ):
     """Add or remove a user (by email) from an Auth0 organization. Protected."""
     if user_manager is None or user_manager.auth0_orgs is None:
@@ -1010,7 +1023,7 @@ def set_user_metadata(
     username: str = Form(...),
     email: str = Form(...),
     metadata: str = Form(...),  # JSON object as a string
-    token_info: dict = Depends(require_keycloak_auth),
+    token_info: dict = Depends(require_role(ADMIN_ROLE)),
 ):
     """Merge key/values into Keycloak attributes + Auth0 app_metadata. Protected."""
     if user_manager is None:
@@ -1035,7 +1048,7 @@ def set_user_active(
     username: str = Form(...),
     email: str = Form(...),
     active: bool = Form(...),
-    token_info: dict = Depends(require_keycloak_auth),
+    token_info: dict = Depends(require_role(ADMIN_ROLE)),
 ):
     """Enable/disable (Keycloak) and unblock/block (Auth0) an account. Protected."""
     if user_manager is None:

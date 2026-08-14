@@ -205,8 +205,14 @@ def test_register_missing_email_is_422(client, monkeypatch):
 # /users/lookup  (UserManager.determine_user_system) — now AUTH-PROTECTED
 # ──────────────────────────────────────────────
 def _auth_override():
-    """Dependency override that simulates a valid authenticated Keycloak token."""
-    return {"active": True, "preferred_username": "caller"}
+    """Dependency override that simulates a valid authenticated Keycloak token.
+
+    Includes the admin role so tests of admin endpoints represent an authorized
+    caller. (Authorization is now role-based; a token without the role gets 403.
+    The dedicated authz tests in test_authz.py cover the deny-without-role path.)
+    """
+    return {"active": True, "preferred_username": "caller",
+            "realm_access": {"roles": ["tenant-admin"]}}
 
 def test_lookup_requires_authentication(client, monkeypatch):
     # No auth override and no keycloak_oidc -> request must be rejected, NOT served.
