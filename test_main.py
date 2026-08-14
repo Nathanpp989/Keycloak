@@ -1489,3 +1489,41 @@ def test_health_ready_200_when_keycloak_connected(client, monkeypatch):
     r = client.get("/health/ready")
     assert r.status_code == 200
     assert r.json()["status"] == "ready"
+
+
+# ── Role provisioning on startup ────────────────────────────────────────────
+def test_ensure_realm_role_creates_when_missing():
+    from unittest.mock import MagicMock
+    admin = MagicMock()
+    admin.get_realm_roles.return_value = [{"name": "user"}]  # tenant-admin absent
+    main.ensure_realm_role(admin, "tenant-admin")
+    admin.create_realm_role.assert_called_once()
+    args = admin.create_realm_role.call_args[0][0]
+    assert args["name"] == "tenant-admin"
+
+def test_ensure_realm_role_idempotent_when_present():
+    from unittest.mock import MagicMock
+    admin = MagicMock()
+    admin.get_realm_roles.return_value = [{"name": "tenant-admin"}]  # already there
+    main.ensure_realm_role(admin, "tenant-admin")
+    admin.create_realm_role.assert_not_called()   # no duplicate creation
+
+def test_ensure_realm_role_survives_error():
+    from unittest.mock import MagicMock
+    admin = MagicMock()
+    admin.get_realm_roles.side_effect = RuntimeError("kc down")
+    # must not raise — provisioning failures shouldn't crash startup
+    main.ensure_realm_role(admin, "tenant-admin")
+
+def test_grant_realm_role_assigns():
+    from unittest.mock import MagicMock
+    admin = MagicMock()
+    admin.get_realm_role.return_value = {"name": "tenant-admin", "id": "r1"}
+    main.grant_realm_role(admin, "user-123", "tenant-admin")
+    admin.assign_realm_roles.assert_called_once()
+
+def test_grant_realm_role_survives_error():
+    from unittest.mock import MagicMock
+    admin = MagicMock()
+    admin.get_realm_role.side_effect = RuntimeError("no such role")
+    main.grant_realm_role(admin, "user-123", "tenant-admin")   # must not raise

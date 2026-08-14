@@ -145,6 +145,42 @@ def create_keycloak_user(admin: KeycloakAdmin, username: str, password: str, gro
     admin.group_user_add(user_id, group_id)
     return user_id
 
+
+def ensure_realm_role(admin: KeycloakAdmin, role_name: str) -> None:
+    """Create a realm role if it doesn't exist. Idempotent.
+
+    Without this, the tenant-admin role the authorization layer checks for simply
+    wouldn't exist in a fresh realm, so no one could ever pass the role check and
+    every admin endpoint would be permanently 403 — the door locked with no key.
+    """
+    try:
+        existing = admin.get_realm_roles()
+        if any(r.get("name") == role_name for r in existing):
+            return
+        admin.create_realm_role({"name": role_name,
+                                 "description": "Tenant administrator — may "
+                                                "manage groups, roles, orgs, and "
+                                                "users via the broker."})
+        logger.info("Created realm role '%s'", role_name)
+    except Exception as exc:  # noqa: BLE001 — provisioning must not crash startup
+        logger.warning("Could not ensure realm role '%s': %s", role_name, exc)
+
+
+def grant_realm_role(admin: KeycloakAdmin, user_id: str, role_name: str) -> None:
+    """Grant a realm role to a user. Idempotent (Keycloak ignores duplicates).
+
+    Best-effort: a failure here shouldn't crash startup — it just means the admin
+    user won't have the role until it's granted manually.
+    """
+    try:
+        role = admin.get_realm_role(role_name)
+        admin.assign_realm_roles(user_id, [role])
+        logger.info("Granted role '%s' to user id %s", role_name, user_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not grant role '%s' to user %s: %s",
+                       role_name, user_id, exc)
+
+
 def ensure_keycloak_client(admin: KeycloakAdmin) -> str:
     """
     Guarantee the app's Keycloak client exists AND is configured for the
@@ -288,6 +324,20 @@ def setup_keycloak() -> str:
         })
     default_password = os.environ.get("DEFAULT_USER_PASSWORD", "change-me")
     create_keycloak_user(admin, "user", default_password, "users")
+
+    # Provision the admin role and an admin user, so the role-based authorization
+    # layer is usable out of the box. Without this, tenant-admin wouldn't exist
+    # and every admin endpoint would be permanently 403 (locked door, no key).
+    admin_role = os.environ.get("ADMIN_ROLE", "tenant-admin")
+    ensure_realm_role(admin, admin_role)
+    # The admin user: a separate account that HOLDS the admin role. Its password
+    # comes from ADMIN_USER_PASSWORD (falls back to the default user's password
+    # so a dev setup still works without extra config).
+    admin_username = os.environ.get("ADMIN_USERNAME", "admin-user")
+    admin_user_password = os.environ.get("ADMIN_USER_PASSWORD", default_password)
+    admin_user_id = create_keycloak_user(
+        admin, admin_username, admin_user_password, "users")
+    grant_realm_role(admin, admin_user_id, admin_role)
 
     client_uuid     = ensure_keycloak_client(admin)
     existing_secret = admin.get_client_secrets(client_uuid)

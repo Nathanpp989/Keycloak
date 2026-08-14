@@ -213,6 +213,43 @@ def main_run() -> int:
     except Exception as exc:  # noqa: BLE001
         c.check("groups pagination", False, str(exc))
 
+    # 6. Role provisioning: setup_keycloak must create the admin role and grant
+    #    it to the admin user, so the authorization layer is usable. Verified
+    #    live because the python-keycloak role method names can't be confirmed by
+    #    mocks.
+    print("\n[6] Admin role provisioning")
+    try:
+        import requests as _rq2
+        realm = os.environ.get("KEYCLOAK_REALM", "Premkey")
+        admin_role = os.environ.get("ADMIN_ROLE", "tenant-admin")
+        admin_username = os.environ.get("ADMIN_USERNAME", "admin-user")
+        admin_user = os.environ.get("KEYCLOAK_ADMIN_USER", "admin")
+        admin_pass = os.environ.get("KEYCLOAK_ADMIN_PASSWORD", "admin")
+        tok = _rq2.post(
+            kc_url.rstrip("/") + "/realms/master/protocol/openid-connect/token",
+            data={"grant_type": "password", "client_id": "admin-cli",
+                  "username": admin_user, "password": admin_pass},
+            timeout=15).json().get("access_token")
+        hdr = {"Authorization": f"Bearer {tok}"}
+        base = kc_url.rstrip("/") + f"/admin/realms/{realm}"
+        roles = _rq2.get(base + "/roles", headers=hdr, timeout=10).json()
+        c.check(f"realm role '{admin_role}' provisioned",
+                any(r.get("name") == admin_role for r in roles),
+                "role not found in realm")
+        users = _rq2.get(base + f"/users?username={admin_username}",
+                         headers=hdr, timeout=10).json()
+        if users:
+            uid = users[0]["id"]
+            urs = _rq2.get(base + f"/users/{uid}/role-mappings/realm",
+                           headers=hdr, timeout=10).json()
+            c.check(f"admin user has '{admin_role}' role",
+                    any(r.get("name") == admin_role for r in urs),
+                    "admin user missing the role")
+        else:
+            c.check("admin user provisioned", False, "admin user not found")
+    except Exception as exc:  # noqa: BLE001
+        c.check("role provisioning", False, str(exc))
+
     print("-" * 68)
     if c.failed:
         print(f"\u2717 {len(c.failed)} check(s) FAILED:")

@@ -173,6 +173,11 @@ services:
       # this role gets 403 on those endpoints. Must match a role that exists in
       # your Keycloak realm and is granted to tenant administrators.
       ADMIN_ROLE: ${ADMIN_ROLE:-tenant-admin}
+      # The app provisions an admin user holding ADMIN_ROLE on startup, so the
+      # authorization layer is usable out of the box. Set a real password in
+      # production; falls back to DEFAULT_USER_PASSWORD if unset.
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin-user}
+      ADMIN_USER_PASSWORD: ${ADMIN_USER_PASSWORD:-testpass123}
       # Structured logging: JSON (one object per line) is the default so
       # `docker compose logs` is searchable and aggregator-ready. Set
       # LOG_FORMAT=text for human-readable local dev. LOG_LEVEL tunes verbosity.
