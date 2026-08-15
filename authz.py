@@ -57,6 +57,50 @@ def user_has_any_role(token_info: dict, required: Iterable[str]) -> bool:
     return any(r in have for r in required)
 
 
+# Claims that may carry the user's organization/tenant membership. Keycloak and
+# Auth0 both can emit an "organization" claim; we also accept a few common
+# alternatives so this works across IdP configurations without code changes.
+_ORG_CLAIMS = ("organizations", "organization", "org", "orgs", "tenant", "tenants")
+
+
+def extract_org_ids(token_info: dict) -> set[str]:
+    """Collect the organization/tenant ids the token's subject belongs to.
+
+    Looks across the common claim names and normalizes the several shapes an org
+    claim takes in the wild:
+      - a list of ids:            ["org_a", "org_b"]
+      - a single id string:       "org_a"
+      - Auth0-style dict keyed by id: {"org_a": {...}, "org_b": {...}}
+      - a list of dicts with id/name: [{"id": "org_a"}, ...]
+    Unknown/missing claims yield an empty set (no access), never an error.
+    """
+    ids: set[str] = set()
+    for claim in _ORG_CLAIMS:
+        val = token_info.get(claim)
+        if val is None:
+            continue
+        if isinstance(val, str):
+            ids.add(val)
+        elif isinstance(val, dict):
+            # Auth0 organizations claim: keys are the org ids.
+            ids.update(str(k) for k in val.keys())
+        elif isinstance(val, list):
+            for item in val:
+                if isinstance(item, str):
+                    ids.add(item)
+                elif isinstance(item, dict):
+                    # dict entries: prefer an explicit id, fall back to name.
+                    oid = item.get("id") or item.get("org_id") or item.get("name")
+                    if oid is not None:
+                        ids.add(str(oid))
+    return ids
+
+
+def user_can_access_org(token_info: dict, org_id: str) -> bool:
+    """True if the token's subject belongs to the given organization."""
+    return org_id in extract_org_ids(token_info)
+
+
 def make_require_role(introspect_dependency: Callable) -> Callable:
     """Build the require_role factory, wired to the app's auth dependency.
 
@@ -92,3 +136,29 @@ def make_require_role(introspect_dependency: Callable) -> Callable:
         return dependency
 
     return require_role
+
+
+def enforce_org_access(token_info: dict, org_id: str,
+                       superadmin_roles: Iterable[str] = ()) -> None:
+    """Raise 403 unless the token's subject may act on the given organization.
+
+    This is the tenant-isolation check: a tenant-admin of org A must not be able
+    to modify org B. Call it from any endpoint that takes an org_id, passing the
+    validated token_info and the target org.
+
+    A caller holding one of `superadmin_roles` bypasses the scope check — that's
+    the platform operator who legitimately manages all tenants. Pass an empty
+    set (the default) if you have no such role.
+
+    Kept as a plain function (not a dependency) because the org_id usually comes
+    from the path/body of the specific endpoint, which a generic dependency can't
+    know — the endpoint calls this after reading its own org_id.
+    """
+    if superadmin_roles and user_has_any_role(token_info, superadmin_roles):
+        return  # platform superadmin: cross-tenant access is intended
+    if not user_can_access_org(token_info, org_id):
+        raise HTTPException(
+            status_code=403,
+            detail=("Forbidden: you do not have access to organization "
+                    f"'{org_id}'"),
+        )

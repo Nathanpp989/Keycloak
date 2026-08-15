@@ -207,12 +207,15 @@ def test_register_missing_email_is_422(client, monkeypatch):
 def _auth_override():
     """Dependency override that simulates a valid authenticated Keycloak token.
 
-    Includes the admin role so tests of admin endpoints represent an authorized
-    caller. (Authorization is now role-based; a token without the role gets 403.
-    The dedicated authz tests in test_authz.py cover the deny-without-role path.)
+    Includes the admin role AND a broad org membership so functional tests of
+    admin/org endpoints represent an authorized caller acting within their
+    tenant. The organizations list covers the org ids/names these tests use, so
+    tenant scoping (enforce_org_access) passes. Cross-tenant DENIAL is covered by
+    the dedicated tests in test_authz.py, which use a token scoped to one org.
     """
     return {"active": True, "preferred_username": "caller",
-            "realm_access": {"roles": ["tenant-admin"]}}
+            "realm_access": {"roles": ["tenant-admin"]},
+            "organizations": ["org_1", "acme", "o"]}
 
 def test_lookup_requires_authentication(client, monkeypatch):
     # No auth override and no keycloak_oidc -> request must be rejected, NOT served.

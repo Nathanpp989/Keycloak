@@ -32,7 +32,7 @@ from metrics import (  # noqa: E402
     metrics_middleware, render_metrics,
     record_token_result, record_forward_auth,
 )
-from authz import make_require_role  # noqa: E402
+from authz import make_require_role, enforce_org_access  # noqa: E402
 configure_logging()
 logger = logging.getLogger(__name__)
 
@@ -574,6 +574,11 @@ def require_keycloak_auth(credentials=Depends(http_bearer)) -> dict:
 # via env so it can match whatever your Keycloak realm actually calls it.
 require_role = make_require_role(require_keycloak_auth)
 ADMIN_ROLE = os.environ.get("ADMIN_ROLE", "tenant-admin")
+# The platform-operator role that legitimately manages ALL tenants, bypassing
+# the per-tenant scope check. Empty by default (no superadmin) so scoping is
+# strict unless you explicitly designate one.
+SUPERADMIN_ROLE = os.environ.get("SUPERADMIN_ROLE", "")
+_SUPERADMIN_ROLES = (SUPERADMIN_ROLE,) if SUPERADMIN_ROLE else ()
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
@@ -1020,6 +1025,8 @@ def update_organization_endpoint(
     """Update an Auth0 organization's display name. Protected."""
     if user_manager is None or user_manager.auth0_orgs is None:
         raise HTTPException(status_code=503, detail="Organizations API unavailable.")
+    # Tenant isolation: a tenant-admin may only modify their own organization.
+    enforce_org_access(token_info, org_id, _SUPERADMIN_ROLES)
     try:
         return user_manager.auth0_orgs.update_organization(org_id, display_name=display_name)
     except RuntimeError as exc:
@@ -1036,6 +1043,8 @@ def delete_organization_endpoint(
     """Delete an Auth0 organization. Protected."""
     if user_manager is None or user_manager.auth0_orgs is None:
         raise HTTPException(status_code=503, detail="Organizations API unavailable.")
+    # Tenant isolation: a tenant-admin may only delete their own organization.
+    enforce_org_access(token_info, org_id, _SUPERADMIN_ROLES)
     try:
         user_manager.auth0_orgs.delete_organization(org_id)
         return {"deleted": org_id}
@@ -1055,6 +1064,11 @@ def organization_membership_endpoint(
     """Add or remove a user (by email) from an Auth0 organization. Protected."""
     if user_manager is None or user_manager.auth0_orgs is None:
         raise HTTPException(status_code=503, detail="Organizations API unavailable.")
+    # Tenant isolation: a tenant-admin may only manage membership of their own
+    # organization. This matches org_name against the token's org claim, which
+    # works when the claim carries org names; if your IdP emits only org IDs
+    # here, map name->id before this check.
+    enforce_org_access(token_info, org_name, _SUPERADMIN_ROLES)
     if action not in ("add", "remove"):
         raise HTTPException(status_code=422, detail="action must be 'add' or 'remove'")
     try:
@@ -1117,7 +1131,7 @@ def verify_email(
     username: str = Form(...),
     email: str = Form(...),
     action: str = Form(...),  # "set" (mark verified) or "send" (send the email)
-    token_info: dict = Depends(require_keycloak_auth),
+    token_info: dict = Depends(require_role(ADMIN_ROLE)),
 ):
     """Mark email verified in both systems, or trigger verification emails. Protected."""
     if user_manager is None:
@@ -1139,7 +1153,7 @@ def verify_email(
 def password_reset(
     username: str = Form(...),
     email: str = Form(...),
-    token_info: dict = Depends(require_keycloak_auth),
+    token_info: dict = Depends(require_role(ADMIN_ROLE)),
 ):
     """Trigger a password reset in both systems (Auth0 returns a ticket URL). Protected."""
     if user_manager is None:
@@ -1157,7 +1171,7 @@ def password_reset(
 def logout_user(
     username: str = Form(...),
     email: str = Form(...),
-    token_info: dict = Depends(require_keycloak_auth),
+    token_info: dict = Depends(require_role(ADMIN_ROLE)),
 ):
     """Kill the user's sessions in both systems (Auth0 also revokes grants). Protected."""
     if user_manager is None:

@@ -98,3 +98,88 @@ def test_403_names_required_role(client):
     with patch.object(main, "_introspect_token", _introspect_returning(["user"])):
         r = client.post("/groups", json={"name": "g"}, headers=_HDR)
     assert "tenant-admin" in r.json().get("detail", "")
+
+
+# ── Tenant scoping ──────────────────────────────────────────────────────────
+def test_extract_org_ids_list():
+    assert authz.extract_org_ids({"organizations": ["a", "b"]}) == {"a", "b"}
+
+def test_extract_org_ids_string():
+    assert authz.extract_org_ids({"organization": "a"}) == {"a"}
+
+def test_extract_org_ids_auth0_dict():
+    # Auth0 organizations claim is a dict keyed by org id
+    assert authz.extract_org_ids({"organizations": {"a": {}, "b": {}}}) == {"a", "b"}
+
+def test_extract_org_ids_list_of_dicts():
+    assert authz.extract_org_ids({"orgs": [{"id": "a"}, {"name": "b"}]}) == {"a", "b"}
+
+def test_extract_org_ids_missing():
+    assert authz.extract_org_ids({}) == set()
+    assert authz.extract_org_ids({"organization": None}) == set()
+
+def test_user_can_access_org():
+    ti = {"organizations": ["org_a"]}
+    assert authz.user_can_access_org(ti, "org_a")
+    assert not authz.user_can_access_org(ti, "org_b")
+
+def test_enforce_org_access_denies_cross_tenant():
+    from fastapi import HTTPException
+    ti = {"organizations": ["org_a"]}
+    with pytest.raises(HTTPException) as ei:
+        authz.enforce_org_access(ti, "org_b")
+    assert ei.value.status_code == 403
+
+def test_enforce_org_access_allows_own_tenant():
+    ti = {"organizations": ["org_a"]}
+    authz.enforce_org_access(ti, "org_a")  # must not raise
+
+def test_enforce_org_access_superadmin_bypasses():
+    ti = {"organizations": ["org_a"], "realm_access": {"roles": ["platform-admin"]}}
+    # superadmin can touch an org they don't belong to
+    authz.enforce_org_access(ti, "org_z", superadmin_roles=["platform-admin"])
+
+def test_enforce_org_access_non_superadmin_still_scoped():
+    from fastapi import HTTPException
+    ti = {"organizations": ["org_a"], "realm_access": {"roles": ["tenant-admin"]}}
+    # having a non-superadmin role does NOT bypass scoping
+    with pytest.raises(HTTPException):
+        authz.enforce_org_access(ti, "org_z", superadmin_roles=["platform-admin"])
+
+
+# ── Tenant scoping through the app ──────────────────────────────────────────
+def _introspect_org(orgs, roles=("tenant-admin",)):
+    def fake(token):
+        return {"active": True, "realm_access": {"roles": list(roles)},
+                "organizations": list(orgs)}
+    return fake
+
+
+def test_delete_own_org_allowed(client):
+    from unittest.mock import MagicMock
+    mgr = MagicMock()
+    mgr.auth0_orgs = MagicMock()
+    with patch.object(main, "_introspect_token", _introspect_org(["org_a"])), \
+         patch.object(main, "user_manager", mgr):
+        r = client.delete("/organizations/org_a", headers=_HDR)
+    assert r.status_code != 403
+
+def test_delete_other_tenant_org_denied(client):
+    from unittest.mock import MagicMock
+    mgr = MagicMock()
+    mgr.auth0_orgs = MagicMock()
+    with patch.object(main, "_introspect_token", _introspect_org(["org_a"])), \
+         patch.object(main, "user_manager", mgr):
+        r = client.delete("/organizations/org_b", headers=_HDR)
+    assert r.status_code == 403
+    assert "org_b" in r.json().get("detail", "")
+
+def test_update_other_tenant_org_denied(client):
+    from unittest.mock import MagicMock
+    mgr = MagicMock()
+    mgr.auth0_orgs = MagicMock()
+    with patch.object(main, "_introspect_token", _introspect_org(["org_a"])), \
+         patch.object(main, "user_manager", mgr):
+        r = client.patch("/organizations/org_b", data={"display_name": "X"},
+                         headers=_HDR)
+    assert r.status_code == 403

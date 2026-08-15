@@ -173,6 +173,10 @@ services:
       # this role gets 403 on those endpoints. Must match a role that exists in
       # your Keycloak realm and is granted to tenant administrators.
       ADMIN_ROLE: ${ADMIN_ROLE:-tenant-admin}
+      # Optional platform-operator role that bypasses per-tenant scoping (can
+      # manage ALL organizations). Empty by default = strict tenant isolation,
+      # no cross-tenant access for anyone. Set only if you need a platform admin.
+      SUPERADMIN_ROLE: ${SUPERADMIN_ROLE:-}
       # The app provisions an admin user holding ADMIN_ROLE on startup, so the
       # authorization layer is usable out of the box. Set a real password in
       # production; falls back to DEFAULT_USER_PASSWORD if unset.
