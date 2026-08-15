@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Install the app's real dependencies from requirements.txt.
+          # If this is incomplete (e.g. a missing package like python-multipart),
+          # the import of main.py during tests will fail and CI catches it.
+          pip install -r requirements.txt
+          # Test-only tooling
+          pip install pytest responses pyflakes
+
+      - name: Lint (pyflakes)
+        run: |
+          python -m pyflakes *.py
+
+      - name: Run tests
+        env:
+          # Dummy values so modules that read env at import/run don't fail.
+          # No real services are contacted — all HTTP is mocked in the tests.
+          AUTH0_DOMAIN: test.auth0.com
+          AUTH0_CLIENT_ID: test-id
+          AUTH0_CLIENT_SECRET: test-secret
+          KEYCLOAK_URL: http://localhost:8080
+        run: |
+          python -m pytest
+
+  # ── Live integration: run the app's REAL Keycloak setup against a REAL
+  #    Keycloak, then exercise the real auth loop over HTTP. This catches the
+  #    class of bug the mocked suite cannot — e.g. the realm-never-created and
+  #    user-not-fully-set-up bugs, which both passed the mocked tests and only
+  #    broke against a real server. Runs as its own job so the fast mocked
+  #    suite above still gives quick per-push feedback.
+  live-integration:
+    runs-on: ubuntu-latest
+    # NOTE: we do NOT use a `services:` block for Keycloak. Service containers
+    # can't easily pass the required "start-dev" command to the Keycloak image
+    # (the default entrypoint doesn't start the server), so we run Keycloak
+    # ourselves as a detached container and poll for readiness below.
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install requests
+
+      # The service container above pulls the image and starts the container,
+      # but the Keycloak image needs an explicit "start-dev" command. The
+      # simplest robust approach on Actions is to run Keycloak ourselves as a
+      # detached container with the right command, then poll for readiness.
+      - name: Start Keycloak (start-dev)
+        run: |
+          docker run -d --name kc -p 8080:8080 \
+            -e KC_BOOTSTRAP_ADMIN_USERNAME=admin \
+            -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+            quay.io/keycloak/keycloak:26.4.0 start-dev --features=organization
+          echo "Waiting for Keycloak to answer on :8080 ..."
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/realms/master || true)
+            if [ "$code" = "200" ]; then echo "Keycloak ready after ${i}0s"; exit 0; fi
+            sleep 5
+          done
+          echo "Keycloak did not become ready in time"; docker logs kc | tail -30; exit 1
+
+      - name: Run live integration test
+        env:
+          KEYCLOAK_URL: http://localhost:8080
+          KEYCLOAK_REALM: Premkey
+          KEYCLOAK_ADMIN_USER: admin
+          KEYCLOAK_ADMIN_PASSWORD: admin
+          DEFAULT_USER_PASSWORD: testpass123
+          # The app's optional subsystems aren't under test here; turn them off
+          # so the run is hermetic (no Auth0/OpenBao needed).
+          AUTH0_DOMAIN: x
+          AUTH0_CLIENT_ID: x
+          AUTH0_CLIENT_SECRET: x
+          OPENBAO_MODE: "off"
+          AUTH0_MANAGEMENT_MODE: "off"
+          KEY_DIR: /tmp/keys
+        run: |
+          mkdir -p /tmp/keys
+          python integration_test_live.py
+
+      - name: Keycloak logs on failure
+        if: failure()
+        run: docker logs kc | tail -50

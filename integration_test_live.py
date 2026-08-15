@@ -323,6 +323,98 @@ def main_run() -> int:
     except Exception as exc:  # noqa: BLE001
         c.check("tenant scoping", False, str(exc))
 
+    # 8. REAL org membership in token: provision an actual Keycloak organization,
+    #    add a user to it, obtain a token with the 'organization' scope, and
+    #    confirm the org flows through into the claim the authz layer reads. This
+    #    is the genuine end-to-end proof (not an injected claim) — it needs the
+    #    'organization' feature and an orgs-enabled realm. Skipped gracefully if
+    #    organizations aren't available in this Keycloak.
+    print("\n[8] Real org membership flows into token")
+    try:
+        from authz import extract_org_ids, enforce_org_access
+        from fastapi import HTTPException
+        import json as _json
+        m_tok = _rq2.post(
+            kc_url.rstrip("/") + "/realms/master/protocol/openid-connect/token",
+            data={"grant_type": "password", "client_id": "admin-cli",
+                  "username": os.environ.get("KEYCLOAK_ADMIN_USER", "admin"),
+                  "password": os.environ.get("KEYCLOAK_ADMIN_PASSWORD", "admin")},
+            timeout=15).json().get("access_token")
+        mh = {"Authorization": f"Bearer {m_tok}",
+              "Content-Type": "application/json"}
+        base = kc_url.rstrip("/")
+        # Use a dedicated orgs-enabled realm so this is self-contained.
+        orealm = "OrgScopeIT"
+        _rq2.post(base + "/admin/realms", headers=mh, timeout=15,
+                  json={"realm": orealm, "enabled": True,
+                        "organizationsEnabled": True})
+        # Is the organizations feature actually available? If the realm setting
+        # didn't take, the feature isn't enabled — skip without failing.
+        rconf = _rq2.get(base + f"/admin/realms/{orealm}", headers=mh,
+                         timeout=10).json()
+        if not rconf.get("organizationsEnabled"):
+            c.check("organizations feature available", True,
+                    "SKIPPED: organizations not enabled in this Keycloak")
+        else:
+            _rq2.post(base + f"/admin/realms/{orealm}/clients", headers=mh,
+                      timeout=15,
+                      json={"clientId": "app", "secret": "sek",
+                            "publicClient": False,
+                            "directAccessGrantsEnabled": True,
+                            "redirectUris": ["*"]})
+            _rq2.post(base + f"/admin/realms/{orealm}/users", headers=mh,
+                      timeout=15,
+                      json={"username": "boss", "enabled": True,
+                            "email": "boss@acme.com", "emailVerified": True,
+                            "firstName": "B", "lastName": "Oss",
+                            "requiredActions": [],
+                            "credentials": [{"type": "password", "value": "pw",
+                                             "temporary": False}]})
+            uid = _rq2.get(base + f"/admin/realms/{orealm}/users?username=boss",
+                           headers=mh, timeout=10).json()[0]["id"]
+            _rq2.post(base + f"/admin/realms/{orealm}/organizations", headers=mh,
+                      timeout=15,
+                      json={"name": "acme",
+                            "domains": [{"name": "acme.com", "verified": True}]})
+            oid = _rq2.get(base + f"/admin/realms/{orealm}/organizations",
+                           headers=mh, timeout=10).json()[0]["id"]
+            # Add member: Keycloak wants the user id as a JSON string body.
+            _rq2.post(base +
+                      f"/admin/realms/{orealm}/organizations/{oid}/members",
+                      headers=mh, data=_json.dumps(uid), timeout=15)
+            # Token WITH the organization scope, then introspect.
+            utok = _rq2.post(
+                base + f"/realms/{orealm}/protocol/openid-connect/token",
+                data={"grant_type": "password", "client_id": "app",
+                      "client_secret": "sek", "username": "boss",
+                      "password": "pw", "scope": "openid organization"},
+                timeout=15).json().get("access_token")
+            intr = _rq2.post(
+                base + f"/realms/{orealm}/protocol/openid-connect/token/introspect",
+                data={"token": utok, "client_id": "app",
+                      "client_secret": "sek"}, timeout=15).json()
+            # THE PROOF: the real org membership is in the claim authz reads.
+            seen = extract_org_ids(intr)
+            c.check("real org membership appears in token claim",
+                    "acme" in seen, f"org 'acme' not in token; saw {seen}")
+            # And enforcement works on the REAL token: own org allowed, other 403.
+            own_ok = True
+            try:
+                enforce_org_access(intr, "acme")
+            except HTTPException:
+                own_ok = False
+            c.check("enforcement allows own org (real membership)", own_ok,
+                    "own org denied on real token")
+            denied = False
+            try:
+                enforce_org_access(intr, "some-other-org")
+            except HTTPException as he:
+                denied = (he.status_code == 403)
+            c.check("enforcement denies other org (real membership)", denied,
+                    "cross-tenant not denied on real token")
+    except Exception as exc:  # noqa: BLE001
+        c.check("real org membership in token", False, str(exc))
+
     print("-" * 68)
     if c.failed:
         print(f"\u2717 {len(c.failed)} check(s) FAILED:")
