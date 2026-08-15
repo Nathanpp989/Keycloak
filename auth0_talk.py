@@ -814,6 +814,24 @@ class Auth0OrganizationsAPI:
         resp.raise_for_status()
         return _as_list(resp.json(), "members")
 
+    def get_user_organizations(self, user_id: str) -> list:
+        """Return the organizations a user belongs to.
+
+        Uses Auth0's GET /users/{id}/organizations. Enables tenant-scoping of
+        user lookups: we can check whether a target user shares an org with the
+        caller. Returns [] on any error (caller treats that as "no shared org").
+        """
+        try:
+            base = self.base.rsplit("/organizations", 1)[0]
+            resp = requests.get(f"{base}/users/{user_id}/organizations",
+                                headers=self.headers,
+                                params={"per_page": 100}, timeout=10)
+            if resp.status_code != 200:
+                return []
+            return _as_list(resp.json(), "organizations")
+        except Exception:  # noqa: BLE001 — best-effort for scoping
+            return []
+
     def add_members(self, org_id: str, user_ids: list[str]) -> None:
         """Add one or more users to an organization."""
         resp = requests.post(f"{self.base}/{org_id}/members", headers=self.headers,

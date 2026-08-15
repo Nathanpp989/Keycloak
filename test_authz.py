@@ -234,3 +234,46 @@ def test_list_orgs_endpoint_filters_to_tenant(client):
     assert r.status_code == 200
     ids = [o["id"] for o in r.json()["organizations"]]
     assert ids == ["org_a"]   # org_b NOT leaked
+
+
+# ── Shared-org (user lookup) scoping ────────────────────────────────────────
+def test_shares_org_true_when_overlap():
+    ti = {"organizations": ["org_a", "org_b"]}
+    assert authz.shares_org(ti, ["org_b", "org_c"])
+
+def test_shares_org_false_when_disjoint():
+    ti = {"organizations": ["org_a"]}
+    assert not authz.shares_org(ti, ["org_x", "org_y"])
+
+def test_shares_org_superadmin_always_true():
+    ti = {"organizations": [], "realm_access": {"roles": ["super"]}}
+    assert authz.shares_org(ti, ["anything"], superadmin_roles=["super"])
+
+def test_enforce_shared_org_denies_disjoint():
+    from fastapi import HTTPException
+    ti = {"organizations": ["org_a"]}
+    with pytest.raises(HTTPException) as ei:
+        authz.enforce_shared_org(ti, ["org_z"])
+    assert ei.value.status_code == 403
+
+def test_enforce_shared_org_allows_overlap():
+    ti = {"organizations": ["org_a"]}
+    authz.enforce_shared_org(ti, ["org_a", "org_b"])  # no raise
+
+
+# ── id-vs-name org matching ─────────────────────────────────────────────────
+def test_user_can_access_org_matches_any_ref():
+    ti = {"organizations": ["org_id_123"]}
+    # token carries the id; we pass both name and id -> matches on id
+    assert authz.user_can_access_org(ti, "Acme", "org_id_123")
+    # token carries id; only the name passed -> no match
+    assert not authz.user_can_access_org(ti, "Acme")
+
+def test_enforce_org_access_multi_ref():
+    from fastapi import HTTPException
+    ti = {"organizations": ["the_id"]}
+    # passing both name and id, token has id -> allowed
+    authz.enforce_org_access(ti, "TheName", "the_id")
+    # neither matches -> denied
+    with pytest.raises(HTTPException):
+        authz.enforce_org_access(ti, "OtherName", "other_id")

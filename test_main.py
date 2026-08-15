@@ -243,6 +243,7 @@ def test_lookup_success(client, monkeypatch):
         mgr = MagicMock()
         mgr.determine_user_system.return_value = UserSystem.BOTH
         monkeypatch.setattr(main, "user_manager", mgr)
+        mgr.get_user_org_refs.return_value = ["org_1"]  # target shares caller org
         r = client.get("/users/lookup", params={"username": "u", "email": "e@x.com"})
         assert r.status_code == 200
         assert r.json()["system"] == "both"
@@ -255,6 +256,7 @@ def test_lookup_runtime_error_becomes_502(client, monkeypatch):
         mgr = MagicMock()
         mgr.determine_user_system.side_effect = RuntimeError("missing read:users scope")
         monkeypatch.setattr(main, "user_manager", mgr)
+        mgr.get_user_org_refs.return_value = ["org_1"]  # target shares caller org
         r = client.get("/users/lookup", params={"username": "u", "email": "e@x.com"})
         assert r.status_code == 502
         assert "read:users" in r.json()["detail"]
@@ -343,6 +345,7 @@ def test_membership_success(client, monkeypatch):
             "correlation": {"groups_in_both": [], "roles_in_both": []},
         }
         monkeypatch.setattr(main, "user_manager", mgr)
+        mgr.get_user_org_refs.return_value = ["org_1"]  # target shares caller org
         r = client.get("/users/membership", params={"username": "u", "email": "e@x.com"})
         assert r.status_code == 200
         assert r.json()["keycloak"]["found"] is True
@@ -355,6 +358,7 @@ def test_membership_runtime_error_becomes_502(client, monkeypatch):
         mgr = MagicMock()
         mgr.get_membership.side_effect = RuntimeError("missing read:roles scope")
         monkeypatch.setattr(main, "user_manager", mgr)
+        mgr.get_user_org_refs.return_value = ["org_1"]  # target shares caller org
         r = client.get("/users/membership", params={"username": "u", "email": "e@x.com"})
         assert r.status_code == 502
         assert "read:roles" in r.json()["detail"]

@@ -579,6 +579,36 @@ ADMIN_ROLE = os.environ.get("ADMIN_ROLE", "tenant-admin")
 SUPERADMIN_ROLE = os.environ.get("SUPERADMIN_ROLE", "")
 _SUPERADMIN_ROLES = (SUPERADMIN_ROLE,) if SUPERADMIN_ROLE else ()
 
+# Whether to tenant-scope user lookups. On by default when the deployment is
+# multi-tenant (a SUPERADMIN_ROLE is configured, or callers carry org claims).
+# Set USER_TENANT_SCOPING=off to disable (e.g. a single-tenant deployment where
+# every admin should see every user).
+USER_TENANT_SCOPING = os.environ.get("USER_TENANT_SCOPING", "on").lower() != "off"
+
+
+def _enforce_user_tenant_scope(token_info: dict, email: str) -> None:
+    """Deny looking up a user outside the caller's organization(s).
+
+    Only enforced when USER_TENANT_SCOPING is on AND the caller actually has org
+    membership in their token (so single-tenant setups, where tokens carry no
+    org claim, keep working unchanged). Superadmins bypass. Resolves the target
+    user's orgs and requires an overlap with the caller's.
+    """
+    if not USER_TENANT_SCOPING:
+        return
+    from authz import extract_org_ids, is_superadmin, enforce_shared_org
+    if is_superadmin(token_info, _SUPERADMIN_ROLES):
+        return
+    # If the caller has no org claim at all, treat as non-multi-tenant context
+    # and skip (avoids breaking single-tenant deployments). Multi-tenant callers
+    # always carry org membership.
+    if not extract_org_ids(token_info):
+        return
+    if user_manager is None:
+        return
+    target_orgs = user_manager.get_user_org_refs(email)
+    enforce_shared_org(token_info, target_orgs, _SUPERADMIN_ROLES)
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -836,6 +866,8 @@ def users_lookup(
             status_code=503,
             detail="User management is unavailable (Auth0 not configured).",
         )
+    # Tenant isolation: only look up users who share one of the caller's orgs.
+    _enforce_user_tenant_scope(token_info, email)
     try:
         system = user_manager.determine_user_system(username, email)
     except RuntimeError as exc:
@@ -861,6 +893,8 @@ def users_membership(
             status_code=503,
             detail="User management is unavailable (Auth0 not configured).",
         )
+    # Tenant isolation: only inspect membership of users in the caller's orgs.
+    _enforce_user_tenant_scope(token_info, email)
     try:
         return user_manager.get_membership(username, email)
     except RuntimeError as exc:
@@ -1029,7 +1063,7 @@ def update_organization_endpoint(
     if user_manager is None or user_manager.auth0_orgs is None:
         raise HTTPException(status_code=503, detail="Organizations API unavailable.")
     # Tenant isolation: a tenant-admin may only modify their own organization.
-    enforce_org_access(token_info, org_id, _SUPERADMIN_ROLES)
+    enforce_org_access(token_info, org_id, superadmin_roles=_SUPERADMIN_ROLES)
     try:
         return user_manager.auth0_orgs.update_organization(org_id, display_name=display_name)
     except RuntimeError as exc:
@@ -1047,7 +1081,7 @@ def delete_organization_endpoint(
     if user_manager is None or user_manager.auth0_orgs is None:
         raise HTTPException(status_code=503, detail="Organizations API unavailable.")
     # Tenant isolation: a tenant-admin may only delete their own organization.
-    enforce_org_access(token_info, org_id, _SUPERADMIN_ROLES)
+    enforce_org_access(token_info, org_id, superadmin_roles=_SUPERADMIN_ROLES)
     try:
         user_manager.auth0_orgs.delete_organization(org_id)
         return {"deleted": org_id}
@@ -1068,10 +1102,18 @@ def organization_membership_endpoint(
     if user_manager is None or user_manager.auth0_orgs is None:
         raise HTTPException(status_code=503, detail="Organizations API unavailable.")
     # Tenant isolation: a tenant-admin may only manage membership of their own
-    # organization. This matches org_name against the token's org claim, which
-    # works when the claim carries org names; if your IdP emits only org IDs
-    # here, map name->id before this check.
-    enforce_org_access(token_info, org_name, _SUPERADMIN_ROLES)
+    # organization. Resolve the org so we can match the caller's claim against
+    # BOTH its id and its name — this works whether the IdP emits org ids or
+    # names in the token, closing the id-vs-name ambiguity.
+    org_ref_id = None
+    try:
+        resolved = user_manager.auth0_orgs.get_organization_by_name(org_name)
+        if resolved:
+            org_ref_id = resolved.get("id")
+    except Exception:  # noqa: BLE001 — resolution is best-effort for scoping
+        org_ref_id = None
+    enforce_org_access(token_info, org_name, org_ref_id,
+                       superadmin_roles=_SUPERADMIN_ROLES)
     if action not in ("add", "remove"):
         raise HTTPException(status_code=422, detail="action must be 'add' or 'remove'")
     try:

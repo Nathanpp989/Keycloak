@@ -411,6 +411,31 @@ class UserManager:
         return summary
 
     # ── Auth0 organization membership ──────────────────────────
+    def get_user_org_refs(self, email: str) -> list:
+        """Return the org ids AND names a user belongs to (for tenant-scoping).
+
+        Resolves email -> Auth0 user id -> organizations, returning both each
+        org's id and name so a caller's claim matches regardless of which form
+        it carries. Returns [] if orgs are unavailable or the user has none —
+        the caller treats an empty result as "no shared tenant".
+        """
+        if self.auth0_orgs is None:
+            return []
+        try:
+            a0_uid = self._auth0_user_id(email)
+        except Exception:  # noqa: BLE001
+            return []
+        if a0_uid is None:
+            return []
+        refs: list = []
+        for org in self.auth0_orgs.get_user_organizations(a0_uid):
+            if isinstance(org, dict):
+                if org.get("id"):
+                    refs.append(str(org["id"]))
+                if org.get("name"):
+                    refs.append(str(org["name"]))
+        return refs
+
     def set_organization_membership(self, email: str, org_name: str,
                                     add: bool = True) -> str:
         """

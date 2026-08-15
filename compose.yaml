@@ -177,6 +177,12 @@ services:
       # manage ALL organizations). Empty by default = strict tenant isolation,
       # no cross-tenant access for anyone. Set only if you need a platform admin.
       SUPERADMIN_ROLE: ${SUPERADMIN_ROLE:-}
+      # Tenant-scope user lookups (/users/lookup, /users/membership): a caller
+      # may only inspect users who share one of their organizations. On by
+      # default; set to "off" for single-tenant deployments where every admin
+      # should see every user. Callers with no org claim are never scoped
+      # (single-tenant tokens keep working).
+      USER_TENANT_SCOPING: ${USER_TENANT_SCOPING:-on}
       # The app provisions an admin user holding ADMIN_ROLE on startup, so the
       # authorization layer is usable out of the box. Set a real password in
       # production; falls back to DEFAULT_USER_PASSWORD if unset.

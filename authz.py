@@ -96,9 +96,13 @@ def extract_org_ids(token_info: dict) -> set[str]:
     return ids
 
 
-def user_can_access_org(token_info: dict, org_id: str) -> bool:
-    """True if the token's subject belongs to the given organization."""
-    return org_id in extract_org_ids(token_info)
+def user_can_access_org(token_info: dict, *org_refs: str) -> bool:
+    """True if the token's subject belongs to an org matching ANY of the given
+    references. Pass an org's id and name together so the check succeeds whether
+    the token claim carries ids or names (they're different identifiers for the
+    same org). None/empty refs are ignored."""
+    accessible = extract_org_ids(token_info)
+    return any(ref in accessible for ref in org_refs if ref)
 
 
 def make_require_role(introspect_dependency: Callable) -> Callable:
@@ -138,29 +142,31 @@ def make_require_role(introspect_dependency: Callable) -> Callable:
     return require_role
 
 
-def enforce_org_access(token_info: dict, org_id: str,
+def enforce_org_access(token_info: dict, *org_refs: str,
                        superadmin_roles: Iterable[str] = ()) -> None:
-    """Raise 403 unless the token's subject may act on the given organization.
+    """Raise 403 unless the token's subject may act on the referenced org.
 
     This is the tenant-isolation check: a tenant-admin of org A must not be able
-    to modify org B. Call it from any endpoint that takes an org_id, passing the
-    validated token_info and the target org.
+    to modify org B. Call it from any endpoint that identifies an org, passing
+    the validated token_info and one or more references to the SAME org (e.g.
+    both its id and its name) — access is granted if the token matches any of
+    them, so it works whether the IdP claim carries ids or names.
 
     A caller holding one of `superadmin_roles` bypasses the scope check — that's
-    the platform operator who legitimately manages all tenants. Pass an empty
-    set (the default) if you have no such role.
+    the platform operator who legitimately manages all tenants.
 
-    Kept as a plain function (not a dependency) because the org_id usually comes
-    from the path/body of the specific endpoint, which a generic dependency can't
-    know — the endpoint calls this after reading its own org_id.
+    Kept as a plain function (not a dependency) because the org reference usually
+    comes from the path/body of the specific endpoint, which a generic dependency
+    can't know — the endpoint calls this after reading its own org reference.
     """
     if superadmin_roles and user_has_any_role(token_info, superadmin_roles):
         return  # platform superadmin: cross-tenant access is intended
-    if not user_can_access_org(token_info, org_id):
+    if not user_can_access_org(token_info, *org_refs):
+        shown = next((r for r in org_refs if r), "?")
         raise HTTPException(
             status_code=403,
             detail=("Forbidden: you do not have access to organization "
-                    f"'{org_id}'"),
+                    f"'{shown}'"),
         )
 
 
@@ -195,3 +201,31 @@ def filter_orgs_to_accessible(token_info: dict, orgs: list,
            (oname is not None and str(oname) in accessible):
             out.append(org)
     return out
+
+
+def shares_org(token_info: dict, target_org_refs: Iterable[str],
+               superadmin_roles: Iterable[str] = ()) -> bool:
+    """True if the caller shares at least one organization with a target.
+
+    Used to tenant-scope user lookups: the caller may only inspect a user who
+    belongs to one of the caller's own organizations. A superadmin always
+    matches. target_org_refs is the set of org ids/names the TARGET belongs to.
+    """
+    if is_superadmin(token_info, superadmin_roles):
+        return True
+    caller_orgs = extract_org_ids(token_info)
+    return any(str(ref) in caller_orgs for ref in target_org_refs if ref)
+
+
+def enforce_shared_org(token_info: dict, target_org_refs: Iterable[str],
+                       superadmin_roles: Iterable[str] = ()) -> None:
+    """Raise 403 unless the caller shares an org with the target user.
+
+    Tenant isolation for user lookups. If the target belongs to no orgs the
+    caller can see, the lookup is denied — a tenant-admin can't inspect users
+    outside their tenant(s).
+    """
+    if not shares_org(token_info, target_org_refs, superadmin_roles):
+        raise HTTPException(
+            status_code=403,
+            detail="Forbidden: target user is not in your organization(s)")
