@@ -183,3 +183,54 @@ def test_update_other_tenant_org_denied(client):
         r = client.patch("/organizations/org_b", data={"display_name": "X"},
                          headers=_HDR)
     assert r.status_code == 403
+
+
+# ── Org-list read filtering ─────────────────────────────────────────────────
+def test_filter_orgs_to_caller_tenants():
+    orgs = [{"id": "a", "name": "A"}, {"id": "b", "name": "B"},
+            {"id": "c", "name": "C"}]
+    ti = {"organizations": ["a", "c"]}
+    result = authz.filter_orgs_to_accessible(ti, orgs)
+    assert [o["id"] for o in result] == ["a", "c"]
+
+def test_filter_orgs_matches_by_name_too():
+    orgs = [{"id": "id1", "name": "Acme"}, {"id": "id2", "name": "Beta"}]
+    ti = {"organizations": ["Acme"]}   # claim carries names, not ids
+    result = authz.filter_orgs_to_accessible(ti, orgs)
+    assert [o["id"] for o in result] == ["id1"]
+
+def test_filter_orgs_superadmin_sees_all():
+    orgs = [{"id": "a"}, {"id": "b"}]
+    ti = {"organizations": ["a"], "realm_access": {"roles": ["super"]}}
+    result = authz.filter_orgs_to_accessible(ti, orgs, superadmin_roles=["super"])
+    assert len(result) == 2
+
+def test_filter_orgs_empty_when_no_membership():
+    orgs = [{"id": "a"}, {"id": "b"}]
+    result = authz.filter_orgs_to_accessible({}, orgs)
+    assert result == []
+
+def test_filter_orgs_drops_non_dict_entries():
+    orgs = [{"id": "a"}, "garbage", None, {"id": "b"}]
+    ti = {"organizations": ["a", "b"]}
+    result = authz.filter_orgs_to_accessible(ti, orgs)
+    assert [o["id"] for o in result] == ["a", "b"]
+
+def test_is_superadmin():
+    ti = {"realm_access": {"roles": ["platform-admin"]}}
+    assert authz.is_superadmin(ti, ["platform-admin"])
+    assert not authz.is_superadmin(ti, ["other"])
+    assert not authz.is_superadmin(ti, [])   # no superadmin role configured
+
+
+def test_list_orgs_endpoint_filters_to_tenant(client):
+    from unittest.mock import MagicMock
+    mgr = MagicMock()
+    mgr.auth0_orgs.list_organizations.return_value = [
+        {"id": "org_a", "name": "A"}, {"id": "org_b", "name": "B"}]
+    with patch.object(main, "_introspect_token", _introspect_org(["org_a"])), \
+         patch.object(main, "user_manager", mgr):
+        r = client.get("/organizations", headers=_HDR)
+    assert r.status_code == 200
+    ids = [o["id"] for o in r.json()["organizations"]]
+    assert ids == ["org_a"]   # org_b NOT leaked

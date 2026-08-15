@@ -250,6 +250,79 @@ def main_run() -> int:
     except Exception as exc:  # noqa: BLE001
         c.check("role provisioning", False, str(exc))
 
+    # 7. Tenant scoping: verify the authz layer correctly reads roles and org
+    #    membership from a REAL Keycloak-issued token (introspected), and that
+    #    enforcement denies cross-tenant access. Roles come from real Keycloak;
+    #    the org claim is injected to exercise the scoping path end to end
+    #    (Keycloak org membership setup varies by version, so we validate the
+    #    enforcement logic against a real token structure plus an org claim).
+    print("\n[7] Tenant scoping enforcement")
+    try:
+        from authz import (extract_roles, enforce_org_access,
+                           filter_orgs_to_accessible)
+        from fastapi import HTTPException
+        realm = os.environ.get("KEYCLOAK_REALM", "Premkey")
+        admin_role = os.environ.get("ADMIN_ROLE", "tenant-admin")
+        # Get the admin user's REAL token and introspect it (real structure).
+        admin_username = os.environ.get("ADMIN_USERNAME", "admin-user")
+        admin_pw = os.environ.get("ADMIN_USER_PASSWORD", "testpass123")
+        # discover the client secret
+        m_tok = _rq2.post(
+            kc_url.rstrip("/") + "/realms/master/protocol/openid-connect/token",
+            data={"grant_type": "password", "client_id": "admin-cli",
+                  "username": os.environ.get("KEYCLOAK_ADMIN_USER", "admin"),
+                  "password": os.environ.get("KEYCLOAK_ADMIN_PASSWORD", "admin")},
+            timeout=15).json().get("access_token")
+        m_hdr = {"Authorization": f"Bearer {m_tok}"}
+        cl = _rq2.get(kc_url.rstrip("/") +
+                      f"/admin/realms/{realm}/clients?clientId=Hello-World-app",
+                      headers=m_hdr, timeout=10).json()
+        cuuid = cl[0]["id"]
+        csec = _rq2.get(kc_url.rstrip("/") +
+                        f"/admin/realms/{realm}/clients/{cuuid}/client-secret",
+                        headers=m_hdr, timeout=10).json()["value"]
+        utok = _rq2.post(
+            kc_url.rstrip("/") + f"/realms/{realm}/protocol/openid-connect/token",
+            data={"grant_type": "password", "client_id": "Hello-World-app",
+                  "client_secret": csec, "username": admin_username,
+                  "password": admin_pw}, timeout=15).json().get("access_token")
+        intr = _rq2.post(
+            kc_url.rstrip("/") +
+            f"/realms/{realm}/protocol/openid-connect/token/introspect",
+            data={"token": utok, "client_id": "Hello-World-app",
+                  "client_secret": csec}, timeout=15).json()
+        # The real token carries the admin role -> authz reads it.
+        c.check("authz reads admin role from real token",
+                admin_role in extract_roles(intr),
+                f"role {admin_role} not found in real token")
+        # Now attach an org claim and verify scoping enforcement on real token.
+        scoped = dict(intr)
+        scoped["organizations"] = ["org_owned"]
+        # own org: allowed (no raise)
+        try:
+            enforce_org_access(scoped, "org_owned")
+            own_ok = True
+        except HTTPException:
+            own_ok = False
+        c.check("scoping allows own tenant (real token)", own_ok, "own org denied")
+        # other org: denied (403)
+        denied = False
+        try:
+            enforce_org_access(scoped, "org_other")
+        except HTTPException as he:
+            denied = (he.status_code == 403)
+        c.check("scoping denies cross-tenant (real token)", denied,
+                "cross-tenant access was NOT denied")
+        # org-list filter drops other tenants
+        orgs = [{"id": "org_owned", "name": "Owned"},
+                {"id": "org_other", "name": "Other"}]
+        visible = filter_orgs_to_accessible(scoped, orgs)
+        c.check("org-list filter hides other tenants (real token)",
+                [o["id"] for o in visible] == ["org_owned"],
+                f"leak: {[o['id'] for o in visible]}")
+    except Exception as exc:  # noqa: BLE001
+        c.check("tenant scoping", False, str(exc))
+
     print("-" * 68)
     if c.failed:
         print(f"\u2717 {len(c.failed)} check(s) FAILED:")

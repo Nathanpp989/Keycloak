@@ -32,7 +32,7 @@ from metrics import (  # noqa: E402
     metrics_middleware, render_metrics,
     record_token_result, record_forward_auth,
 )
-from authz import make_require_role, enforce_org_access  # noqa: E402
+from authz import make_require_role, enforce_org_access, filter_orgs_to_accessible  # noqa: E402
 configure_logging()
 logger = logging.getLogger(__name__)
 
@@ -70,7 +70,6 @@ def _write_atomic(path: str, data: bytes, mode: int = 0o644):
             os.unlink(tmp)
         except OSError:
             pass
-        raise
         raise
 
 def init_rsa_keys():
@@ -1005,11 +1004,15 @@ def create_organization_endpoint(
 def list_organizations_endpoint(
     token_info: dict = Depends(require_keycloak_auth),
 ):
-    """List Auth0 organizations. Protected."""
+    """List Auth0 organizations. Protected. Tenant-scoped: a tenant-admin sees
+    only the organizations they belong to; a superadmin sees all."""
     if user_manager is None or user_manager.auth0_orgs is None:
         raise HTTPException(status_code=503, detail="Organizations API unavailable.")
     try:
-        return {"organizations": user_manager.auth0_orgs.list_organizations()}
+        all_orgs = user_manager.auth0_orgs.list_organizations()
+        # Tenant isolation for reads: don't leak other tenants' orgs.
+        visible = filter_orgs_to_accessible(token_info, all_orgs, _SUPERADMIN_ROLES)
+        return {"organizations": visible}
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
     except Exception as exc:

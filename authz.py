@@ -162,3 +162,36 @@ def enforce_org_access(token_info: dict, org_id: str,
             detail=("Forbidden: you do not have access to organization "
                     f"'{org_id}'"),
         )
+
+
+def is_superadmin(token_info: dict, superadmin_roles: Iterable[str]) -> bool:
+    """True if the token holds a role that grants cross-tenant (platform) access."""
+    return bool(superadmin_roles) and user_has_any_role(token_info, superadmin_roles)
+
+
+def filter_orgs_to_accessible(token_info: dict, orgs: list,
+                              superadmin_roles: Iterable[str] = (),
+                              id_key: str = "id",
+                              name_key: str = "name") -> list:
+    """Filter a list of organization objects to those the caller may see.
+
+    Tenant isolation for READ: a tenant-admin listing organizations should only
+    get back their own, not every tenant's. A superadmin gets the full list.
+
+    Each org is matched by its id OR name against the caller's org claim, so this
+    works whether the token carries ids or names. Non-dict entries are dropped
+    defensively.
+    """
+    if is_superadmin(token_info, superadmin_roles):
+        return orgs
+    accessible = extract_org_ids(token_info)
+    out = []
+    for org in orgs:
+        if not isinstance(org, dict):
+            continue
+        oid = org.get(id_key)
+        oname = org.get(name_key)
+        if (oid is not None and str(oid) in accessible) or \
+           (oname is not None and str(oname) in accessible):
+            out.append(org)
+    return out
