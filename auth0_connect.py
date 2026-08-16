@@ -57,8 +57,25 @@ class Auth0Connect:
             raise RuntimeError(f"Auth0 token request failed: {exc}") from exc
 
         if not response.ok:
+            # A 401 access_denied here almost always means the M2M app isn't
+            # authorized for the Management API audience — the single most common
+            # Auth0 setup gap. Give an actionable message instead of a raw 401.
+            hint = ""
+            if response.status_code == 401 and "access_denied" in response.text:
+                hint = (
+                    "\n  -> The M2M application is not authorized for the Auth0 "
+                    "Management API audience "
+                    f"(https://{self.domain}/api/v2/).\n"
+                    "     Fix: in the Auth0 Dashboard, open Applications -> your "
+                    "M2M app -> APIs, authorize 'Auth0 Management API', and grant "
+                    "the scopes you need (e.g. read:users, read:clients, "
+                    "read:organizations).\n"
+                    "     Or, if you don't intend to use Auth0 management here, "
+                    "set AUTH0_MANAGEMENT_MODE=off so the app disables those "
+                    "endpoints cleanly instead of failing.")
             raise RuntimeError(
-                f"Auth0 token endpoint returned {response.status_code}: {response.text}"
+                f"Auth0 token endpoint returned {response.status_code}: "
+                f"{response.text}{hint}"
             )
         try:
             body = response.json()
