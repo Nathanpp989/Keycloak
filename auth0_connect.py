@@ -276,6 +276,41 @@ def create_server_certificate(
             ]),
             critical=False,
         )
+        # Mark this as an end-entity (leaf) certificate, not a CA. Modern TLS
+        # stacks reject a leaf that doesn't say CA:FALSE, and without pathlen
+        # discipline a self-signed cert can otherwise look like a usable CA.
+        .add_extension(
+            x509.BasicConstraints(ca=False, path_length=None),
+            critical=True,
+        )
+        # Constrain what the key may do: digital signatures + key encipherment,
+        # which is what an RSA server key needs for TLS. Locking this down is
+        # basic certificate hygiene and some clients enforce it.
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                key_encipherment=True,
+                content_commitment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        # Explicitly scope the cert to TLS server authentication.
+        .add_extension(
+            x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]),
+            critical=False,
+        )
+        # Subject Key Identifier — standard hygiene that helps chain building
+        # and matches what real CAs emit.
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(private_key.public_key()),
+            critical=False,
+        )
         .sign(private_key, hashes.SHA256())
     )
 

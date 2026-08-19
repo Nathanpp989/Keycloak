@@ -11,6 +11,7 @@ import requests
 import os
 import re
 import secrets
+import time as _time
 from enum import Enum
 
 from auth0_connect import Auth0Connect, get_keycloak_admin_token, _require_env
@@ -57,6 +58,13 @@ def generate_password(length: int = 16) -> str:
 class UserManager:
     """Detects user presence across systems and creates users in both."""
 
+    # Short-TTL cache for email -> Auth0 user_id, to collapse duplicate
+    # resolutions within a single logical operation (see _auth0_user_id).
+    _UID_CACHE_TTL = 5.0  # seconds
+    # Once the cache reaches this many entries, expired ones are pruned on the
+    # next miss — bounds memory over a long-running process.
+    _UID_CACHE_MAX = 1024
+
     def __init__(self, keycloak: KeycloakAdminAPI, auth0_users: Auth0UsersAPI,
                  auth0_authz=None, auth0_orgs=None):
         self.keycloak = keycloak
@@ -65,6 +73,8 @@ class UserManager:
         self.auth0_authz = auth0_authz
         # Optional Auth0OrganizationsAPI; org operations require it.
         self.auth0_orgs = auth0_orgs
+        # email -> (user_id_or_None, monotonic_timestamp)
+        self._uid_cache: dict = {}
 
     # ── id resolution ──────────────────────────────────────────
     def _keycloak_user_id(self, username: str, email: str) -> str | None:
@@ -84,7 +94,19 @@ class UserManager:
         return None
 
     def _auth0_user_id(self, email: str) -> str | None:
-        """Return the Auth0 user_id for an email, or None if not found."""
+        """Return the Auth0 user_id for an email, or None if not found.
+
+        Memoized with a short TTL (a few seconds) because a single logical
+        operation often resolves the same email more than once — e.g. a
+        tenant-scoped lookup resolves it for the org check AND for the system
+        check. The TTL is short enough that it never serves meaningfully stale
+        data across separate requests, but collapses the duplicate resolutions
+        within one. Cache is keyed by email and holds both hits and misses.
+        """
+        now = _time.monotonic()
+        cached = self._uid_cache.get(email)
+        if cached is not None and (now - cached[1]) < self._UID_CACHE_TTL:
+            return cached[0]
         base = f"https://{self.auth0_users.auth0.domain}/api/v2/users-by-email"
         resp = requests.get(
             base, headers=self.auth0_users.headers,
@@ -97,7 +119,16 @@ class UserManager:
             )
         resp.raise_for_status()
         results = resp.json()
-        return results[0].get("user_id") if results else None
+        uid = results[0].get("user_id") if results else None
+        # Opportunistically drop expired entries so the cache can't grow without
+        # bound over a long-running process (the TTL prevents stale reads, but on
+        # its own would still leak memory as distinct emails accumulate).
+        if len(self._uid_cache) >= self._UID_CACHE_MAX:
+            cutoff = now - self._UID_CACHE_TTL
+            for k in [k for k, v in self._uid_cache.items() if v[1] < cutoff]:
+                self._uid_cache.pop(k, None)
+        self._uid_cache[email] = (uid, now)
+        return uid
 
     # ── detection ──────────────────────────────────────────────
     def _in_keycloak(self, username: str, email: str) -> bool:

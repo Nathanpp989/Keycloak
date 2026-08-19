@@ -277,3 +277,13 @@ def test_enforce_org_access_multi_ref():
     # neither matches -> denied
     with pytest.raises(HTTPException):
         authz.enforce_org_access(ti, "OtherName", "other_id")
+
+
+def test_filter_orgs_handles_none_list():
+    # A None org list (degenerate input) must not crash — returns empty, and
+    # consistently so for both scoped and superadmin callers.
+    ti = {"organizations": ["a"]}
+    ti_super = {"realm_access": {"roles": ["super"]}}
+    assert authz.filter_orgs_to_accessible(ti, None) == []
+    assert authz.filter_orgs_to_accessible(
+        ti_super, None, superadmin_roles=["super"]) == []

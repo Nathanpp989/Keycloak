@@ -188,6 +188,8 @@ def filter_orgs_to_accessible(token_info: dict, orgs: list,
     works whether the token carries ids or names. Non-dict entries are dropped
     defensively.
     """
+    if not orgs:  # None or empty — nothing to filter for anyone
+        return orgs if orgs is not None else []
     if is_superadmin(token_info, superadmin_roles):
         return orgs
     accessible = extract_org_ids(token_info)

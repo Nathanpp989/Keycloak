@@ -389,6 +389,29 @@ def test_create_server_certificate_writes_files_with_600_key():
         assert oct(os.stat(k).st_mode)[-3:] == "600"
 
 
+def test_create_server_certificate_has_proper_extensions():
+    # The cert must be a well-formed end-entity TLS cert: CA:FALSE, key usage
+    # scoped to signing/encipherment (NOT cert-signing), and server-auth EKU.
+    from cryptography import x509
+    with tempfile.TemporaryDirectory() as d:
+        cert_path = os.path.join(d, "s.crt")
+        key_path = os.path.join(d, "s.key")
+        create_server_certificate("example.com", cert_path, key_path)
+        with open(cert_path, "rb") as f:
+            cert = x509.load_pem_x509_certificate(f.read())
+        bc = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+        assert bc.ca is False  # end-entity, not a CA
+        ku = cert.extensions.get_extension_for_class(x509.KeyUsage).value
+        assert ku.digital_signature and ku.key_encipherment
+        assert not ku.key_cert_sign  # must NOT be able to sign other certs
+        eku = cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
+        assert x509.oid.ExtendedKeyUsageOID.SERVER_AUTH in eku
+        # SAN still carries hostname + localhost + loopback
+        san = cert.extensions.get_extension_for_class(
+            x509.SubjectAlternativeName).value
+        assert "example.com" in san.get_values_for_type(x509.DNSName)
+
+
 # ──────────────────────────────────────────────
 # auth0_connect — integrate_with_keycloak status handling
 # ──────────────────────────────────────────────
@@ -2673,3 +2696,111 @@ def test_find_by_name_requests_correct_pagination_params():
     assert "include_totals=true" in get.request.url
     assert "per_page=" in get.request.url
     assert "page=" in get.request.url
+
+
+# ── _auth0_user_id short-TTL cache ──────────────────────────────────────────
+def test_auth0_user_id_cache_collapses_duplicates():
+    from unittest.mock import MagicMock, patch
+    import auth0_type
+    um = auth0_type.UserManager.__new__(auth0_type.UserManager)
+    um.auth0_users = MagicMock()
+    um.auth0_users.auth0.domain = "d.us.auth0.com"
+    um.auth0_users.headers = {}
+    um._uid_cache = {}
+    calls = {"n": 0}
+
+    def fake_get(*a, **k):
+        calls["n"] += 1
+        r = MagicMock(); r.status_code = 200
+        r.json.return_value = [{"user_id": "auth0|123"}]
+        return r
+
+    with patch("auth0_type.requests.get", fake_get):
+        a = um._auth0_user_id("bob@x.com")
+        b = um._auth0_user_id("bob@x.com")
+    assert a == b == "auth0|123"
+    assert calls["n"] == 1  # duplicate resolution collapsed
+
+
+def test_auth0_user_id_cache_expires_after_ttl():
+    from unittest.mock import MagicMock, patch
+    import auth0_type
+    um = auth0_type.UserManager.__new__(auth0_type.UserManager)
+    um.auth0_users = MagicMock()
+    um.auth0_users.auth0.domain = "d.us.auth0.com"
+    um.auth0_users.headers = {}
+    um._uid_cache = {}
+    calls = {"n": 0}
+
+    def fake_get(*a, **k):
+        calls["n"] += 1
+        r = MagicMock(); r.status_code = 200
+        r.json.return_value = [{"user_id": f"id-{calls['n']}"}]
+        return r
+
+    # 3rd access is > TTL later -> must refetch
+    times = [100.0, 100.1, 100.0 + auth0_type.UserManager._UID_CACHE_TTL + 1]
+    with patch("auth0_type.requests.get", fake_get), \
+         patch("auth0_type._time.monotonic", side_effect=times):
+        first = um._auth0_user_id("x@y.com")
+        cached = um._auth0_user_id("x@y.com")
+        refetched = um._auth0_user_id("x@y.com")
+    assert first == cached == "id-1"
+    assert refetched == "id-2"
+    assert calls["n"] == 2
+
+
+def test_auth0_user_id_cache_caches_misses():
+    # A "not found" (None) is cached too, so repeated lookups of a nonexistent
+    # user don't hammer Auth0.
+    from unittest.mock import MagicMock, patch
+    import auth0_type
+    um = auth0_type.UserManager.__new__(auth0_type.UserManager)
+    um.auth0_users = MagicMock()
+    um.auth0_users.auth0.domain = "d.us.auth0.com"
+    um.auth0_users.headers = {}
+    um._uid_cache = {}
+    calls = {"n": 0}
+
+    def fake_get(*a, **k):
+        calls["n"] += 1
+        r = MagicMock(); r.status_code = 200
+        r.json.return_value = []  # no such user
+        return r
+
+    with patch("auth0_type.requests.get", fake_get):
+        a = um._auth0_user_id("ghost@x.com")
+        b = um._auth0_user_id("ghost@x.com")
+    assert a is None and b is None
+    assert calls["n"] == 1  # miss cached, not re-fetched
+
+
+def test_auth0_user_id_cache_is_bounded():
+    # The cache must prune expired entries once it hits its cap, so a long-lived
+    # process resolving many distinct emails can't leak memory unboundedly.
+    from unittest.mock import MagicMock, patch
+    import auth0_type
+    um = auth0_type.UserManager.__new__(auth0_type.UserManager)
+    um.auth0_users = MagicMock()
+    um.auth0_users.auth0.domain = "d"
+    um.auth0_users.headers = {}
+    um._uid_cache = {}
+    orig_max = auth0_type.UserManager._UID_CACHE_MAX
+    auth0_type.UserManager._UID_CACHE_MAX = 5
+    try:
+        clock = {"v": 1000.0}
+
+        def fake_get(*a, **k):
+            r = MagicMock(); r.status_code = 200
+            r.json.return_value = [{"user_id": "id"}]
+            return r
+
+        with patch("auth0_type.requests.get", fake_get), \
+             patch("auth0_type._time.monotonic", lambda: clock["v"]):
+            for i in range(6):
+                um._auth0_user_id(f"user{i}@x.com")
+            clock["v"] = 1000.0 + auth0_type.UserManager._UID_CACHE_TTL + 5
+            um._auth0_user_id("fresh@x.com")  # triggers prune of expired
+        assert len(um._uid_cache) == 1  # only the fresh entry survives
+    finally:
+        auth0_type.UserManager._UID_CACHE_MAX = orig_max
