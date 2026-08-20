@@ -599,6 +599,29 @@ the request — a security add-on must not break login), and it does **not trust
 lets an attacker dodge the limit and lock out victims. Limitation: counters are
 per-process, so behind N replicas the effective limit is N x the value.
 
+### OpenBao as an internal certificate authority (implemented)
+
+OpenBao's PKI engine can act as an internal CA that issues the TLS cert Traefik
+serves — replacing Traefik's throwaway self-signed cert with one from a CA you
+control. `openbao_connect.py` provides the primitives (`enable_pki_engine`,
+`configure_pki_root_ca`, `create_pki_role`, `issue_certificate`), and
+`openbao_traefik_cert.py` wires them together: it issues a leaf cert for your
+hostnames and writes `openbao-cert.pem` (full chain), `openbao-key.pem` (0600),
+and a `tls-openbao.yml` Traefik dynamic-TLS config into `traefik/dynamic/`.
+
+    OPENBAO_ADDR=... OPENBAO_TOKEN=... ./openbao_traefik_cert.py \
+        --hostnames app.localhost,keycloak.localhost,openbao.localhost
+
+Then re-up Traefik so it loads the cert, and verify the issuer is your OpenBao
+CA:
+
+    curl -vk https://app.localhost 2>&1 | grep -i 'issuer\|subject'
+
+Defaults to a self-signed root CA (right for internal/dev trust); switch to an
+intermediate signed by your existing corporate root when you have one. The
+generated cert/key/config are git-ignored — the private key must never be
+committed.
+
 ### Security response headers (implemented)
 
 Every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options:

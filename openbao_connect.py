@@ -55,6 +55,11 @@ JWT_MOUNT_AUTH0     = os.environ.get("OPENBAO_AUTH0_MOUNT", "auth0-jwt")
 # KV v2 secrets engine mount for capability #3.
 KV_MOUNT = os.environ.get("OPENBAO_KV_MOUNT", "secret")
 
+# PKI secrets engine mount — OpenBao acts as an internal Certificate Authority
+# that issues TLS certs (e.g. for Traefik). Separate mount from KV/auth so the
+# CA lives on its own path.
+PKI_MOUNT = os.environ.get("OPENBAO_PKI_MOUNT", "pki")
+
 
 class OpenBaoError(RuntimeError):
     """Raised for OpenBao API failures with an actionable message."""
@@ -355,6 +360,137 @@ def resolve_secret(name: str, *, prefer: str = "openbao") -> str:
         except Exception as exc:  # noqa: BLE001 - fall through to next source
             errors.append(f"{fn.__name__}: {exc}")
     raise OpenBaoError("secret not resolvable from any source: " + " | ".join(errors))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PKI: OpenBao as an internal Certificate Authority (Level 1)
+# ════════════════════════════════════════════════════════════════════════════
+# These let OpenBao mint TLS certificates that Traefik (or anything) can serve,
+# instead of relying on Traefik's throwaway self-signed cert. The flow is:
+#   1. enable_pki_engine()            — mount the PKI secrets engine
+#   2. configure_pki_root_ca()        — generate the CA (the trust anchor)
+#   3. create_pki_role()              — a role that constrains what can be issued
+#   4. issue_certificate(...)         — mint a leaf cert for a hostname
+# Every step is idempotent-friendly and raises OpenBaoError with an actionable
+# message on failure, matching the rest of this module.
+
+def enable_pki_engine(*, mount: str = PKI_MOUNT, max_ttl: str = "87600h",
+                      token: str | None = None,
+                      addr: str | None = None) -> bool:
+    """Mount the PKI secrets engine at `mount`. Idempotent.
+
+    max_ttl bounds the longest cert this engine can ever issue (default 10y,
+    suitable for a root CA). Returns True if the mount is present afterward.
+    """
+    tok = _require_token(token)
+    resp = _request("POST", f"sys/mounts/{mount}", token=tok, addr=addr,
+                    json_body={"type": "pki",
+                               "config": {"max_lease_ttl": max_ttl}})
+    if resp.status_code < 400:
+        logger.info("Enabled PKI engine at mount '%s'", mount)
+        return True
+    body = resp.text.lower()
+    if resp.status_code == 400 and ("already in use" in body
+                                    or "existing mount" in body):
+        logger.info("PKI mount '%s' already exists; reusing", mount)
+        return True
+    _check(resp, f"enable PKI engine at '{mount}'")
+    return True
+
+
+def configure_pki_root_ca(common_name: str, *, mount: str = PKI_MOUNT,
+                          ttl: str = "87600h", key_bits: int = 2048,
+                          token: str | None = None,
+                          addr: str | None = None) -> dict:
+    """Generate a self-signed root CA inside the PKI mount (the trust anchor).
+
+    Idempotent-ish: if a root already exists OpenBao returns the existing one's
+    error on regeneration; we surface that clearly rather than silently
+    clobbering a CA. Returns the issued CA data (contains the certificate).
+
+    For an INTERMEDIATE CA instead of a root, you'd generate a CSR here and have
+    your existing root sign it — left as a future option; root is the right
+    default for internal/dev trust.
+    """
+    tok = _require_token(token)
+    resp = _request("POST", f"{mount}/root/generate/internal", token=tok,
+                    addr=addr,
+                    json_body={"common_name": common_name, "ttl": ttl,
+                               "key_bits": key_bits})
+    data = _check(resp, f"generate root CA '{common_name}'")
+    # Also set the URLs the CA advertises (issuing cert + CRL), which real
+    # clients use for chain building and revocation checks.
+    base = (addr or OPENBAO_ADDR).rstrip("/")
+    _request("POST", f"{mount}/config/urls", token=tok, addr=addr,
+             json_body={
+                 "issuing_certificates": f"{base}/v1/{mount}/ca",
+                 "crl_distribution_points": f"{base}/v1/{mount}/crl",
+             })
+    logger.info("Configured PKI root CA '%s' at mount '%s'", common_name, mount)
+    return data.get("data", data) if isinstance(data, dict) else {}
+
+
+def create_pki_role(role_name: str, *, mount: str = PKI_MOUNT,
+                    allowed_domains: list | None = None,
+                    allow_subdomains: bool = True,
+                    allow_localhost: bool = True,
+                    allow_ip_sans: bool = True,
+                    max_ttl: str = "720h",
+                    token: str | None = None,
+                    addr: str | None = None) -> bool:
+    """Create/replace a PKI role that constrains what certificates may be issued.
+
+    A role is the policy boundary: it says which domains a cert can be issued for
+    and the maximum lifetime. Traefik's cert is then issued against this role.
+    Roles are idempotent (writing the same name updates it).
+    """
+    tok = _require_token(token)
+    body = {
+        "allow_subdomains": allow_subdomains,
+        "allow_localhost": allow_localhost,
+        "allow_ip_sans": allow_ip_sans,
+        "max_ttl": max_ttl,
+        "key_type": "rsa",
+        "key_bits": 2048,
+    }
+    if allowed_domains:
+        body["allowed_domains"] = allowed_domains
+    resp = _request("POST", f"{mount}/roles/{role_name}", token=tok, addr=addr,
+                    json_body=body)
+    _check(resp, f"create PKI role '{role_name}'")
+    logger.info("Created PKI role '%s' at mount '%s'", role_name, mount)
+    return True
+
+
+def issue_certificate(role_name: str, common_name: str, *,
+                      mount: str = PKI_MOUNT, ttl: str = "720h",
+                      alt_names: list | None = None,
+                      ip_sans: list | None = None,
+                      token: str | None = None,
+                      addr: str | None = None) -> dict:
+    """Issue a leaf certificate for `common_name` against `role_name`.
+
+    Returns a dict with 'certificate', 'private_key', 'issuing_ca', and
+    'ca_chain' (PEM strings). This is the cert Traefik serves. The TTL is capped
+    by the role's max_ttl and the engine's max_lease_ttl.
+    """
+    tok = _require_token(token)
+    body: dict = {"common_name": common_name, "ttl": ttl}
+    if alt_names:
+        body["alt_names"] = ",".join(alt_names)
+    if ip_sans:
+        body["ip_sans"] = ",".join(ip_sans)
+    resp = _request("POST", f"{mount}/issue/{role_name}", token=tok, addr=addr,
+                    json_body=body)
+    data = _check(resp, f"issue certificate for '{common_name}'")
+    issued = data.get("data", {}) if isinstance(data, dict) else {}
+    if not issued.get("certificate"):
+        raise OpenBaoError(
+            f"issue certificate for '{common_name}': response had no "
+            "certificate — check the role allows this common_name/domain.")
+    logger.info("Issued certificate for '%s' (serial %s)",
+                common_name, issued.get("serial_number", "?"))
+    return issued
 
 
 # ════════════════════════════════════════════════════════════════════════════

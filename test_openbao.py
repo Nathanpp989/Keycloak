@@ -456,3 +456,62 @@ def test_try_openbao_returns_none_when_unconfigured(monkeypatch):
     import openbao_connect
     monkeypatch.setattr(openbao_connect, "OPENBAO_TOKEN", "")
     assert authorize._try_openbao("X") is None
+
+
+# ── PKI: OpenBao as a certificate authority ─────────────────────────────────
+@responses.activate
+def test_enable_pki_engine_new():
+    responses.add(responses.POST, f"{ADDR}/v1/sys/mounts/pki", status=204)
+    assert ob.enable_pki_engine(token=TOK, addr=ADDR) is True
+
+
+@responses.activate
+def test_enable_pki_engine_already_mounted_is_ok():
+    responses.add(responses.POST, f"{ADDR}/v1/sys/mounts/pki",
+                  json={"errors": ["path is already in use at pki/"]}, status=400)
+    assert ob.enable_pki_engine(token=TOK, addr=ADDR) is True
+
+
+@responses.activate
+def test_configure_pki_root_ca_returns_cert():
+    responses.add(responses.POST, f"{ADDR}/v1/pki/root/generate/internal",
+                  json={"data": {"certificate": "-----BEGIN CERTIFICATE-----"}},
+                  status=200)
+    responses.add(responses.POST, f"{ADDR}/v1/pki/config/urls", status=204)
+    out = ob.configure_pki_root_ca("Test Root CA", token=TOK, addr=ADDR)
+    assert "certificate" in out
+
+
+@responses.activate
+def test_create_pki_role():
+    responses.add(responses.POST, f"{ADDR}/v1/pki/roles/traefik", status=204)
+    assert ob.create_pki_role("traefik", allowed_domains=["localhost"],
+                              token=TOK, addr=ADDR) is True
+
+
+@responses.activate
+def test_issue_certificate_returns_cert_and_key():
+    responses.add(
+        responses.POST, f"{ADDR}/v1/pki/issue/traefik",
+        json={"data": {
+            "certificate": "-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----",
+            "private_key": "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
+            "issuing_ca": "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----",
+            "serial_number": "aa:bb:cc",
+        }}, status=200)
+    out = ob.issue_certificate("traefik", "app.localhost",
+                               alt_names=["localhost"], ip_sans=["127.0.0.1"],
+                               token=TOK, addr=ADDR)
+    assert out["certificate"].startswith("-----BEGIN CERTIFICATE")
+    assert out["private_key"].startswith("-----BEGIN PRIVATE KEY")
+    assert out["serial_number"] == "aa:bb:cc"
+
+
+@responses.activate
+def test_issue_certificate_empty_response_raises():
+    # A 200 with no certificate (e.g. role rejected the CN) must raise clearly.
+    responses.add(responses.POST, f"{ADDR}/v1/pki/issue/traefik",
+                  json={"data": {}}, status=200)
+    with pytest.raises(ob.OpenBaoError) as ei:
+        ob.issue_certificate("traefik", "bad.example", token=TOK, addr=ADDR)
+    assert "no" in str(ei.value).lower()
