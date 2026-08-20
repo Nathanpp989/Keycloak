@@ -398,21 +398,40 @@ def enable_pki_engine(*, mount: str = PKI_MOUNT, max_ttl: str = "87600h",
     return True
 
 
+def _pki_has_ca(mount: str, addr: str | None, token: str | None) -> bool:
+    """True if the PKI mount already has a CA certificate. Used to make root-CA
+    generation genuinely idempotent: OpenBao's /root/generate/internal does NOT
+    reliably error on a second call (behavior varies by version — it may return
+    the existing CA, or in some versions replace it), so we must check first
+    rather than rely on catching an 'already exists' error that may never come.
+    """
+    # GET <mount>/ca/pem returns the CA cert (200 with a PEM body) when one
+    # exists, and a non-200 / empty body when the mount has no CA yet.
+    resp = _request("GET", f"{mount}/ca/pem", token=token, addr=addr)
+    return resp.status_code == 200 and b"BEGIN CERTIFICATE" in resp.content
+
+
 def configure_pki_root_ca(common_name: str, *, mount: str = PKI_MOUNT,
                           ttl: str = "87600h", key_bits: int = 2048,
+                          force: bool = False,
                           token: str | None = None,
                           addr: str | None = None) -> dict:
     """Generate a self-signed root CA inside the PKI mount (the trust anchor).
 
-    Idempotent-ish: if a root already exists OpenBao returns the existing one's
-    error on regeneration; we surface that clearly rather than silently
-    clobbering a CA. Returns the issued CA data (contains the certificate).
+    Idempotent: if the mount already has a CA, this returns without regenerating
+    (so re-running setup doesn't mint a NEW root and orphan previously-issued
+    certs). Pass force=True to regenerate anyway (rotating the CA). Returns the
+    issued CA data on generation, or {"existing": True} when reusing.
 
     For an INTERMEDIATE CA instead of a root, you'd generate a CSR here and have
     your existing root sign it — left as a future option; root is the right
     default for internal/dev trust.
     """
     tok = _require_token(token)
+    if not force and _pki_has_ca(mount, addr, tok):
+        logger.info("PKI mount '%s' already has a CA; reusing (pass force=True "
+                    "to rotate)", mount)
+        return {"existing": True}
     resp = _request("POST", f"{mount}/root/generate/internal", token=tok,
                     addr=addr,
                     json_body={"common_name": common_name, "ttl": ttl,

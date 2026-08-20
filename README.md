@@ -622,6 +622,21 @@ intermediate signed by your existing corporate root when you have one. The
 generated cert/key/config are git-ignored — the private key must never be
 committed.
 
+**Renewal.** Certs are re-issued by running the same tool with `--renew`, which
+only re-issues when the current cert is due (below 1/3 of its lifetime, or under
+7 days remaining — whichever comes first) and otherwise exits without change.
+It's a check-and-exit, meant to run on a cron or systemd timer, not a daemon:
+
+    # daily at 03:00 — re-issue only when due, then reload Traefik if changed
+    0 3 * * *  OPENBAO_ADDR=... OPENBAO_TOKEN=... /path/openbao_traefik_cert.py --renew
+
+Renewal is safe by construction: the new cert is issued and validated BEFORE any
+file is overwritten, so if OpenBao is unreachable or issuance fails, the existing
+working cert is left untouched and Traefik keeps serving it. Re-running the
+initial setup never mints a new CA (it detects and reuses the existing one), so
+previously-issued certs keep chaining; pass `force=True` to `configure_pki_root_ca`
+only when you deliberately want to rotate the CA.
+
 ### Security response headers (implemented)
 
 Every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options:

@@ -474,6 +474,8 @@ def test_enable_pki_engine_already_mounted_is_ok():
 
 @responses.activate
 def test_configure_pki_root_ca_returns_cert():
+    # No existing CA (404 on the check) -> proceeds to generate.
+    responses.add(responses.GET, f"{ADDR}/v1/pki/ca/pem", status=404)
     responses.add(responses.POST, f"{ADDR}/v1/pki/root/generate/internal",
                   json={"data": {"certificate": "-----BEGIN CERTIFICATE-----"}},
                   status=200)
@@ -515,3 +517,40 @@ def test_issue_certificate_empty_response_raises():
     with pytest.raises(ob.OpenBaoError) as ei:
         ob.issue_certificate("traefik", "bad.example", token=TOK, addr=ADDR)
     assert "no" in str(ei.value).lower()
+
+
+@responses.activate
+def test_configure_pki_root_ca_idempotent_when_ca_exists():
+    # If the mount already has a CA, we must NOT regenerate (which would orphan
+    # previously-issued certs). Detect via GET <mount>/ca/pem returning a cert.
+    responses.add(responses.GET, f"{ADDR}/v1/pki/ca/pem",
+                  body="-----BEGIN CERTIFICATE-----\nexisting\n-----END CERTIFICATE-----",
+                  status=200)
+    out = ob.configure_pki_root_ca("Root CA", token=TOK, addr=ADDR)
+    assert out == {"existing": True}
+    # and it must NOT have POSTed to generate
+    assert not any("root/generate" in c.request.url for c in responses.calls)
+
+
+@responses.activate
+def test_configure_pki_root_ca_generates_when_absent():
+    # No CA yet -> GET ca/pem 404 -> generate.
+    responses.add(responses.GET, f"{ADDR}/v1/pki/ca/pem", status=404)
+    responses.add(responses.POST, f"{ADDR}/v1/pki/root/generate/internal",
+                  json={"data": {"certificate": "PEM"}}, status=200)
+    responses.add(responses.POST, f"{ADDR}/v1/pki/config/urls", status=204)
+    out = ob.configure_pki_root_ca("Root CA", token=TOK, addr=ADDR)
+    assert "certificate" in out
+
+
+@responses.activate
+def test_configure_pki_root_ca_force_regenerates():
+    # force=True must generate even when a CA exists (CA rotation).
+    responses.add(responses.GET, f"{ADDR}/v1/pki/ca/pem",
+                  body="-----BEGIN CERTIFICATE-----\nold\n-----END CERTIFICATE-----",
+                  status=200)
+    responses.add(responses.POST, f"{ADDR}/v1/pki/root/generate/internal",
+                  json={"data": {"certificate": "NEWPEM"}}, status=200)
+    responses.add(responses.POST, f"{ADDR}/v1/pki/config/urls", status=204)
+    out = ob.configure_pki_root_ca("Root CA", force=True, token=TOK, addr=ADDR)
+    assert out.get("certificate") == "NEWPEM"

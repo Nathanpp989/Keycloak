@@ -55,17 +55,14 @@ tls:
 
 
 def ensure_pki(role: str, ca_common_name: str, allowed_domains: list) -> None:
-    """Idempotently ensure the PKI engine, root CA, and issuing role exist."""
+    """Idempotently ensure the PKI engine, root CA, and issuing role exist.
+
+    configure_pki_root_ca is now genuinely idempotent (it checks for an existing
+    CA and reuses it), so a re-run never mints a new root and orphans previously
+    issued certs.
+    """
     ob.enable_pki_engine()
-    # configure_pki_root_ca raises if a root already exists; that's fine on a
-    # re-run — treat "already exists" as success so this stays idempotent.
-    try:
-        ob.configure_pki_root_ca(ca_common_name)
-    except ob.OpenBaoError as exc:
-        if "already" in str(exc).lower() or "existing" in str(exc).lower():
-            print("  root CA already present — reusing")
-        else:
-            raise
+    ob.configure_pki_root_ca(ca_common_name)
     ob.create_pki_role(role, allowed_domains=allowed_domains)
 
 
@@ -102,6 +99,87 @@ def write_traefik_tls_config(out_dir: str, cert_container_path: str,
     return config_path
 
 
+def cert_needs_renewal(cert_path: str, *, renew_before_fraction: float = 0.33,
+                       min_remaining_days: float = 7.0) -> bool:
+    """Decide whether the cert at cert_path should be renewed.
+
+    Renews when EITHER the remaining lifetime is below `renew_before_fraction`
+    of the cert's total validity, OR fewer than `min_remaining_days` remain —
+    whichever triggers first. A missing/unparseable cert also returns True (we
+    should issue one). This is deliberately conservative: renewing early is
+    harmless, running expired is not.
+    """
+    from datetime import datetime, timezone
+    from cryptography import x509
+    if not os.path.exists(cert_path):
+        return True
+    try:
+        with open(cert_path, "rb") as f:
+            data = f.read()
+        # The file may be a chain (leaf first); parse the FIRST cert (the leaf).
+        import re as _re
+        blocks = _re.findall(
+            rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+            data, _re.DOTALL)
+        if not blocks:
+            return True
+        leaf = x509.load_pem_x509_certificate(blocks[0])
+    except Exception:  # noqa: BLE001 — unparseable => renew
+        return True
+
+    now = datetime.now(timezone.utc)
+    not_before = leaf.not_valid_before_utc
+    not_after = leaf.not_valid_after_utc
+    if now >= not_after:
+        return True  # already expired
+    total = (not_after - not_before).total_seconds()
+    remaining = (not_after - now).total_seconds()
+    if total <= 0:
+        return True
+    if remaining < min_remaining_days * 86400:
+        return True
+    return (remaining / total) < renew_before_fraction
+
+
+def renew_if_needed(role: str, hostnames: list, out_dir: str, *,
+                    container_dynamic_dir: str = "/etc/traefik/dynamic",
+                    ttl: str = "720h",
+                    renew_before_fraction: float = 0.33,
+                    min_remaining_days: float = 7.0,
+                    force: bool = False) -> dict:
+    """One-shot renewal check: re-issue the Traefik cert only if it's due.
+
+    Designed to run on a schedule (cron/systemd timer) rather than as a daemon —
+    a check-and-exit is simpler, safer, and testable. SAFETY: the NEW cert is
+    issued and validated in memory BEFORE any file is overwritten, so a failed
+    renewal (OpenBao down, role rejects) leaves the existing cert untouched and
+    Traefik keeps serving it. Returns a small status dict.
+
+    Assumes the PKI engine/CA/role already exist (run openbao_traefik_cert.py or
+    ensure_pki first). Renewal only issues leaf certs; it never touches the CA.
+    """
+    cert_path = os.path.join(out_dir, "openbao-cert.pem")
+    if not force and not cert_needs_renewal(
+            cert_path, renew_before_fraction=renew_before_fraction,
+            min_remaining_days=min_remaining_days):
+        return {"renewed": False, "reason": "not due"}
+
+    cn = hostnames[0]
+    # Issue the new cert FIRST. If this raises, we return without touching the
+    # existing files — the old cert stays in place.
+    cert_data = ob.issue_certificate(
+        role, cn, alt_names=hostnames, ip_sans=["127.0.0.1"], ttl=ttl)
+    if not cert_data.get("certificate") or not cert_data.get("private_key"):
+        return {"renewed": False, "reason": "issue returned no cert/key"}
+
+    cert_p, key_p = write_cert_files(cert_data, out_dir)
+    cont_cert = os.path.join(container_dynamic_dir, os.path.basename(cert_p))
+    cont_key = os.path.join(container_dynamic_dir, os.path.basename(key_p))
+    write_traefik_tls_config(out_dir, cont_cert, cont_key)
+    return {"renewed": True, "serial": cert_data.get("serial_number", "?"),
+            "cert_path": cert_p}
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Issue an OpenBao cert for Traefik.")
     p.add_argument("--hostnames",
@@ -116,6 +194,9 @@ def main() -> int:
     p.add_argument("--container-dynamic-dir", default="/etc/traefik/dynamic",
                    help="Path where Traefik sees the dynamic dir (its container "
                         "mount point) — used in the generated TLS config.")
+    p.add_argument("--renew", action="store_true",
+                   help="Renewal mode: only re-issue if the existing cert is due "
+                        "(safe to run on a cron/timer). Assumes PKI is set up.")
     args = p.parse_args()
 
     if not os.environ.get("OPENBAO_TOKEN"):
@@ -126,6 +207,19 @@ def main() -> int:
     if not hostnames:
         print("error: no hostnames given")
         return 1
+
+    # Renewal mode: check-and-maybe-reissue, don't touch the CA.
+    if args.renew:
+        result = renew_if_needed(
+            args.role, hostnames, args.out_dir,
+            container_dynamic_dir=args.container_dynamic_dir, ttl=args.ttl)
+        if result.get("renewed"):
+            print(f"Renewed cert (serial {result.get('serial')}). "
+                  "Reload Traefik to pick it up.")
+        else:
+            print(f"No renewal needed ({result.get('reason')}).")
+        return 0
+
     cn, alt_names = hostnames[0], hostnames
 
     print(f"Issuing OpenBao cert for {hostnames} (CN={cn})")
