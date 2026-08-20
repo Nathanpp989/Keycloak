@@ -599,6 +599,15 @@ the request — a security add-on must not break login), and it does **not trust
 lets an attacker dodge the limit and lock out victims. Limitation: counters are
 per-process, so behind N replicas the effective limit is N x the value.
 
+### Security response headers (implemented)
+
+Every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options:
+DENY`, and `Referrer-Policy: no-referrer` (set in the correlation-ID
+middleware). HSTS (`Strict-Transport-Security`) is opt-in via `SECURITY_HSTS=true`
+— it's off by default so a plain-HTTP local/dev setup isn't locked out. No CSP is
+set: the broker serves JSON, and a wrong CSP breaks more than it protects. All
+use `setdefault`, so an endpoint that sets its own value is never overridden.
+
 ### Secrets out of the environment (implemented)
 
 `GITHUB_TOKEN` resolves through the secret store first (`authorize.get_secret`,

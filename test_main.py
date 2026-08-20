@@ -1534,3 +1534,48 @@ def test_grant_realm_role_survives_error():
     admin = MagicMock()
     admin.get_realm_role.side_effect = RuntimeError("no such role")
     main.grant_realm_role(admin, "user-123", "tenant-admin")   # must not raise
+
+
+# ── /status/subsystems (diagnostic endpoint, previously untested) ────────────
+def test_subsystem_status_reports_feature_states(client):
+    r = client.get("/status/subsystems")
+    assert r.status_code == 200
+    body = r.json()
+    # Reports the two optional subsystems with enabled/mode/reason each.
+    assert "auth0_management" in body
+    assert "openbao" in body
+    for key in ("auth0_management", "openbao"):
+        assert set(body[key]) >= {"enabled", "mode", "reason"}
+    # And the clarifying note about brokered login always being on.
+    assert "note" in body
+
+
+def test_subsystem_status_survives_feature_error(client, monkeypatch):
+    # If feature-state resolution raises, the endpoint returns a graceful error
+    # object rather than 500-ing — it's a diagnostic, it must not itself crash.
+    import features
+    monkeypatch.setattr(features, "auth0_management_state",
+                        lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    r = client.get("/status/subsystems")
+    assert r.status_code == 200
+    assert "error" in r.json()
+
+
+# ── Security response headers ───────────────────────────────────────────────
+def test_security_headers_present_on_responses(client):
+    r = client.get("/health/live")
+    assert r.headers.get("X-Content-Type-Options") == "nosniff"
+    assert r.headers.get("X-Frame-Options") == "DENY"
+    assert r.headers.get("Referrer-Policy") == "no-referrer"
+
+
+def test_hsts_is_opt_in(client):
+    # Without SECURITY_HSTS, no HSTS header (so plain-HTTP dev isn't locked out).
+    r = client.get("/health/live")
+    assert r.headers.get("Strict-Transport-Security") is None
+
+
+def test_hsts_present_when_enabled(client, monkeypatch):
+    monkeypatch.setenv("SECURITY_HSTS", "true")
+    r = client.get("/health/live")
+    assert "max-age=31536000" in r.headers.get("Strict-Transport-Security", "")

@@ -32,7 +32,10 @@ from metrics import (  # noqa: E402
     metrics_middleware, render_metrics,
     record_token_result, record_forward_auth,
 )
-from authz import make_require_role, enforce_org_access, filter_orgs_to_accessible  # noqa: E402
+from authz import (  # noqa: E402
+    make_require_role, enforce_org_access, filter_orgs_to_accessible,
+    extract_org_ids, is_superadmin, enforce_shared_org,
+)
 configure_logging()
 logger = logging.getLogger(__name__)
 
@@ -523,6 +526,17 @@ async def correlation_id_middleware(request: Request, call_next):
     finally:
         request_id_var.reset(token)
     response.headers["X-Request-ID"] = rid
+    # Standard security headers on every response. These are the low-risk,
+    # broadly-applicable ones (no CSP here — a broker serves JSON, and a wrong
+    # CSP breaks more than it protects). HSTS is opt-in via SECURITY_HSTS
+    # because forcing HTTPS-only would lock out plain-HTTP dev/local setups.
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    if os.environ.get("SECURITY_HSTS", "").lower() in ("1", "true", "on"):
+        response.headers.setdefault(
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains")
     return response
 
 
@@ -596,7 +610,6 @@ def _enforce_user_tenant_scope(token_info: dict, email: str) -> None:
     """
     if not USER_TENANT_SCOPING:
         return
-    from authz import extract_org_ids, is_superadmin, enforce_shared_org
     if is_superadmin(token_info, _SUPERADMIN_ROLES):
         return
     # If the caller has no org claim at all, treat as non-multi-tenant context
