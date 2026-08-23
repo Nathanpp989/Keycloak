@@ -136,6 +136,7 @@ python login_flow.py
 | GET | `/` | none | Health/hello |
 | GET | `/hello` | none | Echoes email + username |
 | POST | `/token` | none | Log in via Keycloak; returns an access token |
+| POST | `/token/client` | none | Machine-to-machine token (OAuth2 client_credentials): an app authenticates with its Keycloak client_id + secret. Accepts an optional `scope` to constrain the token. The client's service account can hold realm roles (set `SERVICE_ACCOUNT_ROLE`) so the token carries real permissions; endpoints enforce scopes via `require_scope`. M2M requests use a separate, higher rate limit (`RATE_LIMIT_M2M_MAX`). |
 | GET | `/protected` | Bearer | Example protected resource |
 | POST | `/oidc-token` | Bearer | Validate a token via Keycloak introspection |
 | POST | `/register` | none | Create a user in Keycloak + Auth0 |

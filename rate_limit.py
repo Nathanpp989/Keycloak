@@ -103,6 +103,7 @@ def _float_env(name: str, default: float) -> float:
 # minute per IP is far above human use and far below a brute-force rate.
 _LOGIN = None
 _REGISTER = None
+_M2M = None
 _build_lock = threading.Lock()
 
 
@@ -128,12 +129,32 @@ def register_limiter() -> RateLimiter:
     return _REGISTER
 
 
+def client_credentials_limiter() -> RateLimiter:
+    """Rate limiter for machine-to-machine (client_credentials) token requests.
+
+    Separate from the human login limiter with a higher default ceiling: an app
+    legitimately fetches tokens far more often than a person logs in (e.g. a
+    fleet of workers refreshing tokens), so a limit tuned for humans would
+    throttle normal machine traffic. Still bounded, to contain a misbehaving or
+    compromised client. Tunable via RATE_LIMIT_M2M_MAX / _WINDOW.
+    """
+    global _M2M
+    if _M2M is None:
+        with _build_lock:
+            if _M2M is None:
+                _M2M = RateLimiter(
+                    _int_env("RATE_LIMIT_M2M_MAX", 60),
+                    _float_env("RATE_LIMIT_M2M_WINDOW", 60.0))
+    return _M2M
+
+
 def reset_all() -> None:
     """Test hook / admin: rebuild limiters (e.g. after changing env)."""
-    global _LOGIN, _REGISTER
+    global _LOGIN, _REGISTER, _M2M
     with _build_lock:
         _LOGIN = None
         _REGISTER = None
+        _M2M = None
 
 
 def client_key(request) -> str:

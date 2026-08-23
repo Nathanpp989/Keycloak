@@ -34,7 +34,7 @@ from metrics import (  # noqa: E402
 )
 from authz import (  # noqa: E402
     make_require_role, enforce_org_access, filter_orgs_to_accessible,
-    extract_org_ids, is_superadmin, enforce_shared_org,
+    extract_org_ids, is_superadmin, enforce_shared_org, enforce_scope,
 )
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -183,6 +183,30 @@ def grant_realm_role(admin: KeycloakAdmin, user_id: str, role_name: str) -> None
                        role_name, user_id, exc)
 
 
+def grant_service_account_role(admin: KeycloakAdmin, client_uuid: str,
+                               role_name: str) -> None:
+    """Grant a realm role to a client's SERVICE ACCOUNT (for M2M tokens).
+
+    A service account is a special user Keycloak creates for a client with
+    service accounts enabled; its token carries whatever realm roles it holds,
+    which require_role then reads exactly as it does for a human token. This is
+    what gives an app-level (client_credentials) token actual permissions rather
+    than just 'authenticated'. Best-effort and idempotent — a failure logs a
+    warning rather than crashing startup.
+    """
+    try:
+        sa_user = admin.get_client_service_account_user(client_uuid)
+        sa_id = sa_user.get("id") if isinstance(sa_user, dict) else None
+        if not sa_id:
+            logger.warning("No service-account user for client %s; can't grant "
+                           "role '%s'", client_uuid, role_name)
+            return
+        grant_realm_role(admin, sa_id, role_name)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not grant role '%s' to service account of client "
+                       "%s: %s", role_name, client_uuid, exc)
+
+
 def ensure_keycloak_client(admin: KeycloakAdmin) -> str:
     """
     Guarantee the app's Keycloak client exists AND is configured for the
@@ -215,6 +239,7 @@ def ensure_keycloak_client(admin: KeycloakAdmin) -> str:
             "publicClient":         False,   # confidential: we use a client secret
             "standardFlowEnabled":  True,    # authorization-code (browser) flow
             "directAccessGrantsEnabled": True,  # password grant used by /token
+            "serviceAccountsEnabled": True,  # client_credentials (M2M) grant
             "redirectUris":         wanted_uris,
             "webOrigins":           [f"{parsed.scheme}://{parsed.netloc}"],
         }, skip_exists=True)
@@ -251,6 +276,11 @@ def ensure_keycloak_client(admin: KeycloakAdmin) -> str:
     # a pre-existing client silently can't serve /token.
     if not rep.get("directAccessGrantsEnabled"):
         updates["directAccessGrantsEnabled"] = True
+    # Heal serviceAccountsEnabled too — this is what the client_credentials
+    # (machine-to-machine) grant requires. Without it, /token/client fails with
+    # 'unauthorized_client: Client not allowed for client credentials grant'.
+    if not rep.get("serviceAccountsEnabled"):
+        updates["serviceAccountsEnabled"] = True
     if updates:
         admin.update_client(client_uuid, {**rep, **updates})
         logger.info("Updated Keycloak client '%s': %s",
@@ -342,6 +372,15 @@ def setup_keycloak() -> str:
     grant_realm_role(admin, admin_user_id, admin_role)
 
     client_uuid     = ensure_keycloak_client(admin)
+    # Grant the app client's SERVICE ACCOUNT a role, so machine-to-machine
+    # (client_credentials) tokens carry real permissions rather than just being
+    # 'authenticated'. Empty by default (SERVICE_ACCOUNT_ROLE unset) — set it to
+    # a realm role (e.g. tenant-admin, or a narrower m2m role) to authorize the
+    # app's own service account. The role is created if missing.
+    sa_role = os.environ.get("SERVICE_ACCOUNT_ROLE", "")
+    if sa_role:
+        ensure_realm_role(admin, sa_role)
+        grant_service_account_role(admin, client_uuid, sa_role)
     existing_secret = admin.get_client_secrets(client_uuid)
     secret_value    = existing_secret.get("value")
     if secret_value is None:
@@ -621,6 +660,18 @@ def require_keycloak_auth(credentials=Depends(http_bearer)) -> dict:
 # deleting groups/organizations, assigning roles, editing other users). Override
 # via env so it can match whatever your Keycloak realm actually calls it.
 require_role = make_require_role(require_keycloak_auth)
+
+
+def require_scope(*required_scopes: str):
+    """Dependency factory: validates the token AND requires it carry the given
+    scope(s), raising 403 otherwise. Composes with require_keycloak_auth so a
+    scoped endpoint enforces both authentication and the scope constraint. Use
+    for endpoints that should only accept a token minted for a specific purpose
+    (typically an M2M token requested with that scope)."""
+    def _dep(token_info: dict = Depends(require_keycloak_auth)) -> dict:
+        enforce_scope(token_info, *required_scopes)
+        return token_info
+    return _dep
 ADMIN_ROLE = os.environ.get("ADMIN_ROLE", "tenant-admin")
 # The platform-operator role that legitimately manages ALL tenants, bypassing
 # the per-tenant scope check. Empty by default (no superadmin) so scoping is
@@ -761,6 +812,76 @@ def login(request: Request,
         logger.error("Token request failed for user '%s': %s",
                      username, exc, exc_info=True)
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
+@app.post("/token/client")
+def client_token(request: Request,
+                 client_id: str = Form(...), client_secret: str = Form(...),
+                 scope: str | None = Form(default=None)):
+    """Machine-to-machine token issuance via the OAuth2 client_credentials grant.
+
+    An APPLICATION (not a user) authenticates with its Keycloak client_id +
+    client_secret and receives an access token to call the API as itself — no
+    human, no password. The client must have service accounts enabled in
+    Keycloak (the app's own client is provisioned that way in
+    ensure_keycloak_client; other clients you create must enable it too).
+
+    Distinct from /token (which is the user password grant) so the two flows are
+    separately rate-limited, logged, and reasoned about. Same discipline as
+    /token: rate-limit first (fail-open), never leak the secret, log the real
+    cause server-side while returning a generic message.
+    """
+    # Rate-limit before touching Keycloak, keyed by client_id so one noisy app
+    # can't exhaust the shared limiter for everyone. Fail-open on limiter error.
+    try:
+        from rate_limit import client_credentials_limiter, client_key
+        key = f"m2m:{client_id}:{client_key(request)}"
+        allowed, retry = client_credentials_limiter().check_and_consume(key)
+        if not allowed:
+            raise HTTPException(
+                status_code=429, detail="Too many token requests; slow down.",
+                headers={"Retry-After": str(int(retry) + 1)})
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("rate limiter error on /token/client (allowing): %s", exc)
+
+    if keycloak_oidc is None:
+        raise HTTPException(status_code=503,
+                            detail="Authentication service unavailable")
+
+    # Perform the client_credentials grant with the CALLER's credentials, not the
+    # broker's own. A per-request client object keeps the caller's secret out of
+    # the shared broker client and off any shared state.
+    try:
+        caller = KeycloakOpenID(
+            server_url=KEYCLOAK_URL, client_id=client_id,
+            realm_name=KEYCLOAK_REALM, client_secret_key=client_secret)
+        # A caller may request specific scopes; Keycloak grants those it's
+        # allowed (client scopes). Passing scope constrains the token to a
+        # purpose, which endpoints can then enforce via authz.enforce_scope.
+        grant_kwargs = {"grant_type": "client_credentials"}
+        if scope:
+            grant_kwargs["scope"] = scope
+        token_response = caller.token(**grant_kwargs)
+        record_token_result("success")
+        return {"access_token": token_response["access_token"],
+                "token_type": "bearer",
+                "expires_in": token_response.get("expires_in")}
+    except KeycloakAuthenticationError:
+        # Wrong client_id/secret, or the client lacks service accounts.
+        record_token_result("invalid_credentials")
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid client credentials, or the client is not "
+                   "authorized for the client_credentials grant.")
+    except Exception as exc:
+        record_token_result("error")
+        # Never log the secret; log the client_id and cause for diagnosis.
+        logger.error("Client-credentials token request failed for client "
+                     "'%s': %s", client_id, exc, exc_info=True)
+        raise HTTPException(status_code=503,
+                            detail="Authentication service unavailable")
+
 
 @app.get("/protected")
 def protected_route(token_info: dict = Depends(require_keycloak_auth)):

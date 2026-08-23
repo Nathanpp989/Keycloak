@@ -1125,6 +1125,23 @@ def test_ensure_client_creates_when_missing(monkeypatch):
     assert "http://localhost:8000/callback" in payload["redirectUris"]
     assert "http://localhost:8000/*" in payload["redirectUris"]
     assert payload["standardFlowEnabled"] is True   # browser login possible
+    assert payload["serviceAccountsEnabled"] is True  # M2M client_credentials
+
+
+def test_ensure_client_heals_service_accounts(monkeypatch):
+    # An existing client missing serviceAccountsEnabled must get it healed, so
+    # the /token/client (M2M) grant works.
+    monkeypatch.setattr(main, "APP_REDIRECT_URI", "http://localhost:8000/callback")
+    admin = _kc_admin_autospec()
+    admin.get_client_id.return_value = "uuid-1"
+    admin.get_client.return_value = {
+        "clientId": "Hello-World-app", "standardFlowEnabled": True,
+        "directAccessGrantsEnabled": True,
+        "redirectUris": ["http://localhost:8000/callback",
+                         "http://localhost:8000/*"]}  # only SA missing
+    main.ensure_keycloak_client(admin)
+    sent = admin.update_client.call_args[0][1]
+    assert sent["serviceAccountsEnabled"] is True
 
 def test_ensure_client_adds_missing_redirect_uri(monkeypatch):
     monkeypatch.setattr(main, "APP_REDIRECT_URI", "http://localhost:8000/callback")
@@ -1157,6 +1174,7 @@ def test_ensure_client_noop_when_already_correct(monkeypatch):
     admin.get_client.return_value = {
         "clientId": "Hello-World-app", "standardFlowEnabled": True,
         "directAccessGrantsEnabled": True,
+        "serviceAccountsEnabled": True,
         "redirectUris": ["http://localhost:8000/callback",
                          "http://localhost:8000/*"]}
     main.ensure_keycloak_client(admin)
@@ -1365,6 +1383,7 @@ def test_ensure_client_no_update_when_already_correct(monkeypatch):
                          "http://localhost:8000/*"],
         "standardFlowEnabled": True,
         "directAccessGrantsEnabled": True,
+        "serviceAccountsEnabled": True,
     }
     main.ensure_keycloak_client(admin)
     admin.update_client.assert_not_called()
@@ -1616,3 +1635,137 @@ def test_register_endpoint_422_on_bad_email(client, monkeypatch):
     r = client.post("/register", data={"email": "notanemail", "password": "p"})
     assert r.status_code == 422
     mgr.register_user.assert_not_called()  # never reached the upstream
+
+
+# ── /token/client — machine-to-machine (client_credentials) ─────────────────
+def test_client_token_success(client, monkeypatch):
+    # keycloak_oidc must be non-None (availability guard); the endpoint builds
+    # its OWN KeycloakOpenID with the caller's creds, so patch that constructor.
+    monkeypatch.setattr(main, "keycloak_oidc", MagicMock())
+    caller = MagicMock()
+    caller.token.return_value = {"access_token": "m2m-abc", "expires_in": 300}
+    monkeypatch.setattr(main, "KeycloakOpenID", lambda **kw: caller)
+    r = client.post("/token/client",
+                    data={"client_id": "svc-app", "client_secret": "sek"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["access_token"] == "m2m-abc"
+    assert body["token_type"] == "bearer"
+    assert body["expires_in"] == 300
+    # must have used the client_credentials grant
+    assert caller.token.call_args.kwargs.get("grant_type") == "client_credentials"
+
+
+def test_client_token_invalid_credentials_is_401(client, monkeypatch):
+    from keycloak.exceptions import KeycloakAuthenticationError
+    monkeypatch.setattr(main, "keycloak_oidc", MagicMock())
+    caller = MagicMock()
+    caller.token.side_effect = KeycloakAuthenticationError("bad client")
+    monkeypatch.setattr(main, "KeycloakOpenID", lambda **kw: caller)
+    r = client.post("/token/client",
+                    data={"client_id": "svc-app", "client_secret": "wrong"})
+    assert r.status_code == 401
+
+
+def test_client_token_service_unavailable_when_oidc_none(client, monkeypatch):
+    monkeypatch.setattr(main, "keycloak_oidc", None)
+    r = client.post("/token/client",
+                    data={"client_id": "svc-app", "client_secret": "sek"})
+    assert r.status_code == 503
+
+
+def test_client_token_upstream_error_is_503(client, monkeypatch):
+    monkeypatch.setattr(main, "keycloak_oidc", MagicMock())
+    caller = MagicMock()
+    caller.token.side_effect = RuntimeError("keycloak down")
+    monkeypatch.setattr(main, "KeycloakOpenID", lambda **kw: caller)
+    r = client.post("/token/client",
+                    data={"client_id": "svc-app", "client_secret": "sek"})
+    assert r.status_code == 503
+
+
+def test_client_token_requires_both_fields(client, monkeypatch):
+    monkeypatch.setattr(main, "keycloak_oidc", MagicMock())
+    # missing client_secret -> FastAPI 422 (Form(...) required)
+    r = client.post("/token/client", data={"client_id": "svc-app"})
+    assert r.status_code == 422
+
+
+# ── M2M rate limiter (step 1) ───────────────────────────────────────────────
+def test_client_credentials_limiter_is_distinct_and_tunable(monkeypatch):
+    import rate_limit
+    rate_limit.reset_all()
+    monkeypatch.setenv("RATE_LIMIT_M2M_MAX", "3")
+    monkeypatch.setenv("RATE_LIMIT_M2M_WINDOW", "60")
+    rate_limit.reset_all()
+    lim = rate_limit.client_credentials_limiter()
+    # distinct object from the login limiter
+    assert lim is not rate_limit.login_limiter()
+    # honors its own env: 3 allowed, 4th denied
+    ok = [lim.check_and_consume("k")[0] for _ in range(4)]
+    assert ok == [True, True, True, False]
+    rate_limit.reset_all()
+
+
+# ── /token/client scope passthrough (step 3) ────────────────────────────────
+def test_client_token_passes_scope_to_grant(client, monkeypatch):
+    monkeypatch.setattr(main, "keycloak_oidc", MagicMock())
+    caller = MagicMock()
+    caller.token.return_value = {"access_token": "t", "expires_in": 300}
+    monkeypatch.setattr(main, "KeycloakOpenID", lambda **kw: caller)
+    r = client.post("/token/client", data={
+        "client_id": "svc", "client_secret": "sek", "scope": "openid orders:read"})
+    assert r.status_code == 200
+    # the requested scope must be forwarded to Keycloak
+    assert caller.token.call_args.kwargs.get("scope") == "openid orders:read"
+
+def test_client_token_no_scope_omits_it(client, monkeypatch):
+    monkeypatch.setattr(main, "keycloak_oidc", MagicMock())
+    caller = MagicMock()
+    caller.token.return_value = {"access_token": "t"}
+    monkeypatch.setattr(main, "KeycloakOpenID", lambda **kw: caller)
+    r = client.post("/token/client", data={"client_id": "svc", "client_secret": "sek"})
+    assert r.status_code == 200
+    assert "scope" not in caller.token.call_args.kwargs  # not sent when absent
+
+
+# ── require_scope dependency (step 3) ───────────────────────────────────────
+def test_require_scope_allows_and_denies(monkeypatch):
+    # Mount a temp endpoint guarded by require_scope and exercise both paths.
+    from fastapi.testclient import TestClient as _TC
+    from fastapi import Depends as _Depends
+    dep = main.require_scope("orders:read")
+    main.app.dependency_overrides[main.require_keycloak_auth] = \
+        lambda: {"active": True, "scope": "openid orders:read"}
+    try:
+        @main.app.get("/_scoped_test")
+        def _scoped(ti: dict = _Depends(dep)):
+            return {"ok": True}
+        c = _TC(main.app)
+        assert c.get("/_scoped_test").status_code == 200
+        # now a token WITHOUT the scope
+        main.app.dependency_overrides[main.require_keycloak_auth] = \
+            lambda: {"active": True, "scope": "openid"}
+        assert c.get("/_scoped_test").status_code == 403
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+# ── service-account role granting (step 2) ──────────────────────────────────
+def test_grant_service_account_role(monkeypatch):
+    admin = _kc_admin_autospec()
+    admin.get_client_service_account_user.return_value = {"id": "sa-uuid"}
+    admin.get_realm_role.return_value = {"name": "m2m-service", "id": "r1"}
+    main.grant_service_account_role(admin, "client-uuid", "m2m-service")
+    admin.assign_realm_roles.assert_called_once()
+
+def test_grant_service_account_role_no_sa_user(monkeypatch):
+    admin = _kc_admin_autospec()
+    admin.get_client_service_account_user.return_value = {}  # no id
+    main.grant_service_account_role(admin, "client-uuid", "m2m-service")
+    admin.assign_realm_roles.assert_not_called()  # nothing to grant to
+
+def test_grant_service_account_role_survives_error(monkeypatch):
+    admin = _kc_admin_autospec()
+    admin.get_client_service_account_user.side_effect = RuntimeError("boom")
+    main.grant_service_account_role(admin, "client-uuid", "m2m-service")  # no raise

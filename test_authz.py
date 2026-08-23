@@ -287,3 +287,36 @@ def test_filter_orgs_handles_none_list():
     assert authz.filter_orgs_to_accessible(ti, None) == []
     assert authz.filter_orgs_to_accessible(
         ti_super, None, superadmin_roles=["super"]) == []
+
+
+# ── Scope extraction + enforcement (M2M scope restriction) ──────────────────
+def test_extract_scopes_splits_space_delimited():
+    assert authz.extract_scopes({"scope": "openid orders:read profile"}) == {
+        "openid", "orders:read", "profile"}
+
+def test_extract_scopes_missing_or_malformed():
+    assert authz.extract_scopes({}) == set()
+    assert authz.extract_scopes({"scope": None}) == set()
+
+def test_extract_audiences_string_and_list():
+    assert authz.extract_audiences({"aud": "api"}) == {"api"}
+    assert authz.extract_audiences({"aud": ["api", "admin"]}) == {"api", "admin"}
+    assert authz.extract_audiences({}) == set()
+
+def test_token_has_scope_requires_all():
+    ti = {"scope": "openid orders:read"}
+    assert authz.token_has_scope(ti, ["orders:read"])
+    assert not authz.token_has_scope(ti, ["orders:read", "orders:write"])
+
+def test_enforce_scope_denies_missing():
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as ei:
+        authz.enforce_scope({"scope": "openid"}, "orders:write")
+    assert ei.value.status_code == 403
+    assert "orders:write" in ei.value.detail
+
+def test_enforce_scope_allows_present():
+    authz.enforce_scope({"scope": "openid orders:read"}, "orders:read")  # no raise
+
+def test_enforce_scope_no_requirement_is_noop():
+    authz.enforce_scope({"scope": ""})  # no required scopes -> no raise

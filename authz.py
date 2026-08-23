@@ -231,3 +231,55 @@ def enforce_shared_org(token_info: dict, target_org_refs: Iterable[str],
         raise HTTPException(
             status_code=403,
             detail="Forbidden: target user is not in your organization(s)")
+
+
+def extract_scopes(token_info: dict) -> set[str]:
+    """Collect the OAuth scopes from an introspection response.
+
+    Keycloak returns granted scopes in the space-delimited 'scope' claim.
+    Missing/malformed -> empty set (the token has no scopes), never an error.
+    """
+    raw = token_info.get("scope")
+    if not isinstance(raw, str):
+        return set()
+    return {s for s in raw.split() if s}
+
+
+def extract_audiences(token_info: dict) -> set[str]:
+    """Collect the audiences ('aud' claim) from an introspection response.
+
+    'aud' may be a single string or a list of strings. Normalizes both to a set.
+    """
+    aud = token_info.get("aud")
+    if isinstance(aud, str):
+        return {aud}
+    if isinstance(aud, list):
+        return {str(a) for a in aud}
+    return set()
+
+
+def token_has_scope(token_info: dict, required: Iterable[str]) -> bool:
+    """True if the token carries ALL of the required scopes."""
+    have = extract_scopes(token_info)
+    return all(s in have for s in required)
+
+
+def enforce_scope(token_info: dict, *required_scopes: str) -> None:
+    """Raise 403 unless the token carries every one of the required scopes.
+
+    Lets an endpoint demand that a token was minted for a specific purpose —
+    e.g. an app whose token has scope 'orders:read' can read orders but a token
+    without it is refused, even if it's otherwise valid and authenticated. This
+    is the token-constraint counterpart to require_role (which checks identity's
+    roles); scopes constrain what a given TOKEN may do, independent of the
+    holder's full permissions.
+    """
+    scopes = [s for s in required_scopes if s]
+    if not scopes:
+        return
+    if not token_has_scope(token_info, scopes):
+        have = extract_scopes(token_info)
+        missing = [s for s in scopes if s not in have]
+        raise HTTPException(
+            status_code=403,
+            detail=f"Token is missing required scope(s): {', '.join(missing)}")
