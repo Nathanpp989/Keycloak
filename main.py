@@ -548,6 +548,41 @@ app.middleware("http")(metrics_middleware)
 http_bearer     = HTTPBearer()
 
 # ── Auth dependency ───────────────────────────────────────────────────────────
+def _sanitize_header_value(value: str, max_len: int = 256) -> str:
+    """Strip control characters and cap length for a value going into an HTTP
+    response header. Control chars (CR, LF, NUL, etc.) are removed entirely.
+    Used for identity values echoed to the upstream via ForwardAuth."""
+    cleaned = "".join(ch for ch in value if ch >= " " and ch != "\x7f")
+    return cleaned[:max_len]
+
+
+# Edge input validation for account creation. These are intentionally LENIENT
+# bounds — the real validation is Keycloak/Auth0's; this just rejects obviously
+# abusive input (oversized, control chars, malformed email) at the door so we
+# don't forward garbage upstream or let one request carry a megabyte of data.
+_EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+_MAX_EMAIL_LEN = 254        # RFC 5321 limit
+_MAX_USERNAME_LEN = 128
+_MAX_PASSWORD_LEN = 1024    # generous; blocks multi-MB DoS payloads
+
+
+def _validate_registration(email: str, password: str,
+                           username: str | None) -> str | None:
+    """Return an error string if the registration input is obviously invalid,
+    else None. Cheap edge checks only — not a replacement for the IdP's own
+    validation, but it fails fast and keeps abusive payloads out."""
+    if not email or len(email) > _MAX_EMAIL_LEN or not _EMAIL_RE.fullmatch(email):
+        return "invalid email address"
+    if not password or len(password) > _MAX_PASSWORD_LEN:
+        return "password missing or too long"
+    if any(ch < " " for ch in password):
+        return "password contains control characters"
+    if username is not None:
+        if len(username) > _MAX_USERNAME_LEN or any(ch < " " for ch in username):
+            return "invalid username"
+    return None
+
+
 def _introspect_token(token: str) -> dict:
     """
     Validate a bearer token via Keycloak introspection and return the token-info
@@ -787,6 +822,12 @@ def traefik_forward_auth(request: Request):
     # treat these as trusted ONLY when they arrive via Traefik.
     username = str(token_info.get("preferred_username", ""))
     subject = str(token_info.get("sub", ""))
+    # Defense-in-depth: strip control characters (CR/LF/NUL etc.) before these
+    # validated-but-not-sanitized values go into response headers. The ASGI layer
+    # already blocks CRLF header-splitting, so this isn't the primary defense —
+    # it's belt-and-suspenders that also keeps logs and downstream consumers clean.
+    username = _sanitize_header_value(username)
+    subject = _sanitize_header_value(subject)
     fwd_for = request.headers.get("x-forwarded-for", "")
     fwd_method = request.headers.get("x-forwarded-method", "")
     fwd_uri = request.headers.get("x-forwarded-uri", "")
@@ -822,6 +863,12 @@ def register(
     password: str = Form(...),
     username: str | None = Form(default=None),
 ):
+    # Edge input validation: reject obviously-invalid input before doing any work
+    # (rate-limit lookup, upstream calls). Defense-in-depth — the IdP validates
+    # too, but failing fast here keeps abusive payloads from propagating.
+    _bad = _validate_registration(email, password, username)
+    if _bad is not None:
+        raise HTTPException(status_code=422, detail=_bad)
     # Rate-limit account creation to curb automated signup spam. Fail-open.
     try:
         from rate_limit import register_limiter, client_key

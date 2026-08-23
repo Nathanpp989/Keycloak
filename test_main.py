@@ -1579,3 +1579,40 @@ def test_hsts_present_when_enabled(client, monkeypatch):
     monkeypatch.setenv("SECURITY_HSTS", "true")
     r = client.get("/health/live")
     assert "max-age=31536000" in r.headers.get("Strict-Transport-Security", "")
+
+
+# ── Defense-in-depth: header sanitization + edge input validation ───────────
+def test_sanitize_header_value_strips_control_chars():
+    assert main._sanitize_header_value("evil\r\nX-Injected: 1") == "evilX-Injected: 1"
+    assert main._sanitize_header_value("alice") == "alice"
+    assert main._sanitize_header_value("a\x00b\x7fc") == "abc"
+    assert len(main._sanitize_header_value("x" * 500)) == 256
+
+
+def test_validate_registration_accepts_good_input():
+    assert main._validate_registration("a@b.com", "goodpass123", "alice") is None
+    assert main._validate_registration("a@b.com", "goodpass123", None) is None
+
+
+def test_validate_registration_rejects_bad_email():
+    assert main._validate_registration("notanemail", "p", None) is not None
+    assert main._validate_registration("x" * 300 + "@e.com", "p", None) is not None
+
+
+def test_validate_registration_rejects_oversized_password():
+    assert main._validate_registration("a@b.com", "x" * 2000, None) is not None
+
+
+def test_validate_registration_rejects_control_chars():
+    assert main._validate_registration("a@b.com", "pass\x00word", None) is not None
+    assert main._validate_registration("a@b.com", "goodpass", "ev\r\nil") is not None
+
+
+def test_register_endpoint_422_on_bad_email(client, monkeypatch):
+    # The endpoint should reject bad input with 422 BEFORE touching the manager.
+    from unittest.mock import MagicMock
+    mgr = MagicMock()
+    monkeypatch.setattr(main, "user_manager", mgr)
+    r = client.post("/register", data={"email": "notanemail", "password": "p"})
+    assert r.status_code == 422
+    mgr.register_user.assert_not_called()  # never reached the upstream
