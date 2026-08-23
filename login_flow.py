@@ -421,6 +421,19 @@ def main() -> None:
     print("\nIf step 2 shows the Keycloak login form instead of Auth0, the")
     print("kc_idp_hint/alias is wrong or the IdP isn't registered.")
 
+    if os.environ.get("LOGIN_FLOW_CATCH") != "1":
+        print("\n" + "-" * 70)
+        print("NOTE: you are in PRINT-ONLY mode. Nothing is listening on")
+        print(f"     {redirect_uri} , so completing the login in the browser")
+        print("     will end in ERR_CONNECTION_REFUSED — that's expected here.")
+        print("     The auth itself still worked (you'll see a 'code=' in the URL).")
+        print("\n     To actually CATCH the redirect and exchange the code for")
+        print("     tokens, re-run with the catcher enabled:")
+        print("         LOGIN_FLOW_CATCH=1 python login_flow.py")
+        print("     (add KEYCLOAK_CLIENT_SECRET=... or admin creds so the token")
+        print("      exchange can authenticate).")
+        print("-" * 70)
+
     # Optional automated verification: if APP_REDIRECT_URI points at localhost
     # and LOGIN_FLOW_CATCH=1, catch the redirect and verify the token exchange.
     if os.environ.get("LOGIN_FLOW_CATCH") == "1":
