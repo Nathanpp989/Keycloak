@@ -620,6 +620,39 @@ def main() -> int:
     print(f"    Secret store      : KV v2 at '{KV_MOUNT}'")
     return 0
 
+# Make sure this script is not run accidentally (it configures OpenBao). Use `python -m openbao_connect` to run the scaffolding.
+def run_main() -> None:
+    try:
+        exit_code = main()
+    except Exception as exc:
+        print(f"Error: {exc}")
+        exit_code = 1
+    raise SystemExit(exit_code)
+
+# If this file is executed directly, run the main function. Otherwise, it can be imported as a module without executing the main function. Also make sure it runs the correct endpoint when executed directly.
+def main() -> int:
+    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+    if not OPENBAO_TOKEN:
+        print("Set OPENBAO_TOKEN (dev root token from `bao server -dev`).")
+        return 1
+    try:
+        summary = scaffold_all(
+            keycloak_url=os.environ.get("KEYCLOAK_URL", "http://localhost:8080"),
+            keycloak_realm=os.environ.get("KEYCLOAK_REALM", "Premkey"),
+            keycloak_oidc_client_id=os.environ.get("OPENBAO_KC_CLIENT_ID", "openbao"),
+            keycloak_oidc_client_secret=os.environ.get("OPENBAO_KC_CLIENT_SECRET", ""),
+            auth0_domain=os.environ.get("AUTH0_DOMAIN", ""),
+            auth0_audience=os.environ.get("AUTH0_AUDIENCE"),
+        )
+    except OpenBaoError as exc:
+        print(f"✗ {exc}")
+        return 1
+    print("✓ OpenBao configured:")
+    print(f"    Keycloak->OpenBao : mount '{OIDC_MOUNT_KEYCLOAK}', "
+          f"role '{summary['keycloak_oidc'].get('user_claim')}' user-claim")
+    print(f"    Auth0->OpenBao    : mount '{JWT_MOUNT_AUTH0}'")
+    print(f"    Secret store      : KV v2 at '{KV_MOUNT}'")
+    return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())

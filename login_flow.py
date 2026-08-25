@@ -125,6 +125,104 @@ def exchange_code_for_tokens(
         raise RuntimeError(f"Token response had no access_token: {body}")
     return body
 
+def verify_auth0_token(token: str, jwks_url: str, audience: str) -> dict:
+    """
+    Verify an Auth0-issued JWT (access token) using the JWKS URL. Returns the
+    decoded claims dict on success, or raises RuntimeError on failure.
+
+    This is a real signature verification (not just decoding) and checks:
+      - the signature against the JWKS public keys
+      - the 'aud' claim matches the expected audience
+      - the 'exp' claim is in the future
+    """
+    from jose import jwt, jwk
+    from jose.exceptions import JWTError, ExpiredSignatureError, JWTClaimsError
+
+    try:
+        # Fetch JWKS and verify the token.
+        jwks = requests.get(jwks_url).json()
+        claims = jwt.decode(token, jwks, algorithms=["RS256"], audience=audience)
+        return claims
+    except ExpiredSignatureError:
+        raise RuntimeError("Token has expired")
+    except JWTClaimsError as e:
+        raise RuntimeError(f"Invalid claims: {e}")
+    except JWTError as e:
+        raise RuntimeError(f"Token verification failed: {e}")
+
+def verify_keycloak_token(token: str, keycloak_url: str, realm: str, audience: str) -> dict:
+    """
+    Verify a Keycloak-issued JWT (access token) using the Keycloak JWKS URL.
+    Returns the decoded claims dict on success, or raises RuntimeError on failure.
+
+    This is a real signature verification (not just decoding) and checks:
+      - the signature against the JWKS public keys
+      - the 'aud' claim matches the expected audience
+      - the 'exp' claim is in the future
+    """
+    jwks_url = f"{keycloak_url.rstrip('/')}/realms/{realm}/protocol/openid-connect/certs"
+    return verify_auth0_token(token, jwks_url, audience)
+
+def verify_openbao_token(token: str, bao_addr: str, audience: str) -> dict:
+    """
+    Verify an OpenBao-issued JWT (access token) using the OpenBao JWKS URL.
+    Returns the decoded claims dict on success, or raises RuntimeError on failure.
+
+    This is a real signature verification (not just decoding) and checks:
+      - the signature against the JWKS public keys
+      - the 'aud' claim matches the expected audience
+      - the 'exp' claim is in the future
+    """
+    jwks_url = f"{bao_addr.rstrip('/')}/v1/jwks"
+    return verify_auth0_token(token, jwks_url, audience)
+
+def verify_traefik_token(token: str, traefik_addr: str, audience: str) -> dict:
+    """
+    Verify a Traefik-issued JWT (access token) using the Traefik JWKS URL.
+    Returns the decoded claims dict on success, or raises RuntimeError on failure.
+
+    This is a real signature verification (not just decoding) and checks:
+      - the signature against the JWKS public keys
+      - the 'aud' claim matches the expected audience
+      - the 'exp' claim is in the future
+    """
+    jwks_url = f"{traefik_addr.rstrip('/')}/v1/jwks"
+    return verify_auth0_token(token, jwks_url, audience)
+
+def verify_token(token: str, issuer: str, audience: str) -> dict:
+    """
+    Verify a JWT (access token) using the issuer's JWKS URL. Returns the decoded
+    claims dict on success, or raises RuntimeError on failure.
+
+    This is a real signature verification (not just decoding) and checks:
+      - the signature against the JWKS public keys
+      - the 'aud' claim matches the expected audience
+      - the 'exp' claim is in the future
+    """
+    jwks_url = f"{issuer.rstrip('/')}/.well-known/jwks.json"
+    return verify_auth0_token(token, jwks_url, audience)
+
+def get_jwks_url(issuer: str) -> str:
+    """
+    Return the JWKS URL for a given issuer. This is usually the issuer URL with
+    '/.well-known/jwks.json' appended, but some IdPs may have different paths.
+    """
+    return f"{issuer.rstrip('/')}/.well-known/jwks.json"
+
+def get_openid_configuration(issuer: str) -> dict:
+    """
+    Fetch the OpenID Connect discovery document for a given issuer. This document
+    contains metadata about the issuer, including the JWKS URL, authorization
+    endpoint, token endpoint, and supported scopes.
+    """
+    config_url = f"{issuer.rstrip('/')}/.well-known/openid-configuration"
+    try:
+        resp = requests.get(config_url)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Could not fetch OpenID configuration from {config_url}: {exc}") from exc
+
 def extract_audiences(token_info: dict) -> list[str]:
     """
     Return the list of audiences from a decoded token payload. Keycloak's

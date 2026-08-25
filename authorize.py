@@ -271,6 +271,19 @@ def verify_auth0_token(token: str) -> dict:
                             detail=f"Invalid Auth0 token: {exc}",
                             headers={"WWW-Authenticate": "Bearer"})
 
+# Make sure it authorizes the user and also that we can get an Auth0 M2M token (used for downstream calls).
+def get_current_user_with_auth0(token: str = Depends(oauth2_scheme)) -> dict:
+    """Verify the Auth0 token and ensure we can obtain an Auth0 M2M token."""
+    payload = verify_auth0_token(token)
+    try:
+        get_auth0_token()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Unexpected error obtaining Auth0 token: %s", exc)
+        raise HTTPException(status_code=503, detail="Could not reach Auth0")
+    return payload
+
 # ── Router ────────────────────────────────────────────────────────────────────
 router = APIRouter()
 

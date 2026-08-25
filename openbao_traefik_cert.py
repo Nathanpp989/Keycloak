@@ -179,6 +179,16 @@ def renew_if_needed(role: str, hostnames: list, out_dir: str, *,
     return {"renewed": True, "serial": cert_data.get("serial_number", "?"),
             "cert_path": cert_p}
 
+def ensure_pki(role: str, ca_common_name: str, hostnames: list) -> None:
+    """Idempotently ensure the PKI engine, root CA, and issuing role exist.
+
+    configure_pki_root_ca is now genuinely idempotent (it checks for an existing
+    CA and reuses it), so a re-run never mints a new root and orphans previously
+    issued certs.
+    """
+    ob.enable_pki_engine()
+    ob.configure_pki_root_ca(ca_common_name)
+    ob.create_pki_role(role, allowed_domains=hostnames)
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Issue an OpenBao cert for Traefik.")

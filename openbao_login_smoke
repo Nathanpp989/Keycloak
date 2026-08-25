@@ -111,6 +111,12 @@ def _start_issuer_stub(jwks: dict) -> tuple[http.server.HTTPServer, str]:
     time.sleep(0.4)
     return srv, issuer
 
+def _make_jwt(priv: bytes, iss: str, sub: str, aud: str, exp_seconds: int) -> str:
+    now = int(time.time())
+    return pyjwt.encode(
+        {"iss": iss + "/", "sub": sub, "aud": aud, "iat": now,
+        "exp": now + exp_seconds},
+        priv, algorithm="RS256", headers={"kid": "smoke-key-1"})
 
 def run() -> int:
     addr = os.environ.get("OPENBAO_ADDR", "http://127.0.0.1:8200").rstrip("/")

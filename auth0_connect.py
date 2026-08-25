@@ -236,13 +236,18 @@ class Auth0Connect:
         logger.info("Rotated client secret for %s", client_id)
         return new_secret
 
-
 def test_token_access(auth0: Auth0Connect) -> None:
     """Verify the M2M token works against the Auth0 Management API."""
     result = auth0._api("GET", "clients")
     count = len(result) if isinstance(result, list) else 1
     logger.info("Token validated: %d client(s) visible", count)
 
+def test_connection_exists(auth0: Auth0Connect, name: str) -> None:
+    """Verify a named social connection exists in Auth0."""
+    conn = auth0.get_connection_by_name(name)
+    if not conn:
+        raise RuntimeError(f"Auth0 connection '{name}' not found")
+    logger.info("Connection '%s' exists (strategy=%s)", name, conn.get("strategy"))
 
 def create_server_certificate(
     hostname: str,
@@ -377,6 +382,16 @@ def get_keycloak_admin_token(
 
     raise RuntimeError(f"Keycloak token endpoint not found at {base}")
 
+def ensure_pki(role: str, ca_common_name: str, hostnames: list) -> None:
+    """Idempotently ensure the PKI engine, root CA, and issuing role exist.
+
+    configure_pki_root_ca is now genuinely idempotent (it checks for an existing
+    CA and reuses it), so a re-run never mints a new root and orphans previously
+    issued certs.
+    """
+    ob.enable_pki_engine()
+    ob.configure_pki_root_ca(ca_common_name)
+    ob.create_pki_role(role, allowed_domains=hostnames)
 
 def _ensure_idp_mappers(base: str, path_prefix: str, realm_name: str,
                         admin_token: str, alias: str = "auth0",

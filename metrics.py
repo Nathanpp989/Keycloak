@@ -111,6 +111,14 @@ async def metrics_middleware(request, call_next):
         REQUESTS.labels(method=method, path=path, status=str(status)).inc()
         LATENCY.labels(method=method, path=path).observe(elapsed)
 
+# Metrics endpoint handler — returns the Prometheus text format for scraping.
+
+def metrics_endpoint():
+    """Return a FastAPI endpoint handler for /metrics."""
+    from fastapi.responses import Response
+    body, content_type = render_metrics()
+    return Response(content=body, media_type=content_type)
+
 
 def render_metrics() -> tuple[bytes, str]:
     """Return (body, content_type) for the /metrics endpoint."""
