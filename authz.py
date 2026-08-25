@@ -283,3 +283,8 @@ def enforce_scope(token_info: dict, *required_scopes: str) -> None:
         raise HTTPException(
             status_code=403,
             detail=f"Token is missing required scope(s): {', '.join(missing)}")
+
+def token_has_audience(token_info: dict, required: Iterable[str]) -> bool:
+    """True if the token carries at least one of the required audiences."""
+    have = extract_audiences(token_info)
+    return any(a in have for a in required)

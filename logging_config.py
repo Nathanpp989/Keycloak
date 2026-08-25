@@ -145,3 +145,7 @@ def _install_excepthook() -> None:
             "Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
 
     sys.excepthook = handle
+
+def get_logger(name: str | None = None) -> logging.Logger:
+    """Return a logger with the given name, or the root logger if None."""
+    return logging.getLogger(name)

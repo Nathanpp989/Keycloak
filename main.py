@@ -24,6 +24,13 @@ from auth0_connect import Auth0Connect, get_keycloak_admin_token
 from auth0_talk import KeycloakAdminAPI, Auth0UsersAPI, Auth0AuthzExtensionAPI, Auth0OrganizationsAPI
 from auth0_type import UserManager
 
+#make sure that the logging is configured before any other imports that might log something
+from logging_config import configure_logging  # noqa: E402
+from metrics import (  # noqa: E402
+    metrics_middleware, render_metrics,
+    record_token_result, record_forward_auth,
+)
+
 # Configure logging before anything else so all logger.* calls produce output.
 # Structured JSON by default (LOG_FORMAT=text for human-readable local dev).
 # This changes only the OUTPUT format — every logger.*() call site is unchanged.

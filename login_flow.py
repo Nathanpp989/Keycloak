@@ -125,6 +125,17 @@ def exchange_code_for_tokens(
         raise RuntimeError(f"Token response had no access_token: {body}")
     return body
 
+def extract_audiences(token_info: dict) -> list[str]:
+    """
+    Return the list of audiences from a decoded token payload. Keycloak's
+    "aud" claim can be a string or a list, so this normalizes it to a list.
+    """
+    aud = token_info.get("aud")
+    if isinstance(aud, str):
+        return [aud]
+    if isinstance(aud, list):
+        return aud
+    return []
 
 def decode_token_segments(token: str) -> dict:
     """
@@ -287,6 +298,21 @@ def diagnose_redirect_uri(keycloak_url: str, realm: str, admin_token: str,
         return info
     info["verdict"] = f"realm '{realm}' not found at {base}"
     return info
+
+def print_diagnosis(info: dict) -> None:
+    """
+    Print a human-readable summary of the diagnose_redirect_uri findings.
+    """
+    print("\nDIAGNOSIS SUMMARY")
+    print("=" * 72)
+    print(f"Requested redirect_uri: {info.get('requested')}")
+    print(f"Client ID: {info.get('client_id')}")
+    if "registered" in info:
+        print(f"Registered redirect URIs: {info['registered']}")
+        print(f"Standard Flow enabled: {info.get('standard_flow_enabled')}")
+        print(f"Would Keycloak match the requested URI? {info.get('would_match')}")
+    print("\nVerdict:")
+    print(info.get("verdict", "(no verdict)"))
 
 
 def ensure_client_redirect_uri(keycloak_url: str, realm: str, admin_token: str,

@@ -320,3 +320,11 @@ def test_enforce_scope_allows_present():
 
 def test_enforce_scope_no_requirement_is_noop():
     authz.enforce_scope({"scope": ""})  # no required scopes -> no raise
+
+def test_enforce_scope_multiple_required():
+    ti = {"scope": "openid orders:read orders:write"}
+    authz.enforce_scope(ti, ["orders:read", "orders:write"])  # no raise
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException):
+        authz.enforce_scope(ti, ["orders:read", "orders:delete"])
+
