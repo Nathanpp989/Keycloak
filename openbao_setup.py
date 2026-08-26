@@ -257,36 +257,6 @@ def cmd_auth0(c: Cfg) -> int:
               "to confirm end to end.)")
     return 0
 
-# ── Make sure it configures with traefik ─────────
-def cmd_traefik(c: Cfg) -> int:
-    if not c.bao_token:
-        _bad("OPENBAO_TOKEN required")
-        return 1
-    if not c.a0_domain:
-        _bad("AUTH0_DOMAIN required")
-        return 1
-    ok, detail = _reachable_from_here(c.a0_discovery)
-    if not ok:
-        _bad(f"Auth0 discovery not reachable: {detail}")
-        return 1
-    print(f"Configuring Auth0->OpenBao (mount '{ob.JWT_MOUNT_AUTH0}')...")
-    try:
-        ob.configure_auth0_jwt(
-            c.a0_domain,
-            bound_audiences=[c.a0_audience] if c.a0_audience else None,
-            openbao_addr=c.bao_addr, openbao_token=c.bao_token)
-    except ob.OpenBaoError as exc:
-        _bad(str(exc))
-        return 1
-    _ok("JWT auth configured.")
-    print("\nNEXT (needs a human + browser):")
-    print(f"  1. In Auth0, API '{c.a0_audience}' must have the following "
-          "Identifier in its settings:")
-    print(f"        {c.a0_audience}")
-    print("  2. Log in:  bao login -method=jwt -path={ob.JWT_MOUNT_AUTH0} "
-          "-token=<token>")
-    print("     A browser opens; complete the Auth0 login.")
-    return 0
 
 def cmd_all(c: Cfg) -> int:
     rc = cmd_check(c)
