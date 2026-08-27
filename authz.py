@@ -288,3 +288,27 @@ def token_has_audience(token_info: dict, required: Iterable[str]) -> bool:
     """True if the token carries at least one of the required audiences."""
     have = extract_audiences(token_info)
     return any(a in have for a in required)
+
+
+def enforce_audience(token_info: dict, *required_audiences: str) -> None:
+    """Raise 403 unless the token carries at least one of the required audiences.
+
+    Audience restriction: a token's 'aud' claim names the services it was minted
+    for. An endpoint fronting service X calls enforce_audience(token_info, "X")
+    so a token intended only for service Y is refused — even when it's otherwise
+    valid, authenticated, and correctly scoped. This is the "where may this token
+    be USED" counterpart to enforce_scope's "what may this token DO": a token can
+    carry the right scope yet be meant for a different audience, and vice versa.
+
+    "At least one" match, matching normal aud semantics (a token may legitimately
+    list several audiences; the service passes if it's one of them). No required
+    audiences -> no-op, so an unconstrained endpoint stays open.
+    """
+    auds = [a for a in required_audiences if a]
+    if not auds:
+        return
+    if not token_has_audience(token_info, auds):
+        raise HTTPException(
+            status_code=403,
+            detail="Token audience not accepted here; requires one of: "
+                   + ", ".join(auds))

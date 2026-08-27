@@ -1769,3 +1769,24 @@ def test_grant_service_account_role_survives_error(monkeypatch):
     admin = _kc_admin_autospec()
     admin.get_client_service_account_user.side_effect = RuntimeError("boom")
     main.grant_service_account_role(admin, "client-uuid", "m2m-service")  # no raise
+
+
+# ── require_audience dependency (audience restriction) ──────────────────────
+def test_require_audience_allows_and_denies(monkeypatch):
+    from fastapi.testclient import TestClient as _TC
+    from fastapi import Depends as _Depends
+    dep = main.require_audience("billing-api")
+    main.app.dependency_overrides[main.require_keycloak_auth] = \
+        lambda: {"active": True, "aud": ["billing-api", "account"]}
+    try:
+        @main.app.get("/_aud_test")
+        def _aud(ti: dict = _Depends(dep)):
+            return {"ok": True}
+        c = _TC(main.app)
+        assert c.get("/_aud_test").status_code == 200
+        # token whose aud lacks the required audience
+        main.app.dependency_overrides[main.require_keycloak_auth] = \
+            lambda: {"active": True, "aud": ["account"]}
+        assert c.get("/_aud_test").status_code == 403
+    finally:
+        main.app.dependency_overrides.clear()

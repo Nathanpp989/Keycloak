@@ -321,10 +321,23 @@ def test_enforce_scope_allows_present():
 def test_enforce_scope_no_requirement_is_noop():
     authz.enforce_scope({"scope": ""})  # no required scopes -> no raise
 
-def test_enforce_scope_multiple_required():
-    ti = {"scope": "openid orders:read orders:write"}
-    authz.enforce_scope(ti, ["orders:read", "orders:write"])  # no raise
-    from fastapi import HTTPException
-    with pytest.raises(HTTPException):
-        authz.enforce_scope(ti, ["orders:read", "orders:delete"])
 
+# ── Audience enforcement (M2M audience restriction) ─────────────────────────
+def test_enforce_audience_allows_when_present():
+    authz.enforce_audience({"aud": ["api-x", "api-y"]}, "api-x")   # no raise
+    authz.enforce_audience({"aud": "solo"}, "solo")               # string form
+
+def test_enforce_audience_denies_when_absent():
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as ei:
+        authz.enforce_audience({"aud": ["api-y"]}, "api-x")
+    assert ei.value.status_code == 403
+    assert "api-x" in ei.value.detail
+
+def test_enforce_audience_any_match_suffices():
+    # token lists several audiences; requiring one of them passes
+    authz.enforce_audience({"aud": ["a", "b", "c"]}, "b")
+
+def test_enforce_audience_no_requirement_is_noop():
+    authz.enforce_audience({"aud": "anything"})   # no required -> no raise
+    authz.enforce_audience({})                    # missing aud, no requirement

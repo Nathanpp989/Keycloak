@@ -35,6 +35,7 @@ from metrics import (  # noqa: E402
 from authz import (  # noqa: E402
     make_require_role, enforce_org_access, filter_orgs_to_accessible,
     extract_org_ids, is_superadmin, enforce_shared_org, enforce_scope,
+    enforce_audience,
 )
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -670,6 +671,18 @@ def require_scope(*required_scopes: str):
     (typically an M2M token requested with that scope)."""
     def _dep(token_info: dict = Depends(require_keycloak_auth)) -> dict:
         enforce_scope(token_info, *required_scopes)
+        return token_info
+    return _dep
+
+
+def require_audience(*required_audiences: str):
+    """Dependency factory: validates the token AND requires it carry at least one
+    of the given audiences, raising 403 otherwise. Composes with
+    require_keycloak_auth. Use for an endpoint that should only accept tokens
+    minted for a specific service/audience — the "where may this token be used"
+    guard, complementing require_scope's "what may it do"."""
+    def _dep(token_info: dict = Depends(require_keycloak_auth)) -> dict:
+        enforce_audience(token_info, *required_audiences)
         return token_info
     return _dep
 ADMIN_ROLE = os.environ.get("ADMIN_ROLE", "tenant-admin")

@@ -44,6 +44,21 @@ except ImportError:
 
 import openbao_connect as ob
 
+
+def _make_jwt(priv: bytes, iss: str, sub: str, aud: str, exp_seconds: int,
+              iat_offset: int = 0) -> str:
+    """Mint an RS256 JWT exactly as Auth0 would sign one, for the smoke checks.
+
+    exp = now + exp_seconds (negative exp_seconds => already-expired token).
+    iat = now + iat_offset  (backdate the issued-at for the expired case so the
+    token is coherently 'issued in the past and since expired', not the
+    nonsensical iat=now/exp<now)."""
+    now = int(time.time())
+    return pyjwt.encode(
+        {"iss": iss + "/", "sub": sub, "aud": aud,
+         "iat": now + iat_offset, "exp": now + exp_seconds},
+        priv, algorithm="RS256", headers={"kid": "smoke-key-1"})
+
 # The issuer stub binds a free port at runtime (see _start_issuer_stub).
 
 
@@ -111,12 +126,6 @@ def _start_issuer_stub(jwks: dict) -> tuple[http.server.HTTPServer, str]:
     time.sleep(0.4)
     return srv, issuer
 
-def _make_jwt(priv: bytes, iss: str, sub: str, aud: str, exp_seconds: int) -> str:
-    now = int(time.time())
-    return pyjwt.encode(
-        {"iss": iss + "/", "sub": sub, "aud": aud, "iat": now,
-        "exp": now + exp_seconds},
-        priv, algorithm="RS256", headers={"kid": "smoke-key-1"})
 
 def run() -> int:
     addr = os.environ.get("OPENBAO_ADDR", "http://127.0.0.1:8200").rstrip("/")
@@ -179,11 +188,8 @@ def run() -> int:
                             timeout=5), "write jwt role")
 
         # Mint a real RS256 JWT, exactly as Auth0 would sign one.
-        now = int(time.time())
-        good = pyjwt.encode(
-            {"iss": _ISSUER + "/", "sub": "auth0|smoke-user",
-             "aud": "https://smoke.api", "iat": now, "exp": now + 3600},
-            priv, algorithm="RS256", headers={"kid": "smoke-key-1"})
+        good = _make_jwt(priv, _ISSUER, "auth0|smoke-user",
+                         "https://smoke.api", 3600)
 
         # ── Check 1: the real login code exchanges the JWT for an OpenBao token ──
         try:
@@ -200,10 +206,9 @@ def run() -> int:
 
         # ── Check 2: an expired JWT is REJECTED (negative case) ──
         try:
-            expired = pyjwt.encode(
-                {"iss": _ISSUER + "/", "sub": "u", "aud": "https://smoke.api",
-                 "iat": now - 7200, "exp": now - 3600},
-                priv, algorithm="RS256", headers={"kid": "smoke-key-1"})
+            # exp in the past (expired), iat backdated so it's coherent.
+            expired = _make_jwt(priv, _ISSUER, "u", "https://smoke.api",
+                                -3600, iat_offset=-7200)
             try:
                 ob.login_auth0_jwt(expired, mount=mount, openbao_addr=addr)
                 failures.append("expired JWT was accepted (should reject)")
@@ -216,10 +221,7 @@ def run() -> int:
 
         # ── Check 3: wrong audience is REJECTED (bound_audiences enforced) ──
         try:
-            wrong_aud = pyjwt.encode(
-                {"iss": _ISSUER + "/", "sub": "u", "aud": "https://WRONG",
-                 "iat": now, "exp": now + 3600},
-                priv, algorithm="RS256", headers={"kid": "smoke-key-1"})
+            wrong_aud = _make_jwt(priv, _ISSUER, "u", "https://WRONG", 3600)
             try:
                 ob.login_auth0_jwt(wrong_aud, mount=mount, openbao_addr=addr)
                 failures.append("wrong-audience JWT accepted (should reject)")
