@@ -18,6 +18,9 @@ services:
   # Hostnames resolve via /etc/hosts or a local DNS entry pointing at 127.0.0.1:
   #   127.0.0.1  app.localhost  keycloak.localhost  openbao.localhost
   # (*.localhost already resolves to 127.0.0.1 on most systems.)
+  # For the PremAlytics Command Center *.test.local scheme, add explicitly
+  # (.test.local does NOT auto-resolve):
+  #   127.0.0.1  app.test.local  keycloak.test.local  openbao.test.local  traefik.test.local
   traefik:
     image: traefik:v3.1
     command:
@@ -42,6 +45,20 @@ services:
       - "80:80"
       - "443:443"
       - "8090:8080"   # Traefik dashboard (http://localhost:8090/dashboard/)
+    labels:
+      # Route the dashboard at https://traefik.test.local/dashboard/ (in addition
+      # to the raw :8090 above). exposedbydefault=false, so Traefik's own
+      # container must opt in with traefik.enable=true to be routed.
+      - "traefik.enable=true"
+      - "traefik.http.routers.dashboard.rule=Host(`traefik.test.local`) && (PathPrefix(`/dashboard`) || PathPrefix(`/api`))"
+      - "traefik.http.routers.dashboard.entrypoints=websecure"
+      - "traefik.http.routers.dashboard.tls=true"
+      - "traefik.http.routers.dashboard.service=api@internal"
+      # SECURITY: the dashboard exposes routing/config. Protect it before using
+      # this beyond local dev — uncomment and set an htpasswd credential:
+      #   htpasswd -nb admin 'yourpassword'   -> user:hash
+      # - "traefik.http.routers.dashboard.middlewares=dash-auth"
+      # - "traefik.http.middlewares.dash-auth.basicauth.users=admin:$$apr1$$...."
     volumes:
       # Read-only access to the Docker socket so Traefik can discover services.
       # SECURITY NOTE: mounting the Docker socket grants broad host access; for
@@ -78,7 +95,7 @@ services:
       - "9000"   # management port: /health and /metrics (Prometheus scrapes this)
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.keycloak.rule=Host(`keycloak.localhost`)"
+      - "traefik.http.routers.keycloak.rule=Host(`keycloak.localhost`) || Host(`keycloak.test.local`)"
       - "traefik.http.routers.keycloak.entrypoints=websecure"
       - "traefik.http.routers.keycloak.tls=true"
       - "traefik.http.services.keycloak.loadbalancer.server.port=8080"
@@ -108,7 +125,7 @@ services:
       - "8200"
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.openbao.rule=Host(`openbao.localhost`)"
+      - "traefik.http.routers.openbao.rule=Host(`openbao.localhost`) || Host(`openbao.test.local`)"
       - "traefik.http.routers.openbao.entrypoints=websecure"
       - "traefik.http.routers.openbao.tls=true"
       - "traefik.http.services.openbao.loadbalancer.server.port=8200"
@@ -141,13 +158,13 @@ services:
       # Public router: the auth endpoints themselves (/token, /register,
       # /auth/forward, /) must NOT sit behind ForwardAuth, or you'd need a token
       # to get a token. This router carries no auth middleware.
-      - "traefik.http.routers.app-public.rule=Host(`app.localhost`) && (PathPrefix(`/token`) || PathPrefix(`/register`) || PathPrefix(`/auth/forward`) || Path(`/`) || PathPrefix(`/keys`) || PathPrefix(`/status`) || PathPrefix(`/health`) || Path(`/metrics`))"
+      - "traefik.http.routers.app-public.rule=(Host(`app.localhost`) || Host(`app.test.local`)) && (PathPrefix(`/token`) || PathPrefix(`/register`) || PathPrefix(`/auth/forward`) || Path(`/`) || PathPrefix(`/keys`) || PathPrefix(`/status`) || PathPrefix(`/health`) || Path(`/metrics`))"
       - "traefik.http.routers.app-public.entrypoints=websecure"
       - "traefik.http.routers.app-public.tls=true"
       - "traefik.http.routers.app-public.service=app"
       # Protected router: everything else on the app host requires a valid token,
       # enforced by the ForwardAuth middleware defined in the dynamic config.
-      - "traefik.http.routers.app-protected.rule=Host(`app.localhost`)"
+      - "traefik.http.routers.app-protected.rule=Host(`app.localhost`) || Host(`app.test.local`)"
       - "traefik.http.routers.app-protected.entrypoints=websecure"
       - "traefik.http.routers.app-protected.tls=true"
       - "traefik.http.routers.app-protected.service=app"
@@ -298,3 +315,4 @@ volumes:
   prometheus_data:
   grafana_data:
   alertmanager_data:
+  

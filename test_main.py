@@ -1790,3 +1790,47 @@ def test_require_audience_allows_and_denies(monkeypatch):
         assert c.get("/_aud_test").status_code == 403
     finally:
         main.app.dependency_overrides.clear()
+
+
+# ── /protected/service — M2M scope/audience guards in real use (step 2) ──────
+def test_protected_service_allows_with_scope(client, monkeypatch):
+    monkeypatch.setattr(main, "_SERVICE_AUDIENCE", "")  # audience not required
+    main.app.dependency_overrides[main.require_keycloak_auth] = \
+        lambda: {"active": True, "scope": "openid m2m:access",
+                 "preferred_username": "svc-app"}
+    try:
+        r = client.get("/protected/service")
+        assert r.status_code == 200
+        assert r.json()["service"] == "svc-app"
+        assert "m2m:access" in r.json()["scopes"]
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_protected_service_denies_without_scope(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = \
+        lambda: {"active": True, "scope": "openid"}
+    try:
+        assert client.get("/protected/service").status_code == 403
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_protected_service_enforces_audience_when_configured(client, monkeypatch):
+    # Scope present but the configured audience is missing -> 403.
+    monkeypatch.setattr(main, "_SERVICE_AUDIENCE", "premalytics-api")
+    main.app.dependency_overrides[main.require_keycloak_auth] = \
+        lambda: {"active": True, "scope": "openid m2m:access", "aud": ["account"]}
+    try:
+        assert client.get("/protected/service").status_code == 403
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_auth0_whoami_returns_verified_subject(client, monkeypatch):
+    import authorize
+    main.app.dependency_overrides[authorize.get_current_user_with_auth0] = \
+        lambda: {"sub": "auth0|xyz", "aud": "https://api"}
+    try:
+        r = client.get("/auth0/whoami")
+        assert r.status_code == 200
+        assert r.json()["sub"] == "auth0|xyz"
+    finally:
+        main.app.dependency_overrides.clear()

@@ -183,7 +183,9 @@ def renew_if_needed(role: str, hostnames: list, out_dir: str, *,
 def main() -> int:
     p = argparse.ArgumentParser(description="Issue an OpenBao cert for Traefik.")
     p.add_argument("--hostnames",
-                   default="app.localhost,keycloak.localhost,openbao.localhost",
+                   default="app.localhost,keycloak.localhost,openbao.localhost,"
+                           "app.test.local,keycloak.test.local,"
+                           "openbao.test.local,traefik.test.local",
                    help="Comma-separated hostnames for the cert (first is CN).")
     p.add_argument("--out-dir", default="./traefik/dynamic",
                    help="Where to write the cert files + Traefik TLS config.")

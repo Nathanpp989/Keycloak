@@ -35,7 +35,7 @@ from metrics import (  # noqa: E402
 from authz import (  # noqa: E402
     make_require_role, enforce_org_access, filter_orgs_to_accessible,
     extract_org_ids, is_superadmin, enforce_shared_org, enforce_scope,
-    enforce_audience,
+    enforce_audience, extract_scopes, extract_audiences,
 )
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -206,6 +206,46 @@ def grant_service_account_role(admin: KeycloakAdmin, client_uuid: str,
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not grant role '%s' to service account of client "
                        "%s: %s", role_name, client_uuid, exc)
+
+
+def ensure_audience_mapper(admin: KeycloakAdmin, client_uuid: str,
+                           audience: str) -> None:
+    """Ensure the client has a protocol mapper that puts `audience` into the
+    token's 'aud' claim. Idempotent — creates the mapper if absent, does nothing
+    if a mapper for the same audience already exists.
+
+    Why this is needed: require_audience/enforce_audience can CHECK an audience,
+    but Keycloak won't put a custom audience in a token by itself — a token
+    otherwise carries only aud='account'. This adds an oidc-audience-mapper so
+    the app's (M2M) tokens actually carry the intended audience, making the
+    audience guard usable end to end. Best-effort: a failure logs a warning
+    rather than crashing startup.
+    """
+    mapper_name = f"aud-{audience}"
+    try:
+        existing = admin.get_mappers_from_client(client_uuid) or []
+        for m in existing:
+            cfg = m.get("config", {}) if isinstance(m, dict) else {}
+            if (m.get("name") == mapper_name
+                    or cfg.get("included.custom.audience") == audience):
+                logger.info("Audience mapper for '%s' already present on client "
+                            "%s", audience, client_uuid)
+                return
+        admin.add_mapper_to_client(client_uuid, {
+            "name": mapper_name,
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-audience-mapper",
+            "config": {
+                "included.custom.audience": audience,
+                "access.token.claim": "true",
+                "id.token.claim": "false",
+            },
+        })
+        logger.info("Added audience mapper '%s' -> aud '%s' on client %s",
+                    mapper_name, audience, client_uuid)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not ensure audience mapper for '%s' on client "
+                       "%s: %s", audience, client_uuid, exc)
 
 
 def ensure_keycloak_client(admin: KeycloakAdmin) -> str:
@@ -382,6 +422,12 @@ def setup_keycloak() -> str:
     if sa_role:
         ensure_realm_role(admin, sa_role)
         grant_service_account_role(admin, client_uuid, sa_role)
+    # Mint a custom audience into the app's tokens so require_audience is usable
+    # end to end. Empty by default (SERVICE_ACCOUNT_AUDIENCE unset) — set it to
+    # the audience the token should be accepted for (e.g. the API's identifier).
+    sa_audience = os.environ.get("SERVICE_ACCOUNT_AUDIENCE", "")
+    if sa_audience:
+        ensure_audience_mapper(admin, client_uuid, sa_audience)
     existing_secret = admin.get_client_secrets(client_uuid)
     secret_value    = existing_secret.get("value")
     if secret_value is None:
@@ -899,6 +945,32 @@ def client_token(request: Request,
 @app.get("/protected")
 def protected_route(token_info: dict = Depends(require_keycloak_auth)):
     return {"message": f"Hello, {token_info.get('preferred_username', 'user')}!"}
+
+
+# The audience an M2M token must carry to reach the service endpoint below.
+# Reads the same env used to provision the mapper (see ensure_audience_mapper),
+# so "what the token carries" and "what the endpoint requires" stay in lockstep.
+_SERVICE_AUDIENCE = os.environ.get("SERVICE_ACCOUNT_AUDIENCE", "")
+
+
+@app.get("/protected/service")
+def protected_service(token_info: dict = Depends(require_scope("m2m:access"))):
+    """Machine-to-machine service resource — the guards in real use.
+
+    Access requires a token carrying the 'm2m:access' scope (require_scope), and
+    — when SERVICE_ACCOUNT_AUDIENCE is configured — the matching audience too
+    (enforce_audience). A human token, or an M2M token lacking the scope/audience,
+    gets 403. This is the concrete endpoint the scope/audience machinery exists
+    for: an app calls it with its client-credentials token to reach a
+    service-only resource.
+    """
+    if _SERVICE_AUDIENCE:
+        enforce_audience(token_info, _SERVICE_AUDIENCE)
+    return {
+        "service": token_info.get("preferred_username", "unknown"),
+        "scopes": sorted(extract_scopes(token_info)),
+        "audiences": sorted(extract_audiences(token_info)),
+    }
 
 
 @app.api_route("/auth/forward", methods=["GET", "POST", "PUT", "DELETE",

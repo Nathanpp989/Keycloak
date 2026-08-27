@@ -301,3 +301,13 @@ def read_secure_data(current_user: TokenData = Depends(get_current_user)):
         logger.error("Unexpected error obtaining Auth0 token: %s", exc)
         raise HTTPException(status_code=503, detail="Could not reach Auth0")
     return {"message": "This is secure data", "user": current_user.username}
+
+
+@router.get("/auth0/whoami")
+def auth0_whoami(payload: dict = Depends(get_current_user_with_auth0)):
+    """Auth0-token-protected endpoint: accepts an Auth0-issued RS256 token
+    (validated via JWKS) and confirms the broker can also obtain its own Auth0
+    M2M token for downstream calls. Returns the verified subject. This is the
+    real use of get_current_user_with_auth0 — the Auth0 counterpart to the
+    Keycloak-guarded routes."""
+    return {"sub": payload.get("sub"), "aud": payload.get("aud")}
