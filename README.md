@@ -673,6 +673,36 @@ intermediate signed by your existing corporate root when you have one. The
 generated cert/key/config are git-ignored — the private key must never be
 committed.
 
+#### Persistent CA (issue once, trust once)
+
+By default the compose OpenBao now runs with **file storage on a volume**
+(`openbao-data`) and an auto-init/unseal entrypoint (`openbao/entrypoint.sh`),
+so the CA survives `docker compose down/up` — a cert you trust stays trusted.
+The trade-off vs the old `-dev` mode: a durable OpenBao starts *sealed*, so the
+entrypoint auto-unseals it. To do that unattended it stores the unseal key in
+the data volume in plaintext — fine for local dev, **not** production (production
+uses a KMS auto-unseal).
+
+Because it's no longer dev mode, the fixed `root` token is gone — the real root
+token is generated on first init. Read it (and point the cert tool at the
+container's persistent OpenBao, published on loopback):
+
+    ROOT=$(docker compose exec -T openbao sh -c 'sed -n "s/.*\"root_token\":[[:space:]]*\"\([^\"]*\)\".*/\1/p" /openbao/data/bao-init.json | tr -d "\n"')
+    OPENBAO_ADDR=http://127.0.0.1:8200 OPENBAO_TOKEN="$ROOT" ./openbao_traefik_cert.py
+    docker compose restart traefik
+
+Trust the CA once and it stays valid across restarts:
+
+    curl -s http://127.0.0.1:8200/v1/pki/ca/pem -o /tmp/openbao-ca.pem
+    openssl x509 -in /tmp/openbao-ca.pem -noout -subject          # sanity check
+    sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain /tmp/openbao-ca.pem
+
+Note: the app's `OPENBAO_TOKEN` env still defaults to `root`, which no longer
+exists. OpenBao secret resolution is opt-in and off by default (`OPENBAO_MODE=auto`
+falls back to Key Vault), so this doesn't affect normal operation — but if you
+use OpenBao-backed secrets, set `OPENBAO_TOKEN` to the generated root token (or
+wire an AppRole).
+
 **Renewal.** Certs are re-issued by running the same tool with `--renew`, which
 only re-issues when the current cert is due (below 1/3 of its lifetime, or under
 7 days remaining — whichever comes first) and otherwise exits without change.

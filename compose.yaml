@@ -115,14 +115,32 @@ services:
       start_period: 30s
 
   openbao:
-    # OpenBao in dev mode: in-memory, auto-unsealed, root token fixed to 'root'.
-    # For LOCAL DEVELOPMENT ONLY — dev mode is not durable or secure.
+    # PERSISTENT OpenBao: file storage on a named volume + an auto-init/unseal
+    # entrypoint, so data (the PKI CA included) survives restarts — a cert you
+    # trust stays trusted across `docker compose up/down`.
+    # DEV/LOCAL: the entrypoint stores the unseal key in the data volume to
+    # auto-unseal (convenient, but NOT production-secure — production uses a KMS
+    # auto-unseal). See openbao/entrypoint.sh. The fixed 'root' token is gone;
+    # the real root token is generated on first init (read it with:
+    #   docker compose exec openbao cat /openbao/data/bao-init.json ).
     image: quay.io/openbao/openbao:latest
-    command: server -dev -dev-root-token-id=root -dev-listen-address=0.0.0.0:8200
-    environment:
-      BAO_DEV_ROOT_TOKEN_ID: root
+    entrypoint: ["/bin/sh", "/openbao/entrypoint.sh"]
+    # Local-dev: run as root so the container can write the named data volume
+    # without host uid/gid juggling. (Dev-only, consistent with the plaintext
+    # unseal key above.)
+    user: "0:0"
+    cap_add:
+      - IPC_LOCK          # allow mlock in case disable_mlock isn't honored
+    volumes:
+      - ./openbao/config.hcl:/openbao/config.hcl:ro
+      - ./openbao/entrypoint.sh:/openbao/entrypoint.sh:ro
+      - openbao-data:/openbao/data
     expose:
       - "8200"
+    ports:
+      # Host access on loopback so openbao_traefik_cert.py can reach the
+      # PERSISTENT OpenBao at http://127.0.0.1:8200 (the CA now lives here).
+      - "127.0.0.1:8200:8200"
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.openbao.rule=Host(`openbao.localhost`) || Host(`openbao.test.local`)"
@@ -133,15 +151,15 @@ services:
       # of it (that would double-gate and break the OIDC/JWT flows). Routed but
       # not ForwardAuth-protected.
     healthcheck:
-      # The OpenBao image is Alpine-based: it has NO bash, so a /dev/tcp probe
-      # fails even though the server is fine. It DOES ship wget. Probe the
-      # health endpoint with wget --spider (exit 0 on a 2xx response). In dev
-      # mode OpenBao is initialized+unsealed+active, so /v1/sys/health => 200.
+      # The OpenBao image is Alpine-based (no bash) but ships wget. /v1/sys/health
+      # returns 200 only once initialized+unsealed+active; the entrypoint unseals
+      # within start_period, so give it room for the first-boot init+unseal.
       test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8200/v1/sys/health || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 10
-      start_period: 10s
+      start_period: 30s
+
 
   app:
     build:
@@ -315,4 +333,4 @@ volumes:
   prometheus_data:
   grafana_data:
   alertmanager_data:
-  
+  openbao-data:      # persistent OpenBao storage (PKI CA survives restarts)
