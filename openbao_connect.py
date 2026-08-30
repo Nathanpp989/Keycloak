@@ -84,6 +84,15 @@ def _request(method: str, path: str, token: str | None = None,
              timeout: int = 10) -> requests.Response:
     """Low-level OpenBao API call. `path` is the part after /v1/."""
     base = (addr or OPENBAO_ADDR).rstrip("/")
+    # Catch the common "pasted the placeholder" mistake (OPENBAO_ADDR=... or an
+    # address with no scheme) with an actionable message, rather than letting it
+    # surface as a confusing requests MissingSchema deep in the stack.
+    if not base.startswith(("http://", "https://")):
+        raise OpenBaoError(
+            f"OpenBao address '{base}' is not a valid URL (no http:// or "
+            "https:// scheme). Set OPENBAO_ADDR to your server, e.g. "
+            "OPENBAO_ADDR=http://127.0.0.1:8200 — did you paste a '...' "
+            "placeholder literally?")
     url = f"{base}/v1/{path.lstrip('/')}"
     try:
         resp = requests.request(method, url, headers=_headers(token),
@@ -452,6 +461,7 @@ def configure_pki_root_ca(common_name: str, *, mount: str = PKI_MOUNT,
 def create_pki_role(role_name: str, *, mount: str = PKI_MOUNT,
                     allowed_domains: list | None = None,
                     allow_subdomains: bool = True,
+                    allow_bare_domains: bool = True,
                     allow_localhost: bool = True,
                     allow_ip_sans: bool = True,
                     max_ttl: str = "720h",
@@ -466,6 +476,11 @@ def create_pki_role(role_name: str, *, mount: str = PKI_MOUNT,
     tok = _require_token(token)
     body = {
         "allow_subdomains": allow_subdomains,
+        # Allow issuing for the EXACT names in allowed_domains (not just their
+        # subdomains). Without this, a SAN that equals an allowed domain — e.g.
+        # 'app.test.local' — is rejected ("not allowed by this role"), while
+        # '*.localhost' names still slip through as subdomains of localhost.
+        "allow_bare_domains": allow_bare_domains,
         "allow_localhost": allow_localhost,
         "allow_ip_sans": allow_ip_sans,
         "max_ttl": max_ttl,

@@ -554,3 +554,26 @@ def test_configure_pki_root_ca_force_regenerates():
     responses.add(responses.POST, f"{ADDR}/v1/pki/config/urls", status=204)
     out = ob.configure_pki_root_ca("Root CA", force=True, token=TOK, addr=ADDR)
     assert out.get("certificate") == "NEWPEM"
+
+
+def test_request_rejects_url_without_scheme():
+    # OPENBAO_ADDR pasted as a placeholder or missing http:// gives a clear,
+    # actionable error instead of a deep requests.MissingSchema traceback.
+    for bad in ("...", "localhost:8200", "127.0.0.1:8200"):
+        with pytest.raises(ob.OpenBaoError) as ei:
+            ob._request("POST", "sys/mounts/pki", token="x", addr=bad)
+        assert "not a valid URL" in str(ei.value)
+
+
+@responses.activate
+def test_create_pki_role_allows_bare_domains():
+    # The role must permit issuing for the EXACT allowed_domains (e.g.
+    # app.test.local), not just their subdomains — otherwise a bare SAN is
+    # rejected with "not allowed by this role".
+    responses.add(responses.POST, f"{ADDR}/v1/pki/roles/traefik", status=204)
+    ob.create_pki_role("traefik", allowed_domains=["app.test.local"],
+                       token=TOK, addr=ADDR)
+    import json
+    body = json.loads(responses.calls[0].request.body)
+    assert body.get("allow_bare_domains") is True
+    assert body.get("allow_subdomains") is True
