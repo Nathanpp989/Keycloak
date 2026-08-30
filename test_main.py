@@ -1834,3 +1834,85 @@ def test_auth0_whoami_returns_verified_subject(client, monkeypatch):
         assert r.json()["sub"] == "auth0|xyz"
     finally:
         main.app.dependency_overrides.clear()
+
+
+# ── /admin/service-accounts/{client_id}/grants — per-client M2M grants (#4) ──
+def _admin_token():
+    return {"active": True, "realm_access": {"roles": [main.ADMIN_ROLE]}}
+
+def test_sa_grant_requires_admin_role(client, monkeypatch):
+    # A non-admin token is rejected by require_role(ADMIN_ROLE) -> 403.
+    main.app.dependency_overrides[main.require_keycloak_auth] = \
+        lambda: {"active": True, "realm_access": {"roles": ["user"]}}
+    try:
+        r = client.post("/admin/service-accounts/some-app/grants",
+                        data={"role": "m2m-service"})
+        assert r.status_code == 403
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_sa_grant_422_when_nothing_requested(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = _admin_token
+    try:
+        r = client.post("/admin/service-accounts/some-app/grants", data={})
+        assert r.status_code == 422
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_sa_grant_404_when_client_missing(client, monkeypatch):
+    admin = _kc_admin_autospec()
+    admin.get_client_id.return_value = None
+    monkeypatch.setattr(main, "_build_keycloak_admin", lambda: admin)
+    main.app.dependency_overrides[main.require_keycloak_auth] = _admin_token
+    try:
+        r = client.post("/admin/service-accounts/nope/grants",
+                        data={"role": "m2m-service"})
+        assert r.status_code == 404
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_sa_grant_400_when_no_service_account(client, monkeypatch):
+    admin = _kc_admin_autospec()
+    admin.get_client_id.return_value = "uuid-1"
+    admin.get_client.return_value = {"serviceAccountsEnabled": False}
+    monkeypatch.setattr(main, "_build_keycloak_admin", lambda: admin)
+    main.app.dependency_overrides[main.require_keycloak_auth] = _admin_token
+    try:
+        r = client.post("/admin/service-accounts/app-x/grants",
+                        data={"role": "m2m-service"})
+        assert r.status_code == 400
+        admin.assign_realm_roles.assert_not_called()
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_sa_grant_role_success(client, monkeypatch):
+    admin = _kc_admin_autospec()
+    admin.get_client_id.return_value = "uuid-1"
+    admin.get_client.return_value = {"serviceAccountsEnabled": True}
+    admin.get_client_service_account_user.return_value = {"id": "sa-1"}
+    admin.get_realm_role.return_value = {"name": "m2m-service"}
+    monkeypatch.setattr(main, "_build_keycloak_admin", lambda: admin)
+    main.app.dependency_overrides[main.require_keycloak_auth] = _admin_token
+    try:
+        r = client.post("/admin/service-accounts/app-x/grants",
+                        data={"role": "m2m-service"})
+        assert r.status_code == 200
+        assert r.json()["granted"] == {"role": "m2m-service"}
+        admin.assign_realm_roles.assert_called_once()
+    finally:
+        main.app.dependency_overrides.clear()
+
+def test_sa_grant_audience_success(client, monkeypatch):
+    admin = _kc_admin_autospec()
+    admin.get_client_id.return_value = "uuid-1"
+    admin.get_mappers_from_client.return_value = []
+    monkeypatch.setattr(main, "_build_keycloak_admin", lambda: admin)
+    main.app.dependency_overrides[main.require_keycloak_auth] = _admin_token
+    try:
+        r = client.post("/admin/service-accounts/app-x/grants",
+                        data={"audience": "premalytics-api"})
+        assert r.status_code == 200
+        assert r.json()["granted"] == {"audience": "premalytics-api"}
+        admin.add_mapper_to_client.assert_called_once()
+    finally:
+        main.app.dependency_overrides.clear()

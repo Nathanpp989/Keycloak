@@ -57,8 +57,8 @@ def test_idle_keys_are_reaped(monkeypatch):
     r.check_and_consume("old")
     now[0] += 1000                      # far past reap interval
     r.check_and_consume("new")          # triggers a reap
-    assert "old" not in r._events       # stale key gone
-    assert "new" in r._events
+    assert "old" not in r._backend._events       # stale key gone
+    assert "new" in r._backend._events
 
 def test_thread_safety_under_contention():
     import threading
@@ -113,3 +113,60 @@ def test_client_key_never_raises():
             raise RuntimeError("boom")
         headers = {}
     assert rl.client_key(Bad()) == "unknown"
+
+
+# ── Shared Redis backend (multi-replica global limits) ──────────────────────
+import fakeredis  # noqa: E402
+
+
+def _redis_limiter(max_events, window):
+    be = rl._RedisBackend(max_events, window, fakeredis.FakeStrictRedis())
+    return rl.RateLimiter(max_events, window, backend=be)
+
+
+def test_redis_backend_allows_up_to_max_then_denies():
+    r = _redis_limiter(3, 60)
+    assert [r.check_and_consume("k")[0] for _ in range(3)] == [True, True, True]
+    allowed, retry = r.check_and_consume("k")
+    assert allowed is False and retry > 0
+
+
+def test_redis_backend_per_key_isolation():
+    r = _redis_limiter(1, 60)
+    assert r.check_and_consume("a")[0] is True
+    assert r.check_and_consume("b")[0] is True   # different key unaffected
+    assert r.check_and_consume("a")[0] is False
+
+
+def test_redis_backend_reset_key():
+    r = _redis_limiter(1, 60)
+    r.check_and_consume("k")
+    assert r.check_and_consume("k")[0] is False
+    r.reset("k")
+    assert r.check_and_consume("k")[0] is True
+
+
+def test_redis_backend_reset_all_scans_namespace():
+    client = fakeredis.FakeStrictRedis()
+    be = rl._RedisBackend(1, 60, client, namespace="rltest")
+    r = rl.RateLimiter(1, 60, backend=be)
+    r.check_and_consume("x")
+    r.check_and_consume("y")
+    r.reset()  # clear all keys in this limiter's namespace
+    assert r.check_and_consume("x")[0] is True
+    assert r.check_and_consume("y")[0] is True
+
+
+def test_make_backend_defaults_to_memory(monkeypatch):
+    monkeypatch.delenv("RATE_LIMIT_BACKEND", raising=False)
+    be = rl._make_backend(5, 60)
+    assert isinstance(be, rl._MemoryBackend)
+
+
+def test_make_backend_falls_back_to_memory_when_redis_unreachable(monkeypatch):
+    # RATE_LIMIT_BACKEND=redis but pointed at a closed port -> ping fails ->
+    # degrade to in-process rather than erroring.
+    monkeypatch.setenv("RATE_LIMIT_BACKEND", "redis")
+    monkeypatch.setenv("REDIS_URL", "redis://127.0.0.1:6390/0")  # nothing there
+    be = rl._make_backend(5, 60)
+    assert isinstance(be, rl._MemoryBackend)

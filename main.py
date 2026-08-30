@@ -366,6 +366,22 @@ def _ensure_realm(admin_url: str, realm: str, user: str, pw: str,
     logger.info("Created Keycloak realm '%s'", realm)
 
 
+def _build_keycloak_admin() -> KeycloakAdmin:
+    """Build a KeycloakAdmin from the configured admin credentials.
+
+    One place the admin connection is defined, shared by startup provisioning
+    and the runtime admin endpoints — so there's no second, drifting copy of the
+    construction (the duplication that caused trouble before)."""
+    return KeycloakAdmin(
+        server_url=os.environ.get("KEYCLOAK_URL", "http://localhost:8080/"),
+        username=os.environ.get("KEYCLOAK_ADMIN_USER", "admin"),
+        password=os.environ.get("KEYCLOAK_ADMIN_PASSWORD", "admin"),
+        realm_name=KEYCLOAK_REALM,
+        user_realm_name="master",
+        verify=True,
+    )
+
+
 def setup_keycloak() -> str:
     """
     Ensure the realm's auth flow, default user, and client secret exist.
@@ -378,14 +394,7 @@ def setup_keycloak() -> str:
     # Create the realm first if it's missing — otherwise every call below 404s
     # on a fresh Keycloak.
     _ensure_realm(admin_url, KEYCLOAK_REALM, admin_user, admin_pass)
-    admin = KeycloakAdmin(
-        server_url=admin_url,
-        username=admin_user,
-        password=admin_pass,
-        realm_name=KEYCLOAK_REALM,
-        user_realm_name="master",
-        verify=True
-    )
+    admin = _build_keycloak_admin()
     flows = admin.get_authentication_flows()
     if not any(flow["alias"] == "Hello-World-flow" for flow in flows):
         admin.create_authentication_flow({
@@ -1168,6 +1177,54 @@ def users_membership(
     except Exception as exc:
         logger.error("Membership lookup failed: %s", exc)
         raise HTTPException(status_code=500, detail="Membership lookup failed")
+
+@app.post("/admin/service-accounts/{client_id}/grants")
+def grant_service_account(
+    client_id: str,
+    role: str | None = Form(default=None),
+    audience: str | None = Form(default=None),
+    token_info: dict = Depends(require_role(ADMIN_ROLE)),
+):
+    """Grant a realm role and/or a token audience to ANOTHER client's service
+    account (its M2M identity). Platform-admin operation (requires ADMIN_ROLE).
+
+    Extends the startup-only SERVICE_ACCOUNT_ROLE / SERVICE_ACCOUNT_AUDIENCE
+    (which provision the app's OWN client) to any registered client at runtime,
+    reusing the same idempotent helpers. At least one of role/audience is
+    required. 404 if the client doesn't exist; 400 if a role is requested but the
+    client has no service account (serviceAccountsEnabled must be on).
+    """
+    if not role and not audience:
+        raise HTTPException(status_code=422,
+                            detail="provide at least one of: role, audience")
+    try:
+        admin = _build_keycloak_admin()
+        client_uuid = admin.get_client_id(client_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("admin lookup failed for client '%s': %s", client_id, exc)
+        raise HTTPException(status_code=503, detail="Keycloak admin unavailable")
+    if not client_uuid:
+        raise HTTPException(status_code=404,
+                            detail=f"client '{client_id}' not found")
+
+    granted: dict = {}
+    if role:
+        rep = admin.get_client(client_uuid) or {}
+        if not rep.get("serviceAccountsEnabled"):
+            raise HTTPException(
+                status_code=400,
+                detail=(f"client '{client_id}' has no service account; enable "
+                        "serviceAccountsEnabled before granting a role"))
+        ensure_realm_role(admin, role)
+        grant_service_account_role(admin, client_uuid, role)
+        granted["role"] = role
+    if audience:
+        ensure_audience_mapper(admin, client_uuid, audience)
+        granted["audience"] = audience
+    logger.info("Admin granted %s to service account of client '%s'",
+                granted, client_id)
+    return {"client_id": client_id, "granted": granted}
+
 
 @app.post("/groups")
 def create_group(

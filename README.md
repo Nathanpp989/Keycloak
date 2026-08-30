@@ -52,6 +52,56 @@ grant. You do not need to pre-create the realm by hand — pointing
 `KEYCLOAK_URL` at a clean Keycloak and providing admin credentials is enough.
 This path is verified end to end against a real Keycloak, not just mocks.
 
+### Bringing the stack up (and the port-80 conflict, solved)
+
+The stack binds host ports 80/443 (Traefik). If a Traefik from **another** compose
+project is already running, it holds those ports and this stack's Traefik fails
+with `Bind for 0.0.0.0:80 failed: port is already allocated`. `docker compose down`
+does not fix it — it only touches the current project, not the stray from a
+different one. Use `stack-up.sh`, which resolves this deterministically:
+
+```bash
+./stack-up.sh --check      # report what's holding your ports; change nothing
+./stack-up.sh              # clear this project's leftovers + strays (prompts first)
+./stack-up.sh -y --up      # the "just make it work" invocation: clear + start
+```
+
+It removes this project's own containers/orphans (always safe), finds containers
+from *other* projects holding your ports and removes them (after a prompt, or
+immediately with `-y`), flags any non-docker listener it can't safely kill, and
+with `--up` starts the stack and prints status.
+
+**Freeing a single port** (e.g. `bind: address already in use` on 8200 from a
+leftover `bao server -dev`, or any one port): `free-port.sh` targets one or more
+ports and clears **both** kinds of holder — a Docker container publishing the
+port *and* a plain host process listening on it:
+
+```bash
+./free-port.sh --check 8200   # report what's on 8200; change nothing
+./free-port.sh -y 8200        # remove the container / kill the process on 8200
+./free-port.sh -y 8200 8201   # several ports at once
+```
+
+It ignores your stack's internal-only ports and Docker's own proxy, so it only
+acts on real conflicts.
+
+### The PremAlytics Command Center hostnames (`*.test.local`)
+
+The stack routes both `*.localhost` and `*.test.local`. To use the `.test.local`
+Command Center URLs over HTTPS:
+
+1. Add hosts entries (`.test.local` does not auto-resolve like `.localhost`):
+   ```bash
+   echo "127.0.0.1  app.test.local  keycloak.test.local  openbao.test.local  traefik.test.local" | sudo tee -a /etc/hosts
+   ```
+2. Issue the cert covering those names (see the OpenBao PKI section), then trust the CA.
+3. Bring the stack up: `./stack-up.sh -y --up`
+4. Open `https://app.test.local`, `https://keycloak.test.local`,
+   `https://traefik.test.local/dashboard/`.
+
+(Keycloak's issuer stays `keycloak.localhost` unless you change `KC_HOSTNAME` —
+doing so also means updating your Auth0 callback URLs.)
+
 
 1. **Create a virtual environment and install dependencies:**
    ```bash

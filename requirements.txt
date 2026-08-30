@@ -13,3 +13,10 @@ python-dotenv>=1.0.0
 websockets>=12.0
 pyjwt>=2.8.0
 prometheus-client>=0.20.0
+# Optional: only needed when RATE_LIMIT_BACKEND=redis (shared limits across
+# replicas). Single-replica deployments don't need it — the limiter defaults to
+# the in-process backend. Imported lazily, so an absent redis package is fine
+# unless you opt in.
+redis>=5.0.0
+# Test-only: exercises the Redis rate-limit backend without a real server.
+fakeredis>=2.20.0
