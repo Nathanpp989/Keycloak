@@ -258,7 +258,16 @@ services:
       # OpenBao (the Z-axis) — dev server on the compose network. Alongside Key
       # Vault, not replacing it. resolve_secret() tries OpenBao then falls back.
       OPENBAO_ADDR: http://openbao:8200
-      OPENBAO_TOKEN: ${OPENBAO_TOKEN:-root}
+      # AppRole (preferred with persistent OpenBao): the app logs in with these
+      # to read secrets — no static root token needed. Provision them with
+      #   OPENBAO_TOKEN=<root> python openbao_setup.py approle
+      # then put the printed values here (or in .env).
+      OPENBAO_ROLE_ID: ${OPENBAO_ROLE_ID:-}
+      OPENBAO_SECRET_ID: ${OPENBAO_SECRET_ID:-}
+      # Legacy static token. Blank by default now that OpenBao is persistent
+      # (the fixed 'root' token no longer exists). Set it only for a dev bao
+      # started with -dev-root-token-id=root; otherwise use AppRole above.
+      OPENBAO_TOKEN: ${OPENBAO_TOKEN:-}
     volumes:
       # Persist generated RSA keys across restarts.
       - keys:/data/keys

@@ -275,10 +275,39 @@ def cmd_checklist(c: Cfg) -> int:
     return 0
 
 
+def cmd_approle(c: Cfg) -> int:
+    """Provision AppRole so the APP can read secrets without a root token, and
+    print the role_id + secret_id to put in the app's environment."""
+    if not c.bao_token:
+        _bad("OPENBAO_TOKEN required (the generated root token — read it with: "
+             "docker compose exec openbao cat /openbao/data/bao-init.json)")
+        return 1
+    role = _env("OPENBAO_APPROLE_NAME", "auth-broker")
+    print(f"Provisioning AppRole role '{role}' at {c.bao_addr} ...")
+    try:
+        creds = ob.configure_approle(role, openbao_addr=c.bao_addr,
+                                     token=c.bao_token)
+    except ob.OpenBaoError as exc:
+        _bad(str(exc))
+        return 1
+    _ok(f"AppRole '{role}' provisioned (policy '{creds['policy']}')")
+    print("\nPut these in the app's environment (.env or compose), then restart"
+          " the app:\n")
+    print(f"  OPENBAO_ROLE_ID={creds['role_id']}")
+    print(f"  OPENBAO_SECRET_ID={creds['secret_id']}")
+    print("\nAlso set OPENBAO_SECRETS to the names the app should read from "
+          "OpenBao first (comma-separated, or '*' for all), e.g.:")
+    print("  OPENBAO_SECRETS=AUTH0_CLIENT_SECRET,AUTH0_CLIENT_ID,AUTH0_AUDIENCE")
+    print("\nThe app then logs in with the role_id/secret_id (no root token) and "
+          "reads those secrets from OpenBao, falling back to Key Vault.")
+    return 0
+
+
 _COMMANDS = {
     "check": cmd_check,
     "keycloak": cmd_keycloak,
     "auth0": cmd_auth0,
+    "approle": cmd_approle,
     "all": cmd_all,
     "checklist": cmd_checklist,
 }
@@ -289,7 +318,7 @@ def main(argv: list[str] | None = None) -> int:
     cmd = argv[0] if argv else "check"
     if cmd in ("-h", "--help", "help"):
         print("Usage: python openbao_setup.py "
-              "[check|keycloak|auth0|all|checklist]")
+              "[check|keycloak|auth0|approle|all|checklist]")
         print(__doc__ or "")
         return 0
     fn = _COMMANDS.get(cmd)

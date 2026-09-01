@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+import time
 from typing import Any
 
 import requests
@@ -54,6 +56,14 @@ JWT_MOUNT_AUTH0     = os.environ.get("OPENBAO_AUTH0_MOUNT", "auth0-jwt")
 
 # KV v2 secrets engine mount for capability #3.
 KV_MOUNT = os.environ.get("OPENBAO_KV_MOUNT", "secret")
+
+# AppRole: how the APP authenticates to OpenBao to read secrets, instead of a
+# static root token. The app logs in with a role_id + secret_id (provisioned by
+# configure_approle) and gets a short-lived token. This is the right fit now
+# that OpenBao is persistent (the fixed 'root' token is gone).
+APPROLE_MOUNT = os.environ.get("OPENBAO_APPROLE_MOUNT", "approle")
+OPENBAO_ROLE_ID = os.environ.get("OPENBAO_ROLE_ID", "")
+OPENBAO_SECRET_ID = os.environ.get("OPENBAO_SECRET_ID", "")
 
 # PKI secrets engine mount — OpenBao acts as an internal Certificate Authority
 # that issues TLS certs (e.g. for Traefik). Separate mount from KV/auth so the
@@ -303,6 +313,104 @@ def login_auth0_jwt(jwt: str, *, mount: str = JWT_MOUNT_AUTH0,
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# AppRole: how the APP authenticates to OpenBao to read secrets (no root token)
+# ════════════════════════════════════════════════════════════════════════════
+def configure_approle(role_name: str, *, mount: str = APPROLE_MOUNT,
+                      policy_name: str | None = None,
+                      policy_hcl: str | None = None,
+                      kv_mount: str | None = None,
+                      token_ttl: str = "1h", token_max_ttl: str = "4h",
+                      token: str | None = None,
+                      addr: str | None = None) -> dict:
+    """Provision AppRole auth so the APP can read secrets without a root token.
+
+    Enables the approle auth method, writes a policy granting READ access to the
+    KV secrets, creates a role bound to that policy, and returns
+    {role_id, secret_id, policy} for the app to log in with. Requires an admin
+    token (the generated root token). Idempotent — safe to re-run (it rewrites
+    the policy/role and mints a fresh secret_id each call).
+    """
+    tok = _require_token(token)
+    policy_name = policy_name or f"{role_name}-policy"
+    kv = kv_mount or KV_MOUNT
+    if policy_hcl is None:
+        # Least-privilege: read the app's KV secrets, nothing else.
+        policy_hcl = (f'path "{kv}/data/*" {{ capabilities = ["read"] }}\n'
+                      f'path "{kv}/metadata/*" {{ capabilities = ["read", "list"] }}\n')
+
+    enable_auth_method("approle", mount, token=tok, addr=addr)
+    _check(_request("PUT", f"sys/policies/acl/{policy_name}", token=tok,
+                    addr=addr, json_body={"policy": policy_hcl}),
+           f"write policy '{policy_name}'")
+    _check(_request("POST", f"auth/{mount}/role/{role_name}", token=tok,
+                    addr=addr,
+                    json_body={"token_policies": [policy_name],
+                               "token_ttl": token_ttl,
+                               "token_max_ttl": token_max_ttl,
+                               "secret_id_ttl": "0",       # dev: doesn't expire
+                               "secret_id_num_uses": 0}),  # dev: unlimited uses
+           f"create approle role '{role_name}'")
+    rid = _check(_request("GET", f"auth/{mount}/role/{role_name}/role-id",
+                          token=tok, addr=addr), "read role-id")
+    sid = _check(_request("POST", f"auth/{mount}/role/{role_name}/secret-id",
+                          token=tok, addr=addr), "generate secret-id")
+    role_id = (rid.get("data") or {}).get("role_id")
+    secret_id = (sid.get("data") or {}).get("secret_id")
+    if not role_id or not secret_id:
+        raise OpenBaoError("AppRole provisioning returned no role_id/secret_id")
+    logger.info("Provisioned AppRole role '%s' (policy '%s')",
+                role_name, policy_name)
+    return {"role_id": role_id, "secret_id": secret_id, "policy": policy_name}
+
+
+def login_approle(role_id: str, secret_id: str, *, mount: str = APPROLE_MOUNT,
+                  addr: str | None = None) -> tuple[str, int]:
+    """Exchange a role_id + secret_id for an OpenBao token. Returns
+    (client_token, lease_duration_seconds). The login endpoint is itself
+    unauthenticated — that's the point, it's how you obtain a token."""
+    resp = _request("POST", f"auth/{mount}/login", addr=addr,
+                    json_body={"role_id": role_id, "secret_id": secret_id})
+    data = _check(resp, "AppRole login")
+    auth = data.get("auth") or {}
+    token = auth.get("client_token")
+    if not token:
+        raise OpenBaoError("AppRole login returned no client_token")
+    return token, int(auth.get("lease_duration", 0))
+
+
+# Cache the AppRole-obtained token so we don't log in on every secret read.
+_approle_token_cache: str | None = None
+_approle_token_expiry: float = 0.0   # time.monotonic() deadline
+_approle_lock = threading.Lock()
+
+
+def _get_auth_token() -> str | None:
+    """Return a usable OpenBao token for reading secrets, or None if OpenBao
+    isn't configured. Prefers the static OPENBAO_TOKEN (dev / back-compat); else
+    logs in via AppRole (OPENBAO_ROLE_ID + OPENBAO_SECRET_ID) and caches the
+    token, refreshing shortly before it expires."""
+    if OPENBAO_TOKEN:
+        return OPENBAO_TOKEN
+    if not (OPENBAO_ROLE_ID and OPENBAO_SECRET_ID):
+        return None
+    global _approle_token_cache, _approle_token_expiry
+    with _approle_lock:
+        now = time.monotonic()
+        if _approle_token_cache and now < _approle_token_expiry:
+            return _approle_token_cache
+        token, ttl = login_approle(OPENBAO_ROLE_ID, OPENBAO_SECRET_ID)
+        _approle_token_cache = token
+        # Refresh 30s before expiry; if the token has no TTL, re-login periodically.
+        _approle_token_expiry = now + (max(ttl - 30, 30) if ttl else 300)
+        return token
+
+
+def _openbao_configured() -> bool:
+    """True if OpenBao secret reads are possible — a static token or AppRole."""
+    return bool(OPENBAO_TOKEN or (OPENBAO_ROLE_ID and OPENBAO_SECRET_ID))
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Capability 3: OpenBao as a secret store (KV v2), alongside Azure Key Vault
 # ════════════════════════════════════════════════════════════════════════════
 class OpenBaoSecrets:
@@ -315,7 +423,9 @@ class OpenBaoSecrets:
     def __init__(self, addr: str | None = None, token: str | None = None,
                  mount: str = KV_MOUNT):
         self.addr = (addr or OPENBAO_ADDR).rstrip("/")
-        self.token = token or OPENBAO_TOKEN
+        # A caller may pass an explicit token; otherwise use the auth provider,
+        # which returns the static OPENBAO_TOKEN or logs in via AppRole.
+        self.token = token or _get_auth_token()
         self.mount = mount
 
     def put_secret(self, name: str, value: str) -> None:
@@ -352,8 +462,9 @@ def resolve_secret(name: str, *, prefer: str = "openbao") -> str:
     environments transparently use Key Vault as before.
     """
     def _from_openbao() -> str:
-        if not OPENBAO_TOKEN:
-            raise OpenBaoError("OpenBao not configured (no OPENBAO_TOKEN)")
+        if not _openbao_configured():
+            raise OpenBaoError("OpenBao not configured (no OPENBAO_TOKEN and no "
+                               "OPENBAO_ROLE_ID/OPENBAO_SECRET_ID for AppRole)")
         return OpenBaoSecrets().get_secret(name)
 
     def _from_keyvault() -> str:

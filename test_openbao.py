@@ -577,3 +577,90 @@ def test_create_pki_role_allows_bare_domains():
     body = json.loads(responses.calls[0].request.body)
     assert body.get("allow_bare_domains") is True
     assert body.get("allow_subdomains") is True
+
+
+# ── AppRole: the app authenticates to OpenBao without a root token ──────────
+@responses.activate
+def test_configure_approle_provisions_and_returns_creds():
+    responses.add(responses.POST, f"{ADDR}/v1/sys/auth/approle", status=204)
+    responses.add(responses.PUT,
+                  f"{ADDR}/v1/sys/policies/acl/auth-broker-policy", status=204)
+    responses.add(responses.POST, f"{ADDR}/v1/auth/approle/role/auth-broker",
+                  status=204)
+    responses.add(responses.GET,
+                  f"{ADDR}/v1/auth/approle/role/auth-broker/role-id",
+                  json={"data": {"role_id": "rid-123"}}, status=200)
+    responses.add(responses.POST,
+                  f"{ADDR}/v1/auth/approle/role/auth-broker/secret-id",
+                  json={"data": {"secret_id": "sid-456"}}, status=200)
+    out = ob.configure_approle("auth-broker", token=TOK, addr=ADDR)
+    assert out["role_id"] == "rid-123"
+    assert out["secret_id"] == "sid-456"
+    assert out["policy"] == "auth-broker-policy"
+    # the policy it wrote grants read on the KV data path, nothing more
+    policy_call = next(c for c in responses.calls if "policies/acl" in c.request.url)
+    body = json.loads(policy_call.request.body)
+    assert 'capabilities = ["read"]' in body["policy"]
+    assert "secret/data/*" in body["policy"]
+
+
+@responses.activate
+def test_login_approle_returns_token_and_ttl():
+    responses.add(responses.POST, f"{ADDR}/v1/auth/approle/login",
+                  json={"auth": {"client_token": "s.apptoken",
+                                 "lease_duration": 3600}}, status=200)
+    token, ttl = ob.login_approle("rid", "sid", addr=ADDR)
+    assert token == "s.apptoken"
+    assert ttl == 3600
+
+
+@responses.activate
+def test_login_approle_no_token_raises():
+    responses.add(responses.POST, f"{ADDR}/v1/auth/approle/login",
+                  json={"auth": {}}, status=200)
+    with pytest.raises(ob.OpenBaoError):
+        ob.login_approle("rid", "sid", addr=ADDR)
+
+
+def test_get_auth_token_prefers_static_token(monkeypatch):
+    monkeypatch.setattr(ob, "OPENBAO_TOKEN", "root")
+    monkeypatch.setattr(ob, "OPENBAO_ROLE_ID", "rid")
+    monkeypatch.setattr(ob, "OPENBAO_SECRET_ID", "sid")
+    assert ob._get_auth_token() == "root"   # static wins, no AppRole login
+
+
+def test_get_auth_token_none_when_unconfigured(monkeypatch):
+    monkeypatch.setattr(ob, "OPENBAO_TOKEN", "")
+    monkeypatch.setattr(ob, "OPENBAO_ROLE_ID", "")
+    monkeypatch.setattr(ob, "OPENBAO_SECRET_ID", "")
+    assert ob._get_auth_token() is None
+
+
+@responses.activate
+def test_get_auth_token_uses_approle_and_caches(monkeypatch):
+    monkeypatch.setattr(ob, "OPENBAO_TOKEN", "")
+    monkeypatch.setattr(ob, "OPENBAO_ROLE_ID", "rid")
+    monkeypatch.setattr(ob, "OPENBAO_SECRET_ID", "sid")
+    monkeypatch.setattr(ob, "OPENBAO_ADDR", ADDR)
+    monkeypatch.setattr(ob, "_approle_token_cache", None)
+    monkeypatch.setattr(ob, "_approle_token_expiry", 0.0)
+    responses.add(responses.POST, f"{ADDR}/v1/auth/approle/login",
+                  json={"auth": {"client_token": "s.apptoken",
+                                 "lease_duration": 3600}}, status=200)
+    assert ob._get_auth_token() == "s.apptoken"
+    # second call is served from cache — no second login HTTP call
+    assert ob._get_auth_token() == "s.apptoken"
+    login_calls = [c for c in responses.calls if "approle/login" in c.request.url]
+    assert len(login_calls) == 1
+
+
+def test_openbao_configured_static_or_approle(monkeypatch):
+    monkeypatch.setattr(ob, "OPENBAO_TOKEN", "root")
+    monkeypatch.setattr(ob, "OPENBAO_ROLE_ID", "")
+    monkeypatch.setattr(ob, "OPENBAO_SECRET_ID", "")
+    assert ob._openbao_configured() is True          # static token
+    monkeypatch.setattr(ob, "OPENBAO_TOKEN", "")
+    assert ob._openbao_configured() is False          # nothing
+    monkeypatch.setattr(ob, "OPENBAO_ROLE_ID", "rid")
+    monkeypatch.setattr(ob, "OPENBAO_SECRET_ID", "sid")
+    assert ob._openbao_configured() is True          # AppRole
