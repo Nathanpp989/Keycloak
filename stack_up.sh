@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# stack_up.sh — bring the stack up with deterministic port-conflict resolution.
+# stack-up.sh — bring the stack up with deterministic port-conflict resolution.
 #
 # THE PROBLEM THIS SOLVES (once and for all):
 #   Multiple compose stacks with different project names share the host ports
@@ -144,9 +144,12 @@ if [ "$DO_UP" -eq 1 ] && [ "$CHECK_ONLY" -ne 1 ]; then
     echo "serve once your /etc/hosts entries + cert are in place."
   else
     echo ""
-    echo "compose up failed. If it says 'port is already allocated', a non-docker"
-    echo "process holds the port — find it with:"
-    echo "  sudo lsof -nP -iTCP:80 -sTCP:LISTEN"
+    echo "compose up failed. Two common causes:"
+    echo "  - 'port is already allocated' -> a non-docker process holds a port;"
+    echo "    find it with:  sudo lsof -nP -iTCP:80 -sTCP:LISTEN"
+    echo "  - 'dependency failed to start' / a container 'exited' -> that service"
+    echo "    crashed on boot; read its log:  docker compose logs <service>"
+    echo "    (e.g. 'docker compose logs openbao')"
     exit 1
   fi
 else

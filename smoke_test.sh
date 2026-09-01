@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# smoke_test.sh — curl-based end-to-end check of the auth broker on the live
+# smoke-test.sh — curl-based end-to-end check of the auth broker on the live
 # stack. Exercises the paths built across this project:
 #   1. health over HTTPS (the .test.local Command Center host)
 #   2. fetch the app client secret from Keycloak (admin)
@@ -75,6 +75,23 @@ if [ -n "$SECRET" ]; then
     code=$(curl -sk -o /dev/null -w '%{http_code}' "$BASE/protected" \
       -H "Authorization: Bearer $TOKEN")
     if [ "$code" = "200" ]; then ok "M2M token on /protected -> 200"; else no "M2M token on /protected -> $code"; fi
+
+    # 4b. scope-guarded /protected/service (requires the m2m:access scope).
+    # A token that REQUESTS scope=m2m:access is accepted; the plain token above
+    # (no scope) is refused with 403. (The 200 assumes SERVICE_ACCOUNT_AUDIENCE
+    # is unset — the default; if you set it, the scoped token also needs that
+    # audience.)
+    STOKEN=$(curl -sk "$BASE/token/client" \
+      -d "client_id=$CLIENT" -d "client_secret=$SECRET" \
+      -d "scope=m2m:access" | jget "['access_token']")
+    if [ -n "$STOKEN" ]; then
+      code=$(curl -sk -o /dev/null -w '%{http_code}' "$BASE/protected/service" \
+        -H "Authorization: Bearer $STOKEN")
+      if [ "$code" = "200" ]; then ok "/protected/service with m2m:access -> 200"; else no "/protected/service with m2m:access -> $code"; fi
+    fi
+    code=$(curl -sk -o /dev/null -w '%{http_code}' "$BASE/protected/service" \
+      -H "Authorization: Bearer $TOKEN")
+    if [ "$code" = "403" ]; then ok "/protected/service without scope -> 403 (denied)"; else no "/protected/service without scope -> $code (expected 403)"; fi
   else
     no "/token/client returned no token (client secret? service accounts enabled?)"
   fi

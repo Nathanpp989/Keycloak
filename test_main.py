@@ -1916,3 +1916,27 @@ def test_sa_grant_audience_success(client, monkeypatch):
         admin.add_mapper_to_client.assert_called_once()
     finally:
         main.app.dependency_overrides.clear()
+
+
+# ── ensure_client_scope (m2m:access provisioning, step 3) ───────────────────
+def test_ensure_client_scope_creates_and_assigns():
+    admin = _kc_admin_autospec()
+    admin.get_client_scopes.return_value = []               # not yet present
+    admin.create_client_scope.return_value = "scope-uuid"
+    admin.get_client_optional_client_scopes.return_value = []  # not assigned
+    main.ensure_client_scope(admin, "m2m:access", "client-uuid")
+    admin.create_client_scope.assert_called_once()
+    admin.add_client_optional_client_scope.assert_called_once()
+
+def test_ensure_client_scope_idempotent_when_present():
+    admin = _kc_admin_autospec()
+    admin.get_client_scopes.return_value = [{"name": "m2m:access", "id": "sid"}]
+    admin.get_client_optional_client_scopes.return_value = [{"name": "m2m:access"}]
+    main.ensure_client_scope(admin, "m2m:access", "client-uuid")
+    admin.create_client_scope.assert_not_called()           # already exists
+    admin.add_client_optional_client_scope.assert_not_called()  # already assigned
+
+def test_ensure_client_scope_survives_error():
+    admin = _kc_admin_autospec()
+    admin.get_client_scopes.side_effect = RuntimeError("boom")
+    main.ensure_client_scope(admin, "m2m:access", "client-uuid")  # no raise

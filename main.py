@@ -208,6 +208,44 @@ def grant_service_account_role(admin: KeycloakAdmin, client_uuid: str,
                        "%s: %s", role_name, client_uuid, exc)
 
 
+def ensure_client_scope(admin: KeycloakAdmin, scope_name: str,
+                        client_uuid: str) -> None:
+    """Ensure a client scope `scope_name` exists and is assigned to the client as
+    an OPTIONAL scope, so an M2M token that REQUESTS it (scope=<name>) carries it
+    in its 'scope' claim. This is what makes a require_scope-guarded endpoint
+    (e.g. /protected/service, which requires 'm2m:access') reachable end to end:
+    a token requesting the scope gets 200, one without it gets 403. Idempotent,
+    best-effort — a failure logs a warning rather than crashing startup.
+    """
+    try:
+        scope_id = None
+        for s in (admin.get_client_scopes() or []):
+            if isinstance(s, dict) and s.get("name") == scope_name:
+                scope_id = s.get("id")
+                break
+        if scope_id is None:
+            scope_id = admin.create_client_scope(
+                {"name": scope_name, "protocol": "openid-connect",
+                 "attributes": {"include.in.token.scope": "true",
+                                "display.on.consent.screen": "false"}},
+                skip_exists=True)
+        if not scope_id:
+            logger.warning("Could not resolve client scope '%s'", scope_name)
+            return
+        assigned = admin.get_client_optional_client_scopes(client_uuid) or []
+        if not any(isinstance(a, dict) and a.get("name") == scope_name
+                   for a in assigned):
+            admin.add_client_optional_client_scope(
+                client_uuid, scope_id,
+                {"realm": KEYCLOAK_REALM, "client": client_uuid,
+                 "clientScopeId": scope_id})
+            logger.info("Assigned optional client scope '%s' to client %s",
+                        scope_name, client_uuid)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not ensure client scope '%s': %s",
+                       scope_name, exc)
+
+
 def ensure_audience_mapper(admin: KeycloakAdmin, client_uuid: str,
                            audience: str) -> None:
     """Ensure the client has a protocol mapper that puts `audience` into the
@@ -422,6 +460,10 @@ def setup_keycloak() -> str:
     grant_realm_role(admin, admin_user_id, admin_role)
 
     client_uuid     = ensure_keycloak_client(admin)
+    # Provision the 'm2m:access' optional scope so the require_scope-guarded
+    # /protected/service is reachable: an M2M token that requests
+    # scope=m2m:access carries it and is accepted; one without it gets 403.
+    ensure_client_scope(admin, "m2m:access", client_uuid)
     # Grant the app client's SERVICE ACCOUNT a role, so machine-to-machine
     # (client_credentials) tokens carry real permissions rather than just being
     # 'authenticated'. Empty by default (SERVICE_ACCOUNT_ROLE unset) — set it to
