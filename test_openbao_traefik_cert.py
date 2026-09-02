@@ -151,7 +151,7 @@ def test_renew_failure_preserves_existing_cert():
         original = _make_cert(60)  # short => due
         open(cert_p, "w").write(original)
         with patch.object(ob, "issue_certificate",
-                          side_effect=ob.OpenBaoError("down")):
+                        side_effect=ob.OpenBaoError("down")):
             try:
                 tc.renew_if_needed("traefik", ["app.localhost"], d, force=True)
             except ob.OpenBaoError:
