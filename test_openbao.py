@@ -24,14 +24,14 @@ def test_enable_auth_method_new():
 @responses.activate
 def test_enable_auth_method_already_exists_is_ok():
     responses.add(responses.POST, f"{ADDR}/v1/sys/auth/oidc",
-                json={"errors": ["path is already in use at oidc/"]}, status=400)
+                  json={"errors": ["path is already in use at oidc/"]}, status=400)
     # Idempotent: a re-run must not raise.
     assert ob.enable_auth_method("oidc", "oidc", token=TOK, addr=ADDR) is True
 
 @responses.activate
 def test_enable_auth_method_real_error_raises():
     responses.add(responses.POST, f"{ADDR}/v1/sys/auth/oidc",
-                json={"errors": ["permission denied"]}, status=403)
+                  json={"errors": ["permission denied"]}, status=403)
     with pytest.raises(ob.OpenBaoError, match="permission denied"):
         ob.enable_auth_method("oidc", "oidc", token=TOK, addr=ADDR)
 
@@ -98,7 +98,7 @@ def test_configure_auth0_jwt_without_audience_binds_claims():
 @responses.activate
 def test_login_auth0_jwt_returns_token():
     responses.add(responses.POST, f"{ADDR}/v1/auth/auth0-jwt/login",
-                json={"auth": {"client_token": "s.openbao-token"}}, status=200)
+                  json={"auth": {"client_token": "s.openbao-token"}}, status=200)
     tok = ob.login_auth0_jwt("the.jwt.here", openbao_addr=ADDR)
     assert tok == "s.openbao-token"
     body = json.loads(responses.calls[0].request.body)
@@ -107,7 +107,7 @@ def test_login_auth0_jwt_returns_token():
 @responses.activate
 def test_login_auth0_jwt_no_token_raises():
     responses.add(responses.POST, f"{ADDR}/v1/auth/auth0-jwt/login",
-                json={"auth": {}}, status=200)
+                  json={"auth": {}}, status=200)
     with pytest.raises(ob.OpenBaoError, match="no client_token"):
         ob.login_auth0_jwt("j", openbao_addr=ADDR)
 
@@ -116,20 +116,20 @@ def test_login_auth0_jwt_no_token_raises():
 @responses.activate
 def test_put_and_get_secret():
     responses.add(responses.POST, f"{ADDR}/v1/secret/data/AUTH0_CLIENT_SECRET",
-                json={"data": {"version": 1}}, status=200)
+                  json={"data": {"version": 1}}, status=200)
     responses.add(responses.GET, f"{ADDR}/v1/secret/data/AUTH0_CLIENT_SECRET",
-                json={"data": {"data": {"value": "the-secret"}}}, status=200)
+                  json={"data": {"data": {"value": "the-secret"}}}, status=200)
     s = ob.OpenBaoSecrets(addr=ADDR, token=TOK)
     s.put_secret("AUTH0_CLIENT_SECRET", "the-secret")
     assert s.get_secret("AUTH0_CLIENT_SECRET") == "the-secret"
     put_body = json.loads([c for c in responses.calls
-                        if c.request.method == "POST"][0].request.body)
+                           if c.request.method == "POST"][0].request.body)
     assert put_body["data"]["value"] == "the-secret"
 
 @responses.activate
 def test_get_secret_missing_value_raises():
     responses.add(responses.GET, f"{ADDR}/v1/secret/data/X",
-                json={"data": {"data": {}}}, status=200)
+                  json={"data": {"data": {}}}, status=200)
     s = ob.OpenBaoSecrets(addr=ADDR, token=TOK)
     with pytest.raises(ob.OpenBaoError, match="no 'value' field"):
         s.get_secret("X")
@@ -582,6 +582,7 @@ def test_create_pki_role_allows_bare_domains():
 # ── AppRole: the app authenticates to OpenBao without a root token ──────────
 @responses.activate
 def test_configure_approle_provisions_and_returns_creds():
+    responses.add(responses.POST, f"{ADDR}/v1/sys/mounts/secret", status=204)
     responses.add(responses.POST, f"{ADDR}/v1/sys/auth/approle", status=204)
     responses.add(responses.PUT,
                   f"{ADDR}/v1/sys/policies/acl/auth-broker-policy", status=204)
@@ -664,3 +665,36 @@ def test_openbao_configured_static_or_approle(monkeypatch):
     monkeypatch.setattr(ob, "OPENBAO_ROLE_ID", "rid")
     monkeypatch.setattr(ob, "OPENBAO_SECRET_ID", "sid")
     assert ob._openbao_configured() is True          # AppRole
+
+
+@responses.activate
+def test_enable_kv_engine_new():
+    responses.add(responses.POST, f"{ADDR}/v1/sys/mounts/secret", status=204)
+    assert ob.enable_kv_engine(token=TOK, addr=ADDR) is True
+
+
+@responses.activate
+def test_enable_kv_engine_already_mounted_is_ok():
+    responses.add(responses.POST, f"{ADDR}/v1/sys/mounts/secret",
+                  json={"errors": ["path is already in use at secret/"]},
+                  status=400)
+    assert ob.enable_kv_engine(token=TOK, addr=ADDR) is True
+
+
+@responses.activate
+def test_configure_approle_enables_kv_engine():
+    # configure_approle must mount KV so the app's reads don't 404.
+    responses.add(responses.POST, f"{ADDR}/v1/sys/mounts/secret", status=204)
+    responses.add(responses.POST, f"{ADDR}/v1/sys/auth/approle", status=204)
+    responses.add(responses.PUT,
+                  f"{ADDR}/v1/sys/policies/acl/auth-broker-policy", status=204)
+    responses.add(responses.POST, f"{ADDR}/v1/auth/approle/role/auth-broker",
+                  status=204)
+    responses.add(responses.GET,
+                  f"{ADDR}/v1/auth/approle/role/auth-broker/role-id",
+                  json={"data": {"role_id": "r"}}, status=200)
+    responses.add(responses.POST,
+                  f"{ADDR}/v1/auth/approle/role/auth-broker/secret-id",
+                  json={"data": {"secret_id": "s"}}, status=200)
+    ob.configure_approle("auth-broker", token=TOK, addr=ADDR)
+    assert any("sys/mounts/secret" in c.request.url for c in responses.calls)

@@ -338,6 +338,9 @@ def configure_approle(role_name: str, *, mount: str = APPROLE_MOUNT,
         policy_hcl = (f'path "{kv}/data/*" {{ capabilities = ["read"] }}\n'
                       f'path "{kv}/metadata/*" {{ capabilities = ["read", "list"] }}\n')
 
+    # Ensure the KV engine the policy points at actually exists — a persistent
+    # OpenBao doesn't auto-mount it, and the app would 404 on every read otherwise.
+    enable_kv_engine(mount=kv, token=tok, addr=addr)
     enable_auth_method("approle", mount, token=tok, addr=addr)
     _check(_request("PUT", f"sys/policies/acl/{policy_name}", token=tok,
                     addr=addr, json_body={"policy": policy_hcl}),
@@ -493,6 +496,29 @@ def resolve_secret(name: str, *, prefer: str = "openbao") -> str:
 #   4. issue_certificate(...)         — mint a leaf cert for a hostname
 # Every step is idempotent-friendly and raises OpenBaoError with an actionable
 # message on failure, matching the rest of this module.
+
+def enable_kv_engine(*, mount: str = KV_MOUNT, token: str | None = None,
+                     addr: str | None = None) -> bool:
+    """Mount the KV v2 secrets engine at `mount`. Idempotent.
+
+    A PERSISTENT (non-dev) OpenBao does NOT auto-mount 'secret/' the way dev mode
+    does, so this must run before reading/writing secrets there — otherwise the
+    first write/read 404s ("no handler for route"). Safe to re-run.
+    """
+    tok = _require_token(token)
+    resp = _request("POST", f"sys/mounts/{mount}", token=tok, addr=addr,
+                    json_body={"type": "kv", "options": {"version": "2"}})
+    if resp.status_code < 400:
+        logger.info("Enabled KV v2 engine at mount '%s'", mount)
+        return True
+    body = resp.text.lower()
+    if resp.status_code == 400 and ("already in use" in body
+                                    or "existing mount" in body):
+        logger.info("KV mount '%s' already exists; reusing", mount)
+        return True
+    _check(resp, f"enable KV engine at '{mount}'")
+    return True
+
 
 def enable_pki_engine(*, mount: str = PKI_MOUNT, max_ttl: str = "87600h",
                       token: str | None = None,
