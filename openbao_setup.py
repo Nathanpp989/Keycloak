@@ -285,7 +285,7 @@ def cmd_approle(c: Cfg) -> int:
     role = _env("OPENBAO_APPROLE_NAME", "auth-broker")
     print(f"Provisioning AppRole role '{role}' at {c.bao_addr} ...")
     try:
-        creds = ob.configure_approle(role, openbao_addr=c.bao_addr,
+        creds = ob.configure_approle(role, addr=c.bao_addr,
                                      token=c.bao_token)
     except ob.OpenBaoError as exc:
         _bad(str(exc))

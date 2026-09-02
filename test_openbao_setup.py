@@ -91,3 +91,24 @@ def test_help():
 
 def test_checklist_runs():
     assert setup.main(["checklist"]) == 0
+
+
+def test_cmd_approle_calls_configure_with_valid_kwargs():
+    # Regression: cmd_approle must call ob.configure_approle with kwargs that
+    # exist on its real signature. The 'openbao_addr=' typo crashed the command
+    # with TypeError (configure_approle takes addr=/token=).
+    import inspect
+    from unittest import mock
+    import openbao_connect as ob
+    captured = {}
+
+    def fake(role, **kw):
+        captured["kwargs"] = kw
+        return {"role_id": "rid", "secret_id": "sid", "policy": "p"}
+
+    real_params = inspect.signature(ob.configure_approle).parameters
+    with mock.patch.object(ob, "configure_approle", fake):
+        rc = setup.cmd_approle(_cfg())
+    assert rc == 0
+    for k in captured["kwargs"]:
+        assert k in real_params, f"cmd_approle passed invalid kwarg: {k}"
