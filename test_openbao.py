@@ -698,3 +698,24 @@ def test_configure_approle_enables_kv_engine():
                   json={"data": {"secret_id": "s"}}, status=200)
     ob.configure_approle("auth-broker", token=TOK, addr=ADDR)
     assert any("sys/mounts/secret" in c.request.url for c in responses.calls)
+
+
+@responses.activate
+def test_configure_approle_secret_id_lifetime_configurable():
+    # Production hardening: secret_id TTL + use-count must be settable (default
+    # is dev-permissive 0/0 = never expires, unlimited uses).
+    for p in ("sys/mounts/secret", "sys/auth/approle"):
+        responses.add(responses.POST, f"{ADDR}/v1/{p}", status=204)
+    responses.add(responses.PUT, f"{ADDR}/v1/sys/policies/acl/r-policy", status=204)
+    responses.add(responses.POST, f"{ADDR}/v1/auth/approle/role/r", status=204)
+    responses.add(responses.GET, f"{ADDR}/v1/auth/approle/role/r/role-id",
+                  json={"data": {"role_id": "x"}}, status=200)
+    responses.add(responses.POST, f"{ADDR}/v1/auth/approle/role/r/secret-id",
+                  json={"data": {"secret_id": "y"}}, status=200)
+    ob.configure_approle("r", token=TOK, addr=ADDR,
+                         secret_id_ttl="24h", secret_id_num_uses=5)
+    role_call = next(c for c in responses.calls
+                     if c.request.url.endswith("/role/r"))
+    body = json.loads(role_call.request.body)
+    assert body["secret_id_ttl"] == "24h"
+    assert body["secret_id_num_uses"] == 5

@@ -320,6 +320,8 @@ def configure_approle(role_name: str, *, mount: str = APPROLE_MOUNT,
                       policy_hcl: str | None = None,
                       kv_mount: str | None = None,
                       token_ttl: str = "1h", token_max_ttl: str = "4h",
+                      secret_id_ttl: str | None = None,
+                      secret_id_num_uses: int | None = None,
                       token: str | None = None,
                       addr: str | None = None) -> dict:
     """Provision AppRole auth so the APP can read secrets without a root token.
@@ -333,6 +335,13 @@ def configure_approle(role_name: str, *, mount: str = APPROLE_MOUNT,
     tok = _require_token(token)
     policy_name = policy_name or f"{role_name}-policy"
     kv = kv_mount or KV_MOUNT
+    # secret_id lifetime: DEFAULT is dev-permissive (never expires, unlimited
+    # uses) so local dev "just works". For production set a finite TTL and use
+    # count — via args or OPENBAO_SECRET_ID_TTL / OPENBAO_SECRET_ID_NUM_USES.
+    if secret_id_ttl is None:
+        secret_id_ttl = os.environ.get("OPENBAO_SECRET_ID_TTL", "0")
+    if secret_id_num_uses is None:
+        secret_id_num_uses = int(os.environ.get("OPENBAO_SECRET_ID_NUM_USES", "0"))
     if policy_hcl is None:
         # Least-privilege: read the app's KV secrets, nothing else.
         policy_hcl = (f'path "{kv}/data/*" {{ capabilities = ["read"] }}\n'
@@ -350,8 +359,8 @@ def configure_approle(role_name: str, *, mount: str = APPROLE_MOUNT,
                     json_body={"token_policies": [policy_name],
                                "token_ttl": token_ttl,
                                "token_max_ttl": token_max_ttl,
-                               "secret_id_ttl": "0",       # dev: doesn't expire
-                               "secret_id_num_uses": 0}),  # dev: unlimited uses
+                               "secret_id_ttl": secret_id_ttl,
+                               "secret_id_num_uses": secret_id_num_uses}),
            f"create approle role '{role_name}'")
     rid = _check(_request("GET", f"auth/{mount}/role/{role_name}/role-id",
                           token=tok, addr=addr), "read role-id")

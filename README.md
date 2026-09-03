@@ -638,6 +638,30 @@ every module and all HTTP endpoints. CI (`.github/workflows/ci.yml`) runs lint
 
 ## Production hardening
 
+### Going to production: the dev-only shortcuts to replace
+
+This stack is a **local dev / demo** setup. Several deliberate shortcuts make it
+"just work" locally but are **not** production-safe. Before any real deployment:
+
+- **OpenBao auto-unseal.** The `openbao/entrypoint.sh` stores the unseal key in
+  plaintext in the data volume so it can auto-unseal on boot. In production,
+  remove that and use a real **auto-unseal** (a cloud KMS seal, or a `transit`
+  seal backed by a separate OpenBao) so the master key is never persisted. Also
+  drop `user: "0:0"` and the loopback `127.0.0.1:8200` publish on the openbao
+  service, and don't keep `bao-init.json` around.
+- **AppRole secret_id.** Defaults to never-expire / unlimited-use for dev
+  convenience. Set a finite lifetime with `OPENBAO_SECRET_ID_TTL` and
+  `OPENBAO_SECRET_ID_NUM_USES` (or the `configure_approle` args), and deliver the
+  secret_id to the app via a wrapped/response-wrapped token rather than plain env.
+- **The CA and cert.** The internal root CA is self-signed and trusted manually
+  per-machine. Use an intermediate signed by your org's real root (or ACME/real
+  certs) so clients trust it without manual keychain steps.
+- **Storage.** OpenBao's `file` backend is deprecated by v2.7 — migrate to a
+  supported backend (raft/integrated storage) before upgrading past it.
+- **Secrets.** Put real values in Key Vault / OpenBao KV, not demo data, and
+  scope the AppRole policy to only the paths the app needs (it already grants
+  read-only on the KV data path).
+
 ### Rate limiting (implemented)
 
 `/token` (credential brute-force) and `/register` (signup spam) are rate-limited
