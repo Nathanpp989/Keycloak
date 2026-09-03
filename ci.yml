@@ -115,3 +115,92 @@ jobs:
       - name: Keycloak logs on failure
         if: failure()
         run: docker logs kc | tail -50
+
+  smoke:
+    runs-on: ubuntu-latest
+    # End-to-end curl smoke test of the auth broker: start Keycloak + the app,
+    # then run smoke-test.sh (health, M2M tokens, scope guards, user login). This
+    # catches regressions in the LIVE auth path that unit tests can't — the exact
+    # class of breakage seen in practice (bad provisioning, missing scope, etc.).
+    # Runs the app as a process against localhost (no Traefik/OpenBao needed);
+    # Traefik routing + TLS are infra, exercised on the host via bootstrap.sh.
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install requests
+
+      # Same detached-container approach as live-integration (service containers
+      # can't pass Keycloak's required "start-dev" command).
+      - name: Start Keycloak (start-dev)
+        run: |
+          docker run -d --name kc -p 8080:8080 \
+            -e KC_BOOTSTRAP_ADMIN_USERNAME=admin \
+            -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+            quay.io/keycloak/keycloak:26.4.0 start-dev --features=organization
+          echo "Waiting for Keycloak on :8080 ..."
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/realms/master || true)
+            if [ "$code" = "200" ]; then echo "Keycloak ready after ${i}0s"; exit 0; fi
+            sleep 5
+          done
+          echo "Keycloak did not become ready in time"; docker logs kc | tail -30; exit 1
+
+      - name: Start app and run smoke test
+        env:
+          KEYCLOAK_URL: http://localhost:8080
+          KEYCLOAK_REALM: Premkey
+          KEYCLOAK_ADMIN_USER: admin
+          KEYCLOAK_ADMIN_PASSWORD: admin
+          DEFAULT_USER_PASSWORD: testpass123
+          ADMIN_USER_PASSWORD: testpass123
+          # Hermetic: optional subsystems off (no Auth0 / OpenBao needed).
+          AUTH0_DOMAIN: x
+          AUTH0_CLIENT_ID: x
+          AUTH0_CLIENT_SECRET: x
+          OPENBAO_MODE: "off"
+          AUTH0_MANAGEMENT_MODE: "off"
+          KEY_DIR: /tmp/keys
+          HOST: 0.0.0.0          # bind all interfaces so the smoke curls reach it
+          PORT: "8000"
+        run: |
+          set -e
+          mkdir -p /tmp/keys
+          # Start the app; it provisions Keycloak (realm, client, scope, roles) on startup.
+          python main.py > /tmp/app.log 2>&1 &
+          APP_PID=$!
+          echo "Waiting for the app on :8000 ..."
+          ready=""
+          for i in $(seq 1 40); do
+            if [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/health/live || true)" = "200" ]; then
+              ready=1; echo "App ready"; break
+            fi
+            # fail fast if the app process died
+            kill -0 "$APP_PID" 2>/dev/null || { echo "app process exited early"; cat /tmp/app.log; exit 1; }
+            sleep 2
+          done
+          [ -n "$ready" ] || { echo "app did not become ready"; cat /tmp/app.log; kill "$APP_PID" 2>/dev/null; exit 1; }
+
+          SMOKE=smoke-test.sh; [ -f "$SMOKE" ] || SMOKE=smoke_test.sh
+          chmod +x "$SMOKE" || true
+          BASE=http://localhost:8000 KC=http://localhost:8080 REALM=Premkey \
+            CLIENT=Hello-World-app ADMIN_USER=admin ADMIN_PASS=admin \
+            TEST_USER=user TEST_PASS=testpass123 bash "$SMOKE"
+          rc=$?
+          kill "$APP_PID" 2>/dev/null || true
+          exit $rc
+
+      - name: App + Keycloak logs on failure
+        if: failure()
+        run: |
+          echo "=== app ==="; tail -60 /tmp/app.log 2>/dev/null || true
+          echo "=== keycloak ==="; docker logs kc 2>/dev/null | tail -40 || true
