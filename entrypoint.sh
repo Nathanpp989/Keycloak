@@ -60,7 +60,37 @@ done
 [ "$i" -lt 30 ] || die "OpenBao API did not come up within 30s"
 log "server is up"
 
-# ── initialize once ─────────────────────────────────────────────────────────
+# ── initialize + unseal ─────────────────────────────────────────────────────
+# PRODUCTION mode (BAO_AUTO_UNSEAL=1): the server auto-unseals via a `seal`
+# stanza in its config (KMS/transit) — the master key is held by the seal and
+# never by us. We only initialize once (producing RECOVERY keys, not unseal
+# keys) and never run a manual unseal. This is spec-correct per OpenBao's
+# auto-unseal, but must be verified against YOUR real seal — see the README
+# "production auto-unseal" runbook.
+if [ "${BAO_AUTO_UNSEAL:-0}" = "1" ]; then
+  if ! bao operator init -status >/dev/null 2>&1; then
+    log "initializing OpenBao (seal-backed auto-unseal, first run)"
+    bao operator init -recovery-shares=1 -recovery-threshold=1 -format=json \
+      > "$INIT_FILE" \
+      || die "operator init failed — check the seal stanza and that the seal is reachable"
+    chmod 600 "$INIT_FILE" 2>/dev/null || true
+    log "initialized; recovery keys + root token in $INIT_FILE — store securely, then remove"
+  else
+    log "already initialized (seal-backed auto-unseal)"
+  fi
+  # The seal auto-unseals the server; wait for it, don't run a manual unseal.
+  i=0
+  while [ "$i" -lt 15 ]; do bao status >/dev/null 2>&1 && break; i=$((i + 1)); sleep 1; done
+  if bao status >/dev/null 2>&1; then
+    log "auto-unsealed via seal — OpenBao is ready"
+  else
+    die "seal did not auto-unseal (check the seal stanza / seal availability)"
+  fi
+  wait "$SERVER_PID"
+  exit 0
+fi
+
+# ── DEV mode (default): Shamir init, key persisted in the volume, manual unseal
 if ! bao operator init -status >/dev/null 2>&1; then
   log "initializing OpenBao (first run)"
   if ! bao operator init -key-shares=1 -key-threshold=1 -format=json > "$INIT_FILE"; then
@@ -71,15 +101,22 @@ else
   log "already initialized (reusing $INIT_FILE)"
 fi
 
-# ── unseal ──────────────────────────────────────────────────────────────────
-UNSEAL="$(tr -d '\n' < "$INIT_FILE" 2>/dev/null | sed -n 's/.*"unseal_keys_b64":[[:space:]]*\[[[:space:]]*"\([^"]*\)".*/\1/p')"
-[ -n "$UNSEAL" ] || die "no unseal key in $INIT_FILE (init failed, or the file is stale — remove the openbao-data volume and re-up)"
+# Unseal: prefer an externally-provided key (production: from a Docker secret /
+# secret manager, so the key need not live in the data volume); otherwise read
+# it from the init file (dev).
+if [ -n "${BAO_UNSEAL_KEY:-}" ]; then
+  UNSEAL="$BAO_UNSEAL_KEY"
+  log "unsealing with externally-provided BAO_UNSEAL_KEY"
+else
+  UNSEAL="$(tr -d '\n' < "$INIT_FILE" 2>/dev/null | sed -n 's/.*"unseal_keys_b64":[[:space:]]*\[[[:space:]]*"\([^"]*\)".*/\1/p')"
+  [ -n "$UNSEAL" ] || die "no unseal key in $INIT_FILE (init failed, or the file is stale — remove the openbao-data volume and re-up)"
+fi
 bao operator unseal "$UNSEAL" >/dev/null 2>&1 || true
 
 if bao status >/dev/null 2>&1; then
   log "unsealed — OpenBao is ready"
 else
-  die "unseal did not take (still sealed). The key in $INIT_FILE likely doesn't match the stored data — remove the openbao-data volume and re-up to reinitialize."
+  die "unseal did not take (still sealed). The key likely doesn't match the stored data — remove the openbao-data volume and re-up to reinitialize."
 fi
 
 # ── hand off: keep the server in the foreground so signals propagate ────────

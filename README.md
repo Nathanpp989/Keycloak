@@ -662,6 +662,33 @@ This stack is a **local dev / demo** setup. Several deliberate shortcuts make it
   scope the AppRole policy to only the paths the app needs (it already grants
   read-only on the KV data path).
 
+#### Production auto-unseal (the #1 item) — runbook
+
+The dev entrypoint stores the unseal key in plaintext to auto-unseal. Production
+replaces this so the master key is held by a seal (KMS/transit) and never
+persisted. The pieces are shipped but **must be verified against your real seal**
+— they could not be run in the dev sandbox.
+
+1. **Provide a seal.** A cloud KMS (Azure Key Vault fits this stack's existing
+   Azure usage) or a separate "transit" OpenBao whose token has encrypt/decrypt
+   on a wrapping key.
+2. **Config.** Copy `openbao/config.transit.hcl.example` to
+   `openbao/config.transit.hcl`, keep exactly one `seal` stanza and fill it in.
+   It also switches storage `file` -> `raft` and enables listener TLS.
+3. **Entrypoint mode.** Set `BAO_AUTO_UNSEAL=1` on the openbao service. The
+   entrypoint then initializes with RECOVERY keys (not unseal keys) and lets the
+   seal auto-unseal the server — no manual unseal, no persisted unseal key.
+4. **Compose edits** (a prod overlay): mount `config.transit.hcl` instead of
+   `config.hcl`, drop `user: "0:0"` (run non-root against a writable volume),
+   drop the `127.0.0.1:8200:8200` publish, set `BAO_AUTO_UNSEAL=1`.
+5. **Verify on your infra:** `docker compose logs openbao` shows
+   `auto-unsealed via seal — OpenBao is ready`, a restart comes back unsealed
+   with no unseal key anywhere, and the data volume holds no unseal key.
+
+Intermediate option (better than dev, simpler than KMS): set `BAO_UNSEAL_KEY`
+from a Docker secret — the entrypoint unseals from it and never reads the key
+from the volume.
+
 ### Rate limiting (implemented)
 
 `/token` (credential brute-force) and `/register` (signup spam) are rate-limited
