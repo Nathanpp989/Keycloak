@@ -123,6 +123,15 @@ services:
     # auto-unseal). See openbao/entrypoint.sh. The fixed 'root' token is gone;
     # the real root token is generated on first init (read it with:
     #   docker compose exec openbao cat /openbao/data/bao-init.json ).
+    environment:
+      # Optional, no cloud needed: unseal from an external key instead of the
+      # plaintext key in the data volume. Set BAO_UNSEAL_KEY (ideally from a
+      # Docker/compose secret, not inline) and the entrypoint unseals from it and
+      # never reads the key from the volume. Blank = dev default (volume file).
+      BAO_UNSEAL_KEY: ${BAO_UNSEAL_KEY:-}
+      # Full production auto-unseal (KMS/transit): set BAO_AUTO_UNSEAL=1 and mount
+      # openbao/config.transit.hcl (with a seal stanza) instead of config.hcl.
+      BAO_AUTO_UNSEAL: ${BAO_AUTO_UNSEAL:-0}
     image: quay.io/openbao/openbao:latest
     entrypoint: ["/bin/sh", "/openbao/entrypoint.sh"]
     # Local-dev: run as root so the container can write the named data volume
