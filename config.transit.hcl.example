@@ -1,0 +1,57 @@
+# openbao/config.transit.hcl.EXAMPLE — production OpenBao config with auto-unseal.
+#
+# *** TEMPLATE — verify against YOUR real seal before relying on it. ***
+# This was written to the OpenBao auto-unseal spec but could NOT be live-verified
+# in the dev sandbox (it needs a real KMS or a separate transit OpenBao). Copy to
+# openbao/config.transit.hcl, fill in the blanks, and confirm the server
+# auto-unseals on YOUR infrastructure.
+#
+# Used with BAO_AUTO_UNSEAL=1 (see openbao/entrypoint.sh): the master key is held
+# by the seal and is NEVER persisted next to the data — this replaces the dev
+# entrypoint's plaintext unseal key.
+
+# Integrated (raft) storage — the supported backend. The dev stack uses `file`,
+# which OpenBao deprecates by v2.7; migrate to raft for production.
+storage "raft" {
+  path    = "/openbao/data"
+  node_id = "openbao-1"
+}
+
+listener "tcp" {
+  address = "0.0.0.0:8200"
+  # Terminate TLS at OpenBao in production (or at a trusted proxy). Do NOT ship
+  # tls_disable = true to prod.
+  tls_cert_file = "/openbao/tls/cert.pem"
+  tls_key_file  = "/openbao/tls/key.pem"
+}
+
+api_addr     = "https://openbao:8200"
+cluster_addr = "https://openbao:8201"
+
+# ── Auto-unseal: choose exactly ONE seal stanza ─────────────────────────────
+
+# RECOMMENDED for this stack — Azure Key Vault (you already use Azure Key Vault
+# for app secrets, so the trust + credentials are familiar). Create a key in your
+# Vault (key type RSA), grant the identity wrap/unwrap (encrypt/decrypt), and
+# fill these in. Prefer a managed identity over a client secret when you can.
+seal "azurekeyvault" {
+  tenant_id     = "REPLACE_AZURE_TENANT_ID"
+  client_id     = "REPLACE_AZURE_CLIENT_ID"
+  client_secret = "REPLACE_AZURE_CLIENT_SECRET"   # omit if using a managed identity
+  vault_name    = "REPLACE_KEY_VAULT_NAME"
+  key_name      = "openbao-unseal"
+}
+
+# ALTERNATIVE — transit seal, backed by a SEPARATE OpenBao/Vault "seal" instance
+# that holds the wrapping key (itself unsealed by a cloud KMS/HSM). Comment out
+# the azurekeyvault stanza above and uncomment this. Grant the token only
+# encrypt/decrypt on the key.
+# seal "transit" {
+#   address    = "https://seal-openbao:8200"
+#   token      = "REPLACE_WITH_TRANSIT_TOKEN"
+#   key_name   = "autounseal"
+#   mount_path = "transit/"
+# }
+
+disable_mlock = false   # production: allow mlock (grant IPC_LOCK), don't disable
+ui            = false
