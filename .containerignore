@@ -1,0 +1,19 @@
+# Build-context excludes (used by both docker and podman)
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.git/
+.gitignore
+venv/
+.venv/
+env/
+.env
+*.pem
+tests/
+*_test.py
+test_*.py
+pytest.ini
+.github/
+README.md
+*.md
