@@ -1,7 +1,7 @@
 # Keycloak + Auth0 + Azure Key Vault Integration
 
 <!-- CI badge: replace OWNER/REPO with your GitHub path (e.g. Nathanpp989/keycloak-auth-broker). -->
-[![CI](https://github.com/OWNER/REPO/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/ci.yml)
+[![CI](https://github.com/Nathanpp989/Keycloak/actions/workflows/ci.yml/badge.svg)](https://github.com/Nathanpp989/Keycloak/actions/workflows/ci.yml)
 
 A FastAPI application that brokers user authentication through Keycloak, with
 Auth0 wired in as an upstream OIDC identity provider (so users can log in via
