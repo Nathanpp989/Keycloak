@@ -50,3 +50,4 @@ coverage.xml
 
 # ── Container build context leftovers ───────────────────────────────────────
 *.log
+openbao/config.transit.hcl
