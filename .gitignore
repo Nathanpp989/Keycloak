@@ -63,3 +63,4 @@ openbao/bao-init.json
 **/bao-init.json
 premalytics-broker-synced.tar.gz
 MANIFEST.txt
+.env.broken.bak
