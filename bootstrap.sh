@@ -22,11 +22,25 @@
 set -uo pipefail
 
 DO_CERT=1
-[ "${1:-}" = "--no-cert" ] && DO_CERT=0
+DO_PROVISION=0
+for arg in "$@"; do
+  case "$arg" in
+    --no-cert)   DO_CERT=0 ;;
+    --provision) DO_PROVISION=1 ;;
+  esac
+done
 
 command -v docker >/dev/null 2>&1 || { echo "error: docker not found"; exit 1; }
 docker info >/dev/null 2>&1 || { echo "error: Docker daemon not running — start Docker Desktop first."; exit 1; }
 [ -f compose.yaml ] || [ -f docker-compose.yml ] || { echo "error: run from the stack directory (no compose file here)"; exit 1; }
+
+# ── 0. preflight: catch a corrupt .env BEFORE anything sources it ────────────
+if [ -f .env ] && [ -x ./check-env.sh ]; then
+  if ! ./check-env.sh .env; then
+    echo "error: .env has problems (above) — fix it before bringing the stack up." >&2
+    exit 1
+  fi
+fi
 
 # ── 1. full stack up (prefer stack_up.sh, which also clears port conflicts) ──
 echo "==> Bringing up the FULL stack..."
@@ -71,6 +85,16 @@ if [ "$DO_CERT" -eq 1 ]; then
     else
       echo "    cert issuance failed (see output above) — stack is up, TLS may be stale."
     fi
+  fi
+fi
+
+# ── 3b. optional: provision AppRole + KV and write role_id/secret_id to .env ──
+if [ "$DO_PROVISION" -eq 1 ]; then
+  if [ -x ./provision.sh ]; then
+    echo "==> Provisioning OpenBao AppRole + KV..."
+    ./provision.sh || echo "    provisioning failed (see above) — stack is still up."
+  else
+    echo "    --provision requested but ./provision.sh not found or not executable."
   fi
 fi
 
