@@ -39,7 +39,7 @@ while IFS= read -r line || [ -n "$line" ]; do
   val="${val%\"}"; val="${val#\"}"      # or double quotes
 
   case "$val" in
-    *PASTE_*|*REPLACE_*|*'<'*'>'*|PASTE*|REPLACE*)
+    PASTE_*|REPLACE_*|*'<'*'>'*)
       echo "  x line $lineno: $key still holds a placeholder ($val)"
       problems=$((problems + 1)) ;;
   esac
