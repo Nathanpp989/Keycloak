@@ -8,9 +8,9 @@ b7ba148095d6be8b  auth0_test.py
 6f06039ea7146365  auth0_type.py
 30e4a8271fcd05ea  authorize.py
 b8c1411faf5f4b33  authz.py
-c4885f35a873b601  bootstrap.sh
+46cdc3a352f96d6c  bootstrap.sh
 7d2a18ba370d06a6  BUG_FIXES.md
-24bbab672b253748  check_env.sh
+7b9db37bf1c576c0  check_env.sh
 9d5abeab9b66aa6d  ci.yml
 e4f70c15ecfd8bed  compose.yaml
 24ab9206046e64c8  config.hcl
