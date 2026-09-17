@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPBearer
 from authorize import router as auth0_router, oauth2_scheme
 from keycloak import KeycloakOpenID, KeycloakAdmin
-from keycloak.exceptions import KeycloakAuthenticationError
+from keycloak.exceptions import KeycloakAuthenticationError, KeycloakPostError
 
 # User-flow integration (auth0_connect.py / auth0_talk.py / auth0_type.py)
 from auth0_connect import Auth0Connect, get_keycloak_admin_token
@@ -888,6 +888,19 @@ def health_ready():
 def read_hello(email: str, username: str):
     return {"email": email, "username": username}
 
+def _shape_token_response(tr: dict) -> dict:
+    """Normalize a Keycloak token response for clients. Always returns
+    access_token + token_type; includes refresh_token and expires_in only when
+    Keycloak provided them (so a password grant hands the client what it needs to
+    refresh, while responses without those fields stay minimal)."""
+    out = {"access_token": tr["access_token"], "token_type": "bearer"}
+    if tr.get("refresh_token"):
+        out["refresh_token"] = tr["refresh_token"]
+    if tr.get("expires_in") is not None:
+        out["expires_in"] = tr["expires_in"]
+    return out
+
+
 @app.post("/token")
 def login(request: Request,
           username: str = Form(...), password: str = Form(...)):
@@ -909,7 +922,7 @@ def login(request: Request,
     try:
         token_response = keycloak_oidc.token(username, password)
         record_token_result("success")
-        return {"access_token": token_response["access_token"], "token_type": "bearer"}
+        return _shape_token_response(token_response)
     except KeycloakAuthenticationError:
         record_token_result("invalid_credentials")
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -922,6 +935,39 @@ def login(request: Request,
         logger.error("Token request failed for user '%s': %s",
                      username, exc, exc_info=True)
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
+@app.post("/token/refresh")
+def refresh_access_token(request: Request, refresh_token: str = Form(...)):
+    """Exchange a valid refresh token for a fresh access token, so a client can
+    stay authenticated without re-sending the user's credentials. Rate-limited
+    like /token (a refresh endpoint is a credential-bearing surface too), and it
+    fails closed: an invalid/expired refresh token is 401, an outage is 503."""
+    try:
+        from rate_limit import login_limiter, client_key
+        allowed, retry = login_limiter().check_and_consume(client_key(request))
+        if not allowed:
+            raise HTTPException(
+                status_code=429, detail="Too many refresh attempts; slow down.",
+                headers={"Retry-After": str(int(retry) + 1)})
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("rate limiter error on /token/refresh (allowing): %s", exc)
+    if keycloak_oidc is None:
+        raise HTTPException(status_code=503, detail="Authentication service unavailable")
+    try:
+        token_response = keycloak_oidc.refresh_token(refresh_token)
+        record_token_result("success")
+        return _shape_token_response(token_response)
+    except (KeycloakAuthenticationError, KeycloakPostError):
+        # invalid_grant: refresh token expired, revoked, or malformed.
+        record_token_result("invalid_credentials")
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+    except Exception as exc:
+        record_token_result("error")
+        logger.error("Refresh token request failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
 
 @app.post("/token/client")
 def client_token(request: Request,
@@ -1151,9 +1197,12 @@ def register(
     try:
         result = user_manager.add_user(email=email, password=password, username=username)
     except RuntimeError as exc:
-        # Surfaced for things like missing Auth0 scopes
+        # Surfaced for things like missing Auth0 scopes. Log the detail
+        # server-side, but don't echo the raw upstream error to the (public,
+        # unauthenticated) caller — it can leak internal config/topology.
         logger.error("Registration failed: %s", exc)
-        raise HTTPException(status_code=502, detail=str(exc))
+        raise HTTPException(status_code=502,
+                            detail="Registration failed due to an upstream error.")
     except Exception as exc:
         logger.error("Unexpected registration error: %s", exc)
         raise HTTPException(status_code=500, detail="Registration failed")

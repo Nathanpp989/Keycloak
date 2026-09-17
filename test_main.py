@@ -184,7 +184,11 @@ def test_register_runtime_error_becomes_502(client, monkeypatch):
     monkeypatch.setattr(main, "user_manager", mgr)
     r = client.post("/register", data={"email": "a@x.com", "password": "pw"})
     assert r.status_code == 502
-    assert "read:users" in r.json()["detail"]
+    # /register is public: the raw upstream error must NOT leak to the client
+    # (it's logged server-side instead). Client gets a generic message.
+    detail = r.json()["detail"]
+    assert "read:users" not in detail
+    assert "upstream" in detail.lower()
 
 def test_register_unexpected_error_becomes_500(client, monkeypatch):
     mgr = MagicMock()
@@ -1940,3 +1944,52 @@ def test_ensure_client_scope_survives_error():
     admin = _kc_admin_autospec()
     admin.get_client_scopes.side_effect = RuntimeError("boom")
     main.ensure_client_scope(admin, "m2m:access", "client-uuid")  # no raise
+
+
+# ── /token/refresh (refresh-token grant) ────────────────────────────────────
+
+def test_token_includes_refresh_when_keycloak_provides_it(client, monkeypatch):
+    fake = MagicMock()
+    fake.token.return_value = {
+        "access_token": "acc", "refresh_token": "ref", "expires_in": 300}
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.post("/token", data={"username": "u", "password": "p"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["access_token"] == "acc"
+    assert body["refresh_token"] == "ref"
+    assert body["expires_in"] == 300
+
+
+def test_refresh_success(client, monkeypatch):
+    fake = MagicMock()
+    fake.refresh_token.return_value = {
+        "access_token": "new-acc", "refresh_token": "new-ref", "expires_in": 300}
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.post("/token/refresh", data={"refresh_token": "old-ref"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["access_token"] == "new-acc"
+    assert body["refresh_token"] == "new-ref"
+    fake.refresh_token.assert_called_once_with("old-ref")
+
+
+def test_refresh_invalid_token_is_401(client, monkeypatch):
+    from keycloak.exceptions import KeycloakPostError
+    fake = MagicMock()
+    fake.refresh_token.side_effect = KeycloakPostError("invalid_grant")
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.post("/token/refresh", data={"refresh_token": "expired"})
+    assert r.status_code == 401
+
+
+def test_refresh_service_unavailable_is_503(client, monkeypatch):
+    monkeypatch.setattr(main, "keycloak_oidc", None)
+    r = client.post("/token/refresh", data={"refresh_token": "x"})
+    assert r.status_code == 503
+
+
+def test_refresh_requires_refresh_token_param(client, monkeypatch):
+    monkeypatch.setattr(main, "keycloak_oidc", MagicMock())
+    r = client.post("/token/refresh", data={})
+    assert r.status_code == 422
