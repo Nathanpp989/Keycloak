@@ -68,6 +68,10 @@ services:
       - ./traefik/dynamic:/etc/traefik/dynamic:ro
     depends_on:
       app:
+        # Start once the app container starts; ROUTING to the app is gated on its
+        # health via the Traefik loadbalancer healthcheck label (see the app
+        # service), so Traefik itself comes up immediately and keycloak.localhost
+        # / openbao.localhost stay reachable even while the app is still starting.
         condition: service_started
     networks:
       default:
@@ -219,6 +223,13 @@ services:
       - "traefik.http.routers.app-public.priority=100"
       - "traefik.http.routers.app-protected.priority=1"
       - "traefik.http.services.app.loadbalancer.server.port=8000"
+      # Gate routing on app health: Traefik polls /health/live and only sends
+      # traffic once the app is ready. This closes the startup 404 window (the
+      # Docker provider otherwise routes as soon as the container is discovered)
+      # WITHOUT coupling Traefik's own startup to the app.
+      - "traefik.http.services.app.loadbalancer.healthcheck.path=/health/live"
+      - "traefik.http.services.app.loadbalancer.healthcheck.interval=10s"
+      - "traefik.http.services.app.loadbalancer.healthcheck.timeout=3s"
     environment:
       # Point the app at the Keycloak service by its compose network name.
       KEYCLOAK_URL: http://keycloak:8080
@@ -371,3 +382,4 @@ volumes:
   grafana_data:
   alertmanager_data:
   openbao-data:      # persistent OpenBao storage (PKI CA survives restarts)
+# stray
