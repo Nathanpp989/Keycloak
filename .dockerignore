@@ -13,6 +13,7 @@ env/
 tests/
 *_test.py
 test_*.py
+conftest.py
 pytest.ini
 .github/
 README.md
