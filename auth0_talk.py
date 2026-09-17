@@ -18,6 +18,10 @@ import time
 
 import requests
 
+# Shared session so sequential calls (e.g. pagination) reuse the TCP+TLS
+# connection to Keycloak/Auth0 instead of dialing a new one each time.
+_SESSION = requests.Session()
+
 from auth0_connect import (
     Auth0Connect,
     get_keycloak_admin_token,
@@ -94,7 +98,7 @@ class KeycloakAdminAPI:
         List users in the realm. J1 FIX: Keycloak paginates (default 100).
         Pass first/max_results to page through; this returns one page.
         """
-        resp = requests.get(
+        resp = _SESSION.get(
             self._users_url(),
             headers=self.headers,
             params={"first": first, "max": max_results},
@@ -104,7 +108,7 @@ class KeycloakAdminAPI:
         return resp.json()
 
     def read_user(self, user_id: str) -> dict:
-        resp = requests.get(self._users_url(user_id), headers=self.headers, timeout=10)
+        resp = _SESSION.get(self._users_url(user_id), headers=self.headers, timeout=10)
         if resp.status_code == 200:
             return resp.json()
         logger.error("Failed to read Keycloak user: %d %s", resp.status_code, resp.text)
@@ -121,7 +125,7 @@ class KeycloakAdminAPI:
                 {"type": "password", "value": password, "temporary": False}
             ],
         }
-        resp = requests.post(self._users_url(), headers=self.headers, json=payload, timeout=10)
+        resp = _SESSION.post(self._users_url(), headers=self.headers, json=payload, timeout=10)
         if resp.status_code == 201:
             location = resp.headers.get("Location", "")
             user_id = location.rstrip("/").split("/")[-1] if location else None
@@ -143,7 +147,7 @@ class KeycloakAdminAPI:
         """
         current = self.read_user(user_id)
         current.update(fields)
-        resp = requests.put(self._users_url(user_id), headers=self.headers, json=current, timeout=10)
+        resp = _SESSION.put(self._users_url(user_id), headers=self.headers, json=current, timeout=10)
         if resp.status_code in (200, 204):
             logger.info("Keycloak user %s updated", user_id)
         else:
@@ -151,7 +155,7 @@ class KeycloakAdminAPI:
             resp.raise_for_status()
 
     def delete_user(self, user_id: str) -> None:
-        resp = requests.delete(self._users_url(user_id), headers=self.headers, timeout=10)
+        resp = _SESSION.delete(self._users_url(user_id), headers=self.headers, timeout=10)
         if resp.status_code == 204:
             logger.info("Keycloak user %s deleted", user_id)
         else:
@@ -166,7 +170,7 @@ class KeycloakAdminAPI:
         segment means the group is a subgroup.
         """
         url = f"{self.base}/admin/realms/{self.realm}/users/{user_id}/groups"
-        resp = requests.get(url, headers=self.headers, timeout=10)
+        resp = _SESSION.get(url, headers=self.headers, timeout=10)
         resp.raise_for_status()
         groups = []
         for g in resp.json():
@@ -187,12 +191,12 @@ class KeycloakAdminAPI:
         """
         base = f"{self.base}/admin/realms/{self.realm}/users/{user_id}/role-mappings"
         # Realm roles
-        realm_resp = requests.get(f"{base}/realm", headers=self.headers, timeout=10)
+        realm_resp = _SESSION.get(f"{base}/realm", headers=self.headers, timeout=10)
         realm_resp.raise_for_status()
         realm_roles = [r.get("name", "") for r in realm_resp.json()]
         # Client roles (across all clients) — the composite view lists them
         client_roles: list[str] = []
-        all_resp = requests.get(base, headers=self.headers, timeout=10)
+        all_resp = _SESSION.get(base, headers=self.headers, timeout=10)
         if all_resp.ok:
             data = all_resp.json()
             for client_entry in (data.get("clientMappings") or {}).values():
@@ -202,7 +206,7 @@ class KeycloakAdminAPI:
     def get_realm_role(self, role_name: str) -> dict | None:
         """Fetch a realm role's full representation (needed for assignment)."""
         url = f"{self.base}/admin/realms/{self.realm}/roles/{role_name}"
-        resp = requests.get(url, headers=self.headers, timeout=10)
+        resp = _SESSION.get(url, headers=self.headers, timeout=10)
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
@@ -218,7 +222,7 @@ class KeycloakAdminAPI:
         if role is None:
             raise ValueError(f"Keycloak realm role '{role_name}' not found")
         url = f"{self.base}/admin/realms/{self.realm}/users/{user_id}/role-mappings/realm"
-        resp = requests.post(url, headers=self.headers, json=[role], timeout=10)
+        resp = _SESSION.post(url, headers=self.headers, json=[role], timeout=10)
         if resp.status_code in (204, 201):
             logger.info("Assigned realm role '%s' to user %s", role_name, user_id)
         else:
@@ -234,7 +238,7 @@ class KeycloakAdminAPI:
         if role is None:
             raise ValueError(f"Keycloak realm role '{role_name}' not found")
         url = f"{self.base}/admin/realms/{self.realm}/users/{user_id}/role-mappings/realm"
-        resp = requests.delete(url, headers=self.headers, json=[role], timeout=10)
+        resp = _SESSION.delete(url, headers=self.headers, json=[role], timeout=10)
         if resp.status_code in (204, 404):
             logger.info("Revoked realm role '%s' from user %s", role_name, user_id)
         else:
@@ -271,7 +275,7 @@ class KeycloakAdminAPI:
     def send_verify_email(self, user_id: str) -> None:
         """Trigger Keycloak's built-in verification email (requires realm SMTP)."""
         url = f"{self._users_url(user_id)}/send-verify-email"
-        resp = requests.put(url, headers=self.headers, timeout=10)
+        resp = _SESSION.put(url, headers=self.headers, timeout=10)
         if resp.status_code not in (200, 204):
             logger.error("send-verify-email failed: %d %s", resp.status_code, resp.text)
             resp.raise_for_status()
@@ -281,7 +285,7 @@ class KeycloakAdminAPI:
         """Set a new password. temporary=True forces a change at next login."""
         url = f"{self._users_url(user_id)}/reset-password"
         payload = {"type": "password", "value": new_password, "temporary": temporary}
-        resp = requests.put(url, headers=self.headers, json=payload, timeout=10)
+        resp = _SESSION.put(url, headers=self.headers, json=payload, timeout=10)
         if resp.status_code not in (200, 204):
             logger.error("reset-password failed: %d %s", resp.status_code, resp.text)
             resp.raise_for_status()
@@ -289,7 +293,7 @@ class KeycloakAdminAPI:
     def send_reset_password_email(self, user_id: str) -> None:
         """Email the user a link to set a new password (requires realm SMTP)."""
         url = f"{self._users_url(user_id)}/execute-actions-email"
-        resp = requests.put(url, headers=self.headers,
+        resp = _SESSION.put(url, headers=self.headers,
                             json=["UPDATE_PASSWORD"], timeout=10)
         if resp.status_code not in (200, 204):
             logger.error("execute-actions-email failed: %d %s", resp.status_code, resp.text)
@@ -298,14 +302,14 @@ class KeycloakAdminAPI:
     def list_user_sessions(self, user_id: str) -> list[dict]:
         """Return the user's active sessions."""
         url = f"{self._users_url(user_id)}/sessions"
-        resp = requests.get(url, headers=self.headers, timeout=10)
+        resp = _SESSION.get(url, headers=self.headers, timeout=10)
         resp.raise_for_status()
         return resp.json()
 
     def logout_user(self, user_id: str) -> None:
         """Invalidate all of the user's sessions (idempotent)."""
         url = f"{self._users_url(user_id)}/logout"
-        resp = requests.post(url, headers=self.headers, timeout=10)
+        resp = _SESSION.post(url, headers=self.headers, timeout=10)
         if resp.status_code not in (200, 204):
             logger.error("logout failed: %d %s", resp.status_code, resp.text)
             resp.raise_for_status()
@@ -328,7 +332,7 @@ class KeycloakAdminAPI:
         out: list[dict] = []
         first, page_size = 0, 100
         while True:
-            resp = requests.get(self._groups_url(), headers=self.headers,
+            resp = _SESSION.get(self._groups_url(), headers=self.headers,
                                 params={"first": first, "max": page_size},
                                 timeout=10)
             resp.raise_for_status()
@@ -347,10 +351,10 @@ class KeycloakAdminAPI:
         subGroups inline, so use the dedicated /children endpoint (falling back
         to the inline field on older Keycloak).
         """
-        resp = requests.get(f"{self._groups_url(group_id)}/children",
+        resp = _SESSION.get(f"{self._groups_url(group_id)}/children",
                             headers=self.headers, timeout=10)
         if resp.status_code == 404:
-            parent = requests.get(self._groups_url(group_id),
+            parent = _SESSION.get(self._groups_url(group_id),
                                   headers=self.headers, timeout=10)
             parent.raise_for_status()
             return parent.json().get("subGroups") or []
@@ -395,7 +399,7 @@ class KeycloakAdminAPI:
             url = f"{self._groups_url(parent_id)}/children"
         else:
             url = self._groups_url()
-        resp = requests.post(url, headers=self.headers, json={"name": name}, timeout=10)
+        resp = _SESSION.post(url, headers=self.headers, json={"name": name}, timeout=10)
         if resp.status_code == 201:
             # Keycloak returns the new group's URL in Location
             location = resp.headers.get("Location", "")
@@ -415,13 +419,13 @@ class KeycloakAdminAPI:
                 # Q6 FIX: Keycloak 23+ (this project is on 26) does NOT return
                 # subGroups inline on GET /groups/{id}; query the dedicated
                 # /children endpoint instead, or the subgroup is never found.
-                children = requests.get(
+                children = _SESSION.get(
                     f"{self._groups_url(parent_id)}/children",
                     headers=self.headers, timeout=10,
                 )
                 if children.status_code == 404:
                     # Older Keycloak: fall back to the inline subGroups field
-                    parent = requests.get(self._groups_url(parent_id),
+                    parent = _SESSION.get(self._groups_url(parent_id),
                                           headers=self.headers, timeout=10)
                     parent.raise_for_status()
                     child_list = parent.json().get("subGroups") or []
@@ -439,7 +443,7 @@ class KeycloakAdminAPI:
     def add_user_to_group(self, user_id: str, group_id: str) -> None:
         """Add a Keycloak user to a group (idempotent)."""
         url = f"{self._users_url(user_id)}/groups/{group_id}"
-        resp = requests.put(url, headers=self.headers, timeout=10)
+        resp = _SESSION.put(url, headers=self.headers, timeout=10)
         if resp.status_code in (201, 204):
             logger.info("Added Keycloak user %s to group %s", user_id, group_id)
         else:
@@ -449,7 +453,7 @@ class KeycloakAdminAPI:
     def remove_user_from_group(self, user_id: str, group_id: str) -> None:
         """Revoke a Keycloak user's membership in a group (idempotent)."""
         url = f"{self._users_url(user_id)}/groups/{group_id}"
-        resp = requests.delete(url, headers=self.headers, timeout=10)
+        resp = _SESSION.delete(url, headers=self.headers, timeout=10)
         if resp.status_code in (204, 404):
             logger.info("Removed Keycloak user %s from group %s", user_id, group_id)
         else:
@@ -462,11 +466,11 @@ class KeycloakAdminAPI:
         Keycloak's group PUT replaces the representation, so we read-modify-write
         to avoid dropping other fields.
         """
-        get_resp = requests.get(self._groups_url(group_id), headers=self.headers, timeout=10)
+        get_resp = _SESSION.get(self._groups_url(group_id), headers=self.headers, timeout=10)
         get_resp.raise_for_status()
         current = get_resp.json()
         current.update(fields)
-        resp = requests.put(self._groups_url(group_id), headers=self.headers,
+        resp = _SESSION.put(self._groups_url(group_id), headers=self.headers,
                           json=current, timeout=10)
         if resp.status_code in (200, 204):
             logger.info("Updated Keycloak group %s", group_id)
@@ -476,7 +480,7 @@ class KeycloakAdminAPI:
 
     def delete_group(self, group_id: str) -> None:
         """Delete a Keycloak group (and its subgroups). Idempotent on 404."""
-        resp = requests.delete(self._groups_url(group_id), headers=self.headers, timeout=10)
+        resp = _SESSION.delete(self._groups_url(group_id), headers=self.headers, timeout=10)
         if resp.status_code in (204, 404):
             logger.info("Deleted Keycloak group %s", group_id)
         else:
@@ -502,7 +506,7 @@ class Auth0UsersAPI:
 
     def list_users(self, page: int = 0, per_page: int = 50) -> list:
         """List Auth0 users. J1 FIX: Auth0 paginates (default 50). Returns one page."""
-        resp = requests.get(
+        resp = _SESSION.get(
             self.base,
             headers=self.headers,
             params={"page": page, "per_page": per_page},
@@ -515,7 +519,7 @@ class Auth0UsersAPI:
     def create_user(self, email: str, password: str,
                     connection: str = "Username-Password-Authentication") -> dict:
         payload = {"email": email, "password": password, "connection": connection}
-        resp = requests.post(self.base, headers=self.headers, json=payload, timeout=10)
+        resp = _SESSION.post(self.base, headers=self.headers, json=payload, timeout=10)
         _explain_403(resp, "create:users")
         if resp.status_code == 201:
             logger.info("Auth0 user '%s' created", email)
@@ -535,7 +539,7 @@ class Auth0UsersAPI:
         return {}
 
     def delete_user(self, user_id: str) -> None:
-        resp = requests.delete(f"{self.base}/{user_id}", headers=self.headers, timeout=10)
+        resp = _SESSION.delete(f"{self.base}/{user_id}", headers=self.headers, timeout=10)
         _explain_403(resp, "delete:users")
         if resp.status_code == 204:
             logger.info("Auth0 user %s deleted", user_id)
@@ -549,7 +553,7 @@ class Auth0UsersAPI:
         Requires the 'read:roles' scope on the M2M application.
         """
         url = f"{self.base}/{user_id}/roles"
-        resp = requests.get(url, headers=self.headers, timeout=10)
+        resp = _SESSION.get(url, headers=self.headers, timeout=10)
         _explain_403(resp, "read:roles")
         resp.raise_for_status()
         return [r.get("name", "") for r in _as_list(resp.json(), "roles")]
@@ -563,7 +567,7 @@ class Auth0UsersAPI:
         Find an Auth0 role by name. Assignment needs the role ID, not the name.
         Requires the 'read:roles' scope.
         """
-        resp = requests.get(self._roles_base(), headers=self.headers,
+        resp = _SESSION.get(self._roles_base(), headers=self.headers,
                             params={"name_filter": role_name}, timeout=10)
         _explain_403(resp, "read:roles")
         resp.raise_for_status()
@@ -582,7 +586,7 @@ class Auth0UsersAPI:
         if role is None:
             raise ValueError(f"Auth0 role '{role_name}' not found")
         url = f"{self.base}/{user_id}/roles"
-        resp = requests.post(url, headers=self.headers,
+        resp = _SESSION.post(url, headers=self.headers,
                             json={"roles": [role["id"]]}, timeout=10)
         _explain_403(resp, "update:users")
         if resp.status_code in (200, 204):
@@ -597,7 +601,7 @@ class Auth0UsersAPI:
         if role is None:
             raise ValueError(f"Auth0 role '{role_name}' not found")
         url = f"{self.base}/{user_id}/roles"
-        resp = requests.delete(url, headers=self.headers,
+        resp = _SESSION.delete(url, headers=self.headers,
                               json={"roles": [role["id"]]}, timeout=10)
         _explain_403(resp, "update:users")
         if resp.status_code in (200, 204):
@@ -613,7 +617,7 @@ class Auth0UsersAPI:
 
     def get_user(self, user_id: str) -> dict:
         """Fetch a single Auth0 user. Requires 'read:users'."""
-        resp = requests.get(f"{self.base}/{user_id}", headers=self.headers, timeout=10)
+        resp = _SESSION.get(f"{self.base}/{user_id}", headers=self.headers, timeout=10)
         _explain_403(resp, "read:users")
         resp.raise_for_status()
         return resp.json()
@@ -648,7 +652,7 @@ class Auth0UsersAPI:
         Requires the 'update:users' scope.
         """
         url = f"{self._api_v2_base()}/jobs/verification-email"
-        resp = requests.post(url, headers=self.headers,
+        resp = _SESSION.post(url, headers=self.headers,
                              json={"user_id": user_id}, timeout=10)
         _explain_403(resp, "update:users")
         resp.raise_for_status()
@@ -665,7 +669,7 @@ class Auth0UsersAPI:
         if result_url:
             payload["result_url"] = result_url
         url = f"{self._api_v2_base()}/tickets/password-change"
-        resp = requests.post(url, headers=self.headers, json=payload, timeout=10)
+        resp = _SESSION.post(url, headers=self.headers, json=payload, timeout=10)
         _explain_403(resp, "create:user_tickets")
         resp.raise_for_status()
         ticket = resp.json().get("ticket", "")
@@ -676,7 +680,7 @@ class Auth0UsersAPI:
     def delete_sessions(self, user_id: str) -> None:
         """Delete the user's Auth0 sessions. Requires 'delete:sessions'."""
         url = f"{self.base}/{user_id}/sessions"
-        resp = requests.delete(url, headers=self.headers, timeout=10)
+        resp = _SESSION.delete(url, headers=self.headers, timeout=10)
         _explain_403(resp, "delete:sessions")
         if resp.status_code not in (200, 202, 204):
             resp.raise_for_status()
@@ -687,7 +691,7 @@ class Auth0UsersAPI:
         Requires 'delete:grants'.
         """
         url = f"{self._api_v2_base()}/grants"
-        resp = requests.delete(url, headers=self.headers,
+        resp = _SESSION.delete(url, headers=self.headers,
                                params={"user_id": user_id}, timeout=10)
         _explain_403(resp, "delete:grants")
         if resp.status_code not in (200, 204):
@@ -713,14 +717,14 @@ class Auth0OrganizationsAPI:
         }
 
     def list_organizations(self, page: int = 0, per_page: int = 50) -> list:
-        resp = requests.get(self.base, headers=self.headers,
+        resp = _SESSION.get(self.base, headers=self.headers,
                             params={"page": page, "per_page": per_page}, timeout=10)
         _explain_403(resp, "read:organizations")
         resp.raise_for_status()
         return _as_list(resp.json(), "organizations")
 
     def get_organization(self, org_id: str) -> dict:
-        resp = requests.get(f"{self.base}/{org_id}", headers=self.headers, timeout=10)
+        resp = _SESSION.get(f"{self.base}/{org_id}", headers=self.headers, timeout=10)
         _explain_403(resp, "read:organizations")
         resp.raise_for_status()
         return resp.json()
@@ -738,7 +742,7 @@ class Auth0OrganizationsAPI:
             lookup = self.normalize_org_name(name)
         except ValueError:
             return None
-        resp = requests.get(f"{self.base}/name/{lookup}", headers=self.headers, timeout=10)
+        resp = _SESSION.get(f"{self.base}/name/{lookup}", headers=self.headers, timeout=10)
         if resp.status_code == 404:
             return None
         _explain_403(resp, "read:organizations")
@@ -775,7 +779,7 @@ class Auth0OrganizationsAPI:
             logger.info("Auth0 organization '%s' already exists; reusing", norm)
             return existing
         payload = {"name": norm, "display_name": display_name or name}
-        resp = requests.post(self.base, headers=self.headers, json=payload, timeout=10)
+        resp = _SESSION.post(self.base, headers=self.headers, json=payload, timeout=10)
         _explain_403(resp, "create:organizations")
         if resp.status_code in (200, 201):
             logger.info("Created Auth0 organization '%s'", norm)
@@ -798,7 +802,7 @@ class Auth0OrganizationsAPI:
 
     def delete_organization(self, org_id: str) -> None:
         """Delete an organization. Idempotent: a 404 is treated as already gone."""
-        resp = requests.delete(f"{self.base}/{org_id}", headers=self.headers, timeout=10)
+        resp = _SESSION.delete(f"{self.base}/{org_id}", headers=self.headers, timeout=10)
         _explain_403(resp, "delete:organizations")
         if resp.status_code in (204, 404):
             logger.info("Deleted Auth0 organization %s", org_id)
@@ -808,7 +812,7 @@ class Auth0OrganizationsAPI:
 
     # ── members ────────────────────────────────────────────────
     def list_members(self, org_id: str, page: int = 0, per_page: int = 50) -> list:
-        resp = requests.get(f"{self.base}/{org_id}/members", headers=self.headers,
+        resp = _SESSION.get(f"{self.base}/{org_id}/members", headers=self.headers,
                             params={"page": page, "per_page": per_page}, timeout=10)
         _explain_403(resp, "read:organization_members")
         resp.raise_for_status()
@@ -823,7 +827,7 @@ class Auth0OrganizationsAPI:
         """
         try:
             base = self.base.rsplit("/organizations", 1)[0]
-            resp = requests.get(f"{base}/users/{user_id}/organizations",
+            resp = _SESSION.get(f"{base}/users/{user_id}/organizations",
                                 headers=self.headers,
                                 params={"per_page": 100}, timeout=10)
             if resp.status_code != 200:
@@ -834,7 +838,7 @@ class Auth0OrganizationsAPI:
 
     def add_members(self, org_id: str, user_ids: list[str]) -> None:
         """Add one or more users to an organization."""
-        resp = requests.post(f"{self.base}/{org_id}/members", headers=self.headers,
+        resp = _SESSION.post(f"{self.base}/{org_id}/members", headers=self.headers,
                             json={"members": user_ids}, timeout=10)
         _explain_403(resp, "create:organization_members")
         if resp.status_code in (200, 204):
@@ -845,7 +849,7 @@ class Auth0OrganizationsAPI:
 
     def remove_members(self, org_id: str, user_ids: list[str]) -> None:
         """Remove one or more users from an organization. Idempotent."""
-        resp = requests.delete(f"{self.base}/{org_id}/members", headers=self.headers,
+        resp = _SESSION.delete(f"{self.base}/{org_id}/members", headers=self.headers,
                              json={"members": user_ids}, timeout=10)
         _explain_403(resp, "delete:organization_members")
         if resp.status_code in (200, 204, 404):
@@ -888,7 +892,7 @@ class Auth0AuthzExtensionAPI:
             "grant_type":    "client_credentials",
         }
         try:
-            resp = requests.post(url, json=payload, timeout=10)
+            resp = _SESSION.post(url, json=payload, timeout=10)
         except requests.RequestException as exc:
             raise RuntimeError(f"Authz Extension token request failed: {exc}") from exc
         if not resp.ok:
@@ -916,7 +920,7 @@ class Auth0AuthzExtensionAPI:
         }
         url = f"{self.base}/users/{user_id}/groups"
         try:
-            resp = requests.get(url, headers=headers, timeout=10)
+            resp = _SESSION.get(url, headers=headers, timeout=10)
         except requests.RequestException as exc:
             raise RuntimeError(f"Authz Extension groups request failed: {exc}") from exc
         if resp.status_code == 403:

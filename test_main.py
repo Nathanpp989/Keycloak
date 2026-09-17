@@ -1993,3 +1993,17 @@ def test_refresh_requires_refresh_token_param(client, monkeypatch):
     monkeypatch.setattr(main, "keycloak_oidc", MagicMock())
     r = client.post("/token/refresh", data={})
     assert r.status_code == 422
+
+
+def test_subsystem_status_reports_keycloak(client, monkeypatch):
+    # /status/subsystems must report Keycloak connectivity (the core dep).
+    monkeypatch.setattr(main, "keycloak_oidc", MagicMock())
+    r = client.get("/status/subsystems")
+    assert r.status_code == 200
+    body = r.json()
+    assert "keycloak" in body
+    assert body["keycloak"]["enabled"] is True
+
+    monkeypatch.setattr(main, "keycloak_oidc", None)
+    r2 = client.get("/status/subsystems")
+    assert r2.json()["keycloak"]["enabled"] is False

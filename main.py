@@ -840,6 +840,15 @@ def subsystem_status():
         for st in (auth0_management_state(), openbao_state()):
             out[st.name] = {"enabled": st.enabled, "mode": st.mode,
                             "reason": st.reason}
+        # Keycloak is the core dependency (not optional): report whether it's
+        # connected, since a Keycloak outage is the most common cause of a 503
+        # on /token and the protected routes.
+        out["keycloak"] = {
+            "enabled": keycloak_oidc is not None,
+            "mode": "required",
+            "reason": ("connected" if keycloak_oidc is not None
+                       else "not connected (degraded start or outage)"),
+        }
         out["note"] = ("auth0 brokered-login IdP is architectural and has no "
                        "off switch; these flags cover optional surfaces only")
         return out
