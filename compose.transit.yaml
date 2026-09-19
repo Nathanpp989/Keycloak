@@ -1,0 +1,49 @@
+# compose.transit.yaml — LOCAL proof that BAO_AUTO_UNSEAL works, using a transit
+# seal (a second OpenBao as key-wrapper). No cloud needed. Once this proves the
+# mechanism, production is the same wiring with the azurekeyvault seal instead.
+#
+# RUN (from the stack dir):
+#   docker compose -f compose.yaml -f compose.transit.yaml up -d openbao-seal openbao
+#   docker compose -f compose.yaml -f compose.transit.yaml logs openbao | grep '\[entrypoint\]'
+#   -> expect: "auto-unsealed via seal — OpenBao is ready"
+#
+# Uses a SEPARATE volume (openbao-transit-data) so it never touches your real
+# shamir-initialized openbao-data. Tear down with:
+#   docker compose -f compose.yaml -f compose.transit.yaml down
+#   docker volume rm keycloak-2662_openbao-transit-data   # to reset the proof
+services:
+  openbao-seal:
+    image: quay.io/openbao/openbao:latest
+    container_name: openbao-seal
+    entrypoint: ["/bin/sh", "/openbao/seal-entrypoint.sh"]
+    environment:
+      SEAL_ROOT_TOKEN: sealroot
+      SEAL_KEY_NAME: autounseal
+    cap_add:
+      - IPC_LOCK
+    volumes:
+      - ./openbao/seal-entrypoint.sh:/openbao/seal-entrypoint.sh:ro
+    healthcheck:
+      # healthy only once the transit KEY exists — so the main bao never starts
+      # before the seal can actually wrap/unwrap (closes the startup race).
+      test: ["CMD-SHELL", "BAO_ADDR=http://127.0.0.1:8200 BAO_TOKEN=sealroot bao read transit/keys/autounseal >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  openbao:
+    entrypoint: ["/bin/sh", "/openbao/entrypoint.sh"]
+    environment:
+      BAO_AUTO_UNSEAL: "1"
+    volumes:
+      - ./openbao/config.local-transit.hcl:/openbao/config.hcl:ro
+      - ./openbao/entrypoint.sh:/openbao/entrypoint.sh:ro
+      - openbao-transit-data:/openbao/data
+    depends_on:
+      openbao-seal:
+        condition: service_healthy
+
+volumes:
+  openbao-transit-data:
+  
