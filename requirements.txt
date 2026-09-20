@@ -1,22 +1,22 @@
-fastapi>=0.110.0
-uvicorn>=0.29.0
-python-multipart>=0.0.9
-python-keycloak>=3.9.0
-python-jose[cryptography]>=3.3.0
-argon2-cffi>=23.1.0
-cryptography>=42.0.0
-azure-identity>=1.16.0
-azure-keyvault-secrets>=4.8.0
-requests>=2.31.0
-pydantic>=2.0.0
-python-dotenv>=1.0.0
-websockets>=12.0
-pyjwt>=2.8.0
-prometheus-client>=0.20.0
+fastapi==0.141.1
+uvicorn==0.53.0
+python-multipart==0.0.32
+python-keycloak==7.1.1
+python-jose[cryptography]==3.5.0
+argon2-cffi==25.1.0
+cryptography==46.0.6
+azure-identity==1.25.3
+azure-keyvault-secrets==4.11.2
+requests==2.33.1
+pydantic==2.13.5
+python-dotenv==1.2.2
+websockets==17.1
+pyjwt==2.14.0
+prometheus-client==0.26.0
 # Optional: only needed when RATE_LIMIT_BACKEND=redis (shared limits across
 # replicas). Single-replica deployments don't need it — the limiter defaults to
 # the in-process backend. Imported lazily, so an absent redis package is fine
 # unless you opt in.
-redis>=5.0.0
+redis==8.1.0
 # Test-only: exercises the Redis rate-limit backend without a real server.
-fakeredis>=2.20.0
+fakeredis==2.38.0
