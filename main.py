@@ -39,6 +39,20 @@ from authz import (  # noqa: E402
 )
 configure_logging()
 logger = logging.getLogger(__name__)
+_audit_logger = logging.getLogger("audit")
+
+
+def audit(event: str, outcome: str, **fields) -> None:
+    """Emit a structured audit record for a security-relevant event — token
+    issued/denied, refreshed, revoked, or a ForwardAuth decision. Routed to the
+    dedicated 'audit' logger so it can be retained/shipped separately from app
+    logs, and carries the request_id via the logging filter. NEVER includes token
+    values, passwords, or secrets — only identifiers and outcomes."""
+    parts = ["event=" + event, "outcome=" + outcome]
+    for k, v in fields.items():
+        if v is not None and v != "":
+            parts.append(f"{k}={v}")
+    _audit_logger.info(" ".join(parts))
 
 # ── Configuration (single source of truth) ────────────────────────────────────
 # Fix #3: realm and client id are read once here so setup, the OIDC client, and
@@ -638,6 +652,35 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(lifespan=lifespan)
+
+
+def _configure_cors(fastapi_app) -> bool:
+    """Enable CORS only when CORS_ALLOW_ORIGINS is set (comma-separated origins).
+    Off by default — the broker is server-side/ForwardAuth by default, so we don't
+    open cross-origin access unless a browser client explicitly needs it. Never
+    uses a wildcard origin together with credentials (the browser forbids it and
+    it's unsafe); allow_credentials only takes effect with explicit origins."""
+    raw = os.environ.get("CORS_ALLOW_ORIGINS", "").strip()
+    if not raw:
+        return False
+    origins = [o.strip() for o in raw.split(",") if o.strip()]
+    if not origins:
+        return False
+    creds = os.environ.get("CORS_ALLOW_CREDENTIALS", "false").strip().lower() in (
+        "1", "true", "yes", "on")
+    from fastapi.middleware.cors import CORSMiddleware
+    fastapi_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=creds and "*" not in origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    logger.info("CORS enabled for origins: %s (credentials=%s)", origins, creds)
+    return True
+
+
+_configure_cors(app)
 app.include_router(auth0_router)
 
 
@@ -931,9 +974,12 @@ def login(request: Request,
     try:
         token_response = keycloak_oidc.token(username, password)
         record_token_result("success")
+        audit("token_issued", "success", grant="password", user=username)
         return _shape_token_response(token_response)
     except KeycloakAuthenticationError:
         record_token_result("invalid_credentials")
+        audit("token_issued", "denied", grant="password", user=username,
+              reason="invalid_credentials")
         raise HTTPException(status_code=401, detail="Invalid credentials")
     except Exception as exc:
         # Log the REAL cause. Returning a bare 503 with no server-side log is
@@ -976,6 +1022,65 @@ def refresh_access_token(request: Request, refresh_token: str = Form(...)):
         record_token_result("error")
         logger.error("Refresh token request failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
+
+@app.post("/token/introspect")
+def introspect_token(request: Request, token: str = Form(...)):
+    """RFC 7662-style introspection: is this access token active, and what are its
+    key claims? Rate-limited. Per the spec, an invalid/expired token yields
+    {"active": false} (a 200), not an error. Returns only non-sensitive claims —
+    not the raw token — so it's safe to expose to resource servers."""
+    try:
+        from rate_limit import login_limiter, client_key
+        allowed, retry = login_limiter().check_and_consume(client_key(request))
+        if not allowed:
+            raise HTTPException(
+                status_code=429, detail="Too many introspection attempts; slow down.",
+                headers={"Retry-After": str(int(retry) + 1)})
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("rate limiter error on /token/introspect (allowing): %s", exc)
+    if keycloak_oidc is None:
+        raise HTTPException(status_code=503, detail="Authentication service unavailable")
+    try:
+        info = keycloak_oidc.introspect(token)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("introspection error (reporting inactive): %s", exc)
+        return {"active": False}
+    if not info or not info.get("active"):
+        return {"active": False}
+    # Surface only useful, non-sensitive claims.
+    return {k: info[k] for k in
+            ("active", "sub", "username", "preferred_username", "scope",
+             "aud", "exp", "iat", "client_id", "token_type")
+            if k in info}
+
+
+@app.post("/token/revoke")
+def revoke_token(request: Request, refresh_token: str = Form(...)):
+    """Revoke a refresh token (logout) — ends that session at Keycloak.
+    Rate-limited, and idempotent: revoking an already-revoked/expired token still
+    returns 200 (the client's goal — that the token is no longer usable — holds)."""
+    try:
+        from rate_limit import login_limiter, client_key
+        allowed, retry = login_limiter().check_and_consume(client_key(request))
+        if not allowed:
+            raise HTTPException(
+                status_code=429, detail="Too many revoke attempts; slow down.",
+                headers={"Retry-After": str(int(retry) + 1)})
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("rate limiter error on /token/revoke (allowing): %s", exc)
+    if keycloak_oidc is None:
+        raise HTTPException(status_code=503, detail="Authentication service unavailable")
+    try:
+        keycloak_oidc.logout(refresh_token)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("revoke/logout error (treating as revoked): %s", exc)
+    audit("token_revoked", "success")
+    return {"revoked": True}
 
 
 @app.post("/token/client")
@@ -1057,6 +1162,26 @@ def protected_route(token_info: dict = Depends(require_keycloak_auth)):
 # Reads the same env used to provision the mapper (see ensure_audience_mapper),
 # so "what the token carries" and "what the endpoint requires" stay in lockstep.
 _SERVICE_AUDIENCE = os.environ.get("SERVICE_ACCOUNT_AUDIENCE", "")
+
+# Audience an app token must carry to reach /protected/audience. Defaults to the
+# service audience when set, else a stable app-audience name — so the endpoint
+# below is always a live demonstration of the require_audience guard.
+_APP_AUDIENCE = os.environ.get("APP_AUDIENCE", "") or _SERVICE_AUDIENCE or "premalytics-api"
+
+
+@app.get("/protected/audience")
+def protected_audience(
+        token_info: dict = Depends(require_audience(_APP_AUDIENCE))):
+    """Audience-guarded resource: reachable only by a token minted for the
+    required audience (the 'where may this token be used' guard, via
+    require_audience). A token without that audience gets 403 — even if it is
+    otherwise valid and carries the right roles/scopes."""
+    return {
+        "message": "audience-guarded resource reached",
+        "audience_required": _APP_AUDIENCE,
+        "user": (token_info.get("preferred_username")
+                 or token_info.get("clientId") or "?"),
+    }
 
 
 @app.get("/protected/service")
@@ -1147,6 +1272,8 @@ def traefik_forward_auth(request: Request):
         logger.info("ForwardAuth allow: user=%s %s %s (xff=%s)",
                     username or "?", fwd_method, fwd_uri, fwd_for)
     record_forward_auth("allow")
+    audit("forward_auth", "allow", user=username or "?",
+          method=fwd_method, uri=fwd_uri)
     return JSONResponse(
         status_code=200,
         content={"status": "authenticated"},

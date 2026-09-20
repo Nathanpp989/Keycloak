@@ -2007,3 +2007,132 @@ def test_subsystem_status_reports_keycloak(client, monkeypatch):
     monkeypatch.setattr(main, "keycloak_oidc", None)
     r2 = client.get("/status/subsystems")
     assert r2.json()["keycloak"]["enabled"] is False
+
+
+# ── #2 audience-guarded endpoint (require_audience as a route dependency) ────
+
+def test_audience_endpoint_allows_matching_audience(client, monkeypatch):
+    fake = MagicMock()
+    fake.introspect.return_value = {"active": True, "aud": ["premalytics-api"],
+                                    "preferred_username": "bob"}
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.get("/protected/audience", headers={"Authorization": "Bearer good"})
+    assert r.status_code == 200
+    assert r.json()["audience_required"] == "premalytics-api"
+
+
+def test_audience_endpoint_denies_wrong_audience(client, monkeypatch):
+    fake = MagicMock()
+    fake.introspect.return_value = {"active": True, "aud": ["something-else"],
+                                    "preferred_username": "bob"}
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.get("/protected/audience", headers={"Authorization": "Bearer good"})
+    assert r.status_code == 403
+
+
+# ── #1 /token/introspect + /token/revoke ────────────────────────────────────
+
+def test_introspect_active_returns_allowlisted_claims(client, monkeypatch):
+    fake = MagicMock()
+    fake.introspect.return_value = {"active": True, "sub": "u1", "scope": "openid",
+                                    "aud": ["a"], "secret_field": "should-not-leak"}
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.post("/token/introspect", data={"token": "abc"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["active"] is True and body["sub"] == "u1"
+    assert "secret_field" not in body   # only allow-listed claims surface
+
+
+def test_introspect_inactive(client, monkeypatch):
+    fake = MagicMock()
+    fake.introspect.return_value = {"active": False}
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.post("/token/introspect", data={"token": "stale"})
+    assert r.status_code == 200 and r.json() == {"active": False}
+
+
+def test_introspect_error_reports_inactive(client, monkeypatch):
+    fake = MagicMock()
+    fake.introspect.side_effect = Exception("boom")
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.post("/token/introspect", data={"token": "x"})
+    assert r.status_code == 200 and r.json() == {"active": False}
+
+
+def test_introspect_service_down_503(client, monkeypatch):
+    monkeypatch.setattr(main, "keycloak_oidc", None)
+    r = client.post("/token/introspect", data={"token": "x"})
+    assert r.status_code == 503
+
+
+def test_revoke_success(client, monkeypatch):
+    fake = MagicMock()
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.post("/token/revoke", data={"refresh_token": "ref"})
+    assert r.status_code == 200 and r.json() == {"revoked": True}
+    fake.logout.assert_called_once_with("ref")
+
+
+def test_revoke_idempotent_on_error(client, monkeypatch):
+    fake = MagicMock()
+    fake.logout.side_effect = Exception("already gone")
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.post("/token/revoke", data={"refresh_token": "ref"})
+    assert r.status_code == 200 and r.json() == {"revoked": True}
+
+
+# ── #3 configurable CORS ────────────────────────────────────────────────────
+
+def test_cors_disabled_by_default(client):
+    r = client.get("/health/live", headers={"Origin": "http://evil.com"})
+    assert "access-control-allow-origin" not in {k.lower() for k in r.headers}
+
+
+def test_configure_cors_off_when_unset(monkeypatch):
+    from fastapi import FastAPI
+    monkeypatch.delenv("CORS_ALLOW_ORIGINS", raising=False)
+    assert main._configure_cors(FastAPI()) is False
+
+
+def test_configure_cors_enabled_adds_headers(monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    monkeypatch.setenv("CORS_ALLOW_ORIGINS", "http://good.com")
+    app2 = FastAPI()
+    assert main._configure_cors(app2) is True
+
+    @app2.get("/x")
+    def _x():
+        return {"ok": True}
+    r = TestClient(app2).get("/x", headers={"Origin": "http://good.com"})
+    assert r.headers.get("access-control-allow-origin") == "http://good.com"
+
+
+# ── #4 structured audit log ─────────────────────────────────────────────────
+
+def test_audit_emits_structured_event(caplog):
+    import logging
+    with caplog.at_level(logging.INFO, logger="audit"):
+        main.audit("token_issued", "success", grant="password", user="bob")
+    assert any("event=token_issued" in r.message and "outcome=success" in r.message
+               and "user=bob" in r.message for r in caplog.records)
+
+
+def test_audit_omits_empty_fields(caplog):
+    import logging
+    with caplog.at_level(logging.INFO, logger="audit"):
+        main.audit("x", "y", user="", present="v")
+    rec = next(r for r in caplog.records if "event=x" in r.message)
+    assert "user=" not in rec.message and "present=v" in rec.message
+
+
+def test_token_success_emits_audit(client, monkeypatch, caplog):
+    import logging
+    fake = MagicMock()
+    fake.token.return_value = {"access_token": "abc"}
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    with caplog.at_level(logging.INFO, logger="audit"):
+        client.post("/token", data={"username": "alice", "password": "p"})
+    assert any("event=token_issued" in r.message and "user=alice" in r.message
+               for r in caplog.records)
