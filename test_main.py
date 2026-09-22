@@ -2136,3 +2136,46 @@ def test_token_success_emits_audit(client, monkeypatch, caplog):
         client.post("/token", data={"username": "alice", "password": "p"})
     assert any("event=token_issued" in r.message and "user=alice" in r.message
                for r in caplog.records)
+
+
+# ── /userinfo (OIDC UserInfo endpoint) ──────────────────────────────────────
+
+def test_userinfo_returns_profile(client, monkeypatch):
+    fake = MagicMock()
+    fake.userinfo.return_value = {"sub": "u1", "preferred_username": "bob",
+                                  "email": "bob@x.com", "name": "Bob"}
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.get("/userinfo", headers={"Authorization": "Bearer good"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["sub"] == "u1" and body["email"] == "bob@x.com"
+    fake.userinfo.assert_called_once_with("good")
+
+
+def test_userinfo_invalid_token_401(client, monkeypatch):
+    from keycloak.exceptions import KeycloakAuthenticationError
+    fake = MagicMock()
+    fake.userinfo.side_effect = KeycloakAuthenticationError("bad")
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.get("/userinfo", headers={"Authorization": "Bearer bad"})
+    assert r.status_code == 401
+
+
+def test_userinfo_no_sub_401(client, monkeypatch):
+    fake = MagicMock()
+    fake.userinfo.return_value = {}   # no 'sub' -> not a valid userinfo response
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.get("/userinfo", headers={"Authorization": "Bearer x"})
+    assert r.status_code == 401
+
+
+def test_userinfo_requires_token(client, monkeypatch):
+    monkeypatch.setattr(main, "keycloak_oidc", MagicMock())
+    r = client.get("/userinfo")  # no Authorization header
+    assert r.status_code == 401
+
+
+def test_userinfo_service_down_503(client, monkeypatch):
+    monkeypatch.setattr(main, "keycloak_oidc", None)
+    r = client.get("/userinfo", headers={"Authorization": "Bearer x"})
+    assert r.status_code == 503

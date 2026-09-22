@@ -1295,6 +1295,29 @@ def oidc_login(token: str = Depends(oauth2_scheme)):
         logger.error("Token introspection failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
 
+
+@app.get("/userinfo")
+def userinfo(token: str = Depends(oauth2_scheme)):
+    """OIDC UserInfo endpoint: return the authenticated user's profile claims for a
+    valid access token (Authorization: Bearer). The standard way a client fetches
+    the user's profile after login — complementing /token/introspect, which is for
+    resource servers validating a token. 401 on a missing/invalid token, 503 if
+    the auth service is down. The caller presents their OWN token, so their own
+    profile claims are returned as-is."""
+    if keycloak_oidc is None:
+        raise HTTPException(status_code=503, detail="Authentication service unavailable")
+    try:
+        info = keycloak_oidc.userinfo(token)
+    except KeycloakAuthenticationError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("userinfo lookup failed (treating as unauthorized): %s", exc)
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    if not isinstance(info, dict) or not info.get("sub"):
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return info
+
+
 @app.post("/register")
 def register(
     request: Request,
