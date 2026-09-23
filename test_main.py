@@ -2212,3 +2212,63 @@ def test_userinfo_is_rate_limited(client, monkeypatch):
              for _ in range(4)]
     assert 429 in codes   # the 3rd/4th within the window are throttled
     rate_limit.reset_all()
+
+
+# ── #1 metrics + #2 audit on token-validation ops ───────────────────────────
+
+def test_introspect_records_metric_and_audit(client, monkeypatch, caplog):
+    import logging
+    import metrics
+    fake = MagicMock()
+    fake.introspect.return_value = {"active": True, "sub": "u9"}
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    before = metrics.TOKEN_OPS.labels(operation="introspect", outcome="active")._value.get()
+    with caplog.at_level(logging.INFO, logger="audit"):
+        client.post("/token/introspect", data={"token": "x"})
+    after = metrics.TOKEN_OPS.labels(operation="introspect", outcome="active")._value.get()
+    assert after == before + 1
+    assert any("event=token_introspected" in r.message and "sub=u9" in r.message
+               for r in caplog.records)
+
+
+def test_introspect_inactive_records_inactive_metric(client, monkeypatch):
+    import metrics
+    fake = MagicMock()
+    fake.introspect.return_value = {"active": False}
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    before = metrics.TOKEN_OPS.labels(operation="introspect", outcome="inactive")._value.get()
+    client.post("/token/introspect", data={"token": "stale"})
+    after = metrics.TOKEN_OPS.labels(operation="introspect", outcome="inactive")._value.get()
+    assert after == before + 1
+
+
+def test_userinfo_records_metric_and_audit(client, monkeypatch, caplog):
+    import logging
+    import metrics
+    fake = MagicMock()
+    fake.userinfo.return_value = {"sub": "u7", "preferred_username": "bob"}
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    before = metrics.TOKEN_OPS.labels(operation="userinfo", outcome="success")._value.get()
+    with caplog.at_level(logging.INFO, logger="audit"):
+        client.get("/userinfo", headers={"Authorization": "Bearer t"})
+    after = metrics.TOKEN_OPS.labels(operation="userinfo", outcome="success")._value.get()
+    assert after == before + 1
+    assert any("event=userinfo" in r.message and "sub=u7" in r.message
+               for r in caplog.records)
+
+
+def test_revoke_records_metric(client, monkeypatch):
+    import metrics
+    monkeypatch.setattr(main, "keycloak_oidc", MagicMock())
+    before = metrics.TOKEN_OPS.labels(operation="revoke", outcome="success")._value.get()
+    client.post("/token/revoke", data={"refresh_token": "r"})
+    after = metrics.TOKEN_OPS.labels(operation="revoke", outcome="success")._value.get()
+    assert after == before + 1
+
+
+def test_forward_auth_deny_emits_audit(client, monkeypatch, caplog):
+    import logging
+    with caplog.at_level(logging.INFO, logger="audit"):
+        client.get("/auth/forward")  # no Authorization header -> deny
+    assert any("event=forward_auth" in r.message and "outcome=deny" in r.message
+               and "reason=no_credentials" in r.message for r in caplog.records)

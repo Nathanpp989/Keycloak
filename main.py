@@ -30,7 +30,7 @@ from auth0_type import UserManager
 from logging_config import configure_logging, request_id_var  # noqa: E402
 from metrics import (  # noqa: E402
     metrics_middleware, render_metrics,
-    record_token_result, record_forward_auth,
+    record_token_result, record_forward_auth, record_token_op,
 )
 from authz import (  # noqa: E402
     make_require_role, enforce_org_access, filter_orgs_to_accessible,
@@ -1042,14 +1042,19 @@ def introspect_token(request: Request, token: str = Form(...)):
     except Exception as exc:  # noqa: BLE001
         logger.warning("rate limiter error on /token/introspect (allowing): %s", exc)
     if keycloak_oidc is None:
+        record_token_op("introspect", "unavailable")
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
     try:
         info = keycloak_oidc.introspect(token)
     except Exception as exc:  # noqa: BLE001
         logger.warning("introspection error (reporting inactive): %s", exc)
+        record_token_op("introspect", "error")
         return {"active": False}
     if not info or not info.get("active"):
+        record_token_op("introspect", "inactive")
         return {"active": False}
+    record_token_op("introspect", "active")
+    audit("token_introspected", "active", sub=info.get("sub"))
     # Surface only useful, non-sensitive claims.
     return {k: info[k] for k in
             ("active", "sub", "username", "preferred_username", "scope",
@@ -1074,11 +1079,13 @@ def revoke_token(request: Request, refresh_token: str = Form(...)):
     except Exception as exc:  # noqa: BLE001
         logger.warning("rate limiter error on /token/revoke (allowing): %s", exc)
     if keycloak_oidc is None:
+        record_token_op("revoke", "unavailable")
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
     try:
         keycloak_oidc.logout(refresh_token)
     except Exception as exc:  # noqa: BLE001
         logger.warning("revoke/logout error (treating as revoked): %s", exc)
+    record_token_op("revoke", "success")
     audit("token_revoked", "success")
     return {"revoked": True}
 
@@ -1236,11 +1243,13 @@ def traefik_forward_auth(request: Request):
     if not auth.lower().startswith("bearer "):
         # No credentials -> deny. 401 tells the client to authenticate.
         record_forward_auth("deny")
+        audit("forward_auth", "deny", reason="no_credentials")
         raise HTTPException(status_code=401, detail="Missing bearer token",
                             headers={"WWW-Authenticate": "Bearer"})
     token = auth.split(" ", 1)[1].strip()
     if not token:
         record_forward_auth("deny")
+        audit("forward_auth", "deny", reason="empty_token")
         raise HTTPException(status_code=401, detail="Empty bearer token",
                             headers={"WWW-Authenticate": "Bearer"})
 
@@ -1252,6 +1261,7 @@ def traefik_forward_auth(request: Request):
     except HTTPException:
         # 401 (invalid token) or 503 (backend down) both mean "not allowed".
         record_forward_auth("deny")
+        audit("forward_auth", "deny", reason="invalid_or_backend")
         raise
 
     # Allowed. Hand identity back to the upstream via response headers that
@@ -1320,12 +1330,17 @@ def userinfo(request: Request, token: str = Depends(oauth2_scheme)):
     try:
         info = keycloak_oidc.userinfo(token)
     except KeycloakAuthenticationError:
+        record_token_op("userinfo", "invalid")
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     except Exception as exc:  # noqa: BLE001
         logger.warning("userinfo lookup failed (treating as unauthorized): %s", exc)
+        record_token_op("userinfo", "error")
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     if not isinstance(info, dict) or not info.get("sub"):
+        record_token_op("userinfo", "invalid")
         raise HTTPException(status_code=401, detail="Invalid or expired token")
+    record_token_op("userinfo", "success")
+    audit("userinfo", "success", sub=info.get("sub"))
     return info
 
 

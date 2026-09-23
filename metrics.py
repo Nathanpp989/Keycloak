@@ -56,11 +56,24 @@ FORWARD_AUTH = Counter(
     ["decision"],   # "allow" | "deny"
 )
 
+# Token-validation operations: introspect / userinfo / revoke, by outcome.
+TOKEN_OPS = Counter(
+    "auth_token_ops_total",
+    "Token-validation operations by type and outcome",
+    ["operation", "outcome"],   # operation: introspect|userinfo|revoke
+                                # outcome: active|inactive|success|invalid|error|unavailable
+)
+
 
 def record_token_result(outcome: str) -> None:
     """Increment the token-issuance counter. outcome in
     {success, invalid_credentials, error}."""
     TOKEN_REQUESTS.labels(outcome=outcome).inc()
+
+
+def record_token_op(operation: str, outcome: str) -> None:
+    """Increment the token-validation-op counter (introspect/userinfo/revoke)."""
+    TOKEN_OPS.labels(operation=operation, outcome=outcome).inc()
 
 
 def record_forward_auth(decision: str) -> None:
