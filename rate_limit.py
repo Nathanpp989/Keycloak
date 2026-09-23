@@ -199,6 +199,7 @@ def _float_env(name: str, default: float) -> float:
 _LOGIN = None
 _REGISTER = None
 _M2M = None
+_TOKENOPS = None
 _build_lock = threading.Lock()
 
 
@@ -243,13 +244,35 @@ def client_credentials_limiter() -> RateLimiter:
     return _M2M
 
 
+def token_ops_limiter() -> RateLimiter:
+    """Rate limiter for token-VALIDATION operations: introspect, userinfo, revoke.
+
+    These take an existing token rather than a guessable credential, so they are
+    not a brute-force surface the way /token (password) is — a client or resource
+    server may call them frequently and legitimately (e.g. validating a token on
+    many requests). They therefore get a higher default ceiling than login and,
+    crucially, their OWN bucket, so heavy token validation can't exhaust the login
+    budget and lock real logins out. Still bounded, to contain a compromised
+    caller. Tunable via RATE_LIMIT_TOKENOPS_MAX / _WINDOW.
+    """
+    global _TOKENOPS
+    if _TOKENOPS is None:
+        with _build_lock:
+            if _TOKENOPS is None:
+                _TOKENOPS = RateLimiter(
+                    _int_env("RATE_LIMIT_TOKENOPS_MAX", 120),
+                    _float_env("RATE_LIMIT_TOKENOPS_WINDOW", 60.0))
+    return _TOKENOPS
+
+
 def reset_all() -> None:
     """Test hook / admin: rebuild limiters (e.g. after changing env)."""
-    global _LOGIN, _REGISTER, _M2M
+    global _LOGIN, _REGISTER, _M2M, _TOKENOPS
     with _build_lock:
         _LOGIN = None
         _REGISTER = None
         _M2M = None
+        _TOKENOPS = None
 
 
 def client_key(request) -> str:

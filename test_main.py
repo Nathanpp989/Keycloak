@@ -2179,3 +2179,36 @@ def test_userinfo_service_down_503(client, monkeypatch):
     monkeypatch.setattr(main, "keycloak_oidc", None)
     r = client.get("/userinfo", headers={"Authorization": "Bearer x"})
     assert r.status_code == 503
+
+
+# ── rate-limiter isolation: token-ops must not starve the login budget ──────
+
+def test_introspect_does_not_consume_login_budget(client, monkeypatch):
+    import rate_limit
+    rate_limit.reset_all()
+    monkeypatch.setenv("RATE_LIMIT_LOGIN_MAX", "3")
+    monkeypatch.setenv("RATE_LIMIT_TOKENOPS_MAX", "50")
+    rate_limit.reset_all()  # rebuild with the new env
+    fake = MagicMock()
+    fake.introspect.return_value = {"active": True, "sub": "u"}
+    fake.token.return_value = {"access_token": "t"}
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    # hammer introspect well past the LOGIN budget (3)
+    for _ in range(10):
+        assert client.post("/token/introspect", data={"token": "x"}).status_code == 200
+    # a real login must STILL work — introspect used the token-ops bucket, not login's
+    assert client.post("/token", data={"username": "u", "password": "p"}).status_code == 200
+    rate_limit.reset_all()
+
+
+def test_userinfo_is_rate_limited(client, monkeypatch):
+    import rate_limit
+    monkeypatch.setenv("RATE_LIMIT_TOKENOPS_MAX", "2")
+    rate_limit.reset_all()
+    fake = MagicMock()
+    fake.userinfo.return_value = {"sub": "u1", "preferred_username": "bob"}
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    codes = [client.get("/userinfo", headers={"Authorization": "Bearer t"}).status_code
+             for _ in range(4)]
+    assert 429 in codes   # the 3rd/4th within the window are throttled
+    rate_limit.reset_all()

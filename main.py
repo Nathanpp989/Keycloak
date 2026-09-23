@@ -1031,8 +1031,8 @@ def introspect_token(request: Request, token: str = Form(...)):
     {"active": false} (a 200), not an error. Returns only non-sensitive claims —
     not the raw token — so it's safe to expose to resource servers."""
     try:
-        from rate_limit import login_limiter, client_key
-        allowed, retry = login_limiter().check_and_consume(client_key(request))
+        from rate_limit import token_ops_limiter, client_key
+        allowed, retry = token_ops_limiter().check_and_consume(client_key(request))
         if not allowed:
             raise HTTPException(
                 status_code=429, detail="Too many introspection attempts; slow down.",
@@ -1063,8 +1063,8 @@ def revoke_token(request: Request, refresh_token: str = Form(...)):
     Rate-limited, and idempotent: revoking an already-revoked/expired token still
     returns 200 (the client's goal — that the token is no longer usable — holds)."""
     try:
-        from rate_limit import login_limiter, client_key
-        allowed, retry = login_limiter().check_and_consume(client_key(request))
+        from rate_limit import token_ops_limiter, client_key
+        allowed, retry = token_ops_limiter().check_and_consume(client_key(request))
         if not allowed:
             raise HTTPException(
                 status_code=429, detail="Too many revoke attempts; slow down.",
@@ -1297,13 +1297,24 @@ def oidc_login(token: str = Depends(oauth2_scheme)):
 
 
 @app.get("/userinfo")
-def userinfo(token: str = Depends(oauth2_scheme)):
+def userinfo(request: Request, token: str = Depends(oauth2_scheme)):
     """OIDC UserInfo endpoint: return the authenticated user's profile claims for a
     valid access token (Authorization: Bearer). The standard way a client fetches
     the user's profile after login — complementing /token/introspect, which is for
     resource servers validating a token. 401 on a missing/invalid token, 503 if
     the auth service is down. The caller presents their OWN token, so their own
     profile claims are returned as-is."""
+    try:
+        from rate_limit import token_ops_limiter, client_key
+        allowed, retry = token_ops_limiter().check_and_consume(client_key(request))
+        if not allowed:
+            raise HTTPException(
+                status_code=429, detail="Too many userinfo requests; slow down.",
+                headers={"Retry-After": str(int(retry) + 1)})
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("rate limiter error on /userinfo (allowing): %s", exc)
     if keycloak_oidc is None:
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
     try:
