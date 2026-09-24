@@ -100,6 +100,7 @@ monitoring stack. 728 tests; CI runs the unit suite plus a live smoke test.
   app + the 9-check curl suite).
 
 ### Changed
+- Runs on the latest Python (3.14); container base image and CI updated. The suite passes on Python 3.12, 3.13, and 3.14 (all 728 tests). Pinned dependencies verified to install and work on 3.14.
 - Dependencies pinned to exact tested versions (`==`) for reproducible builds.
 - `/token/introspect`, `/token/revoke`, and `/userinfo` use a dedicated,
   more-generous token-ops rate limiter instead of the strict login limiter, so
