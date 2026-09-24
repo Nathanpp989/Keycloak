@@ -31,6 +31,7 @@ from logging_config import configure_logging, request_id_var  # noqa: E402
 from metrics import (  # noqa: E402
     metrics_middleware, render_metrics,
     record_token_result, record_forward_auth, record_token_op, time_upstream,
+    record_lockout,
 )
 from authz import (  # noqa: E402
     make_require_role, enforce_org_access, filter_orgs_to_accessible,
@@ -1011,6 +1012,7 @@ def login(request: Request,
     from account_lockout import check_locked, note_failure, note_success
     locked, lock_retry = check_locked(username)
     if locked:
+        record_lockout()
         audit("token_issued", "denied", grant="password", user=username,
               reason="account_locked")
         raise HTTPException(
@@ -1346,35 +1348,47 @@ def traefik_forward_auth(request: Request):
     client; introspection-backend failures still surface as 503.
     """
     auth = request.headers.get("authorization", "")
-    if not auth.lower().startswith("bearer "):
+    api_key = request.headers.get("x-api-key", "").strip()
+    if auth.lower().startswith("bearer "):
+        # Bearer/OIDC path: validate exactly the way the app's own endpoints do.
+        token = auth.split(" ", 1)[1].strip()
+        if not token:
+            record_forward_auth("deny")
+            audit("forward_auth", "deny", reason="empty_token")
+            raise HTTPException(status_code=401, detail="Empty bearer token",
+                                headers={"WWW-Authenticate": "Bearer"})
+        try:
+            token_info = _introspect_token(token)
+        except HTTPException:
+            # 401 (invalid token) or 503 (backend down) both mean "not allowed".
+            record_forward_auth("deny")
+            audit("forward_auth", "deny", reason="invalid_or_backend")
+            raise
+        username = str(token_info.get("preferred_username", ""))
+        subject = str(token_info.get("sub", ""))
+    elif api_key:
+        # API-key path: a simple service client routed through Traefik. Identity
+        # is the key's name/id, prefixed "apikey:" so upstreams can distinguish
+        # it from a user login.
+        from api_keys import api_key_manager
+        meta = api_key_manager().verify(api_key)
+        if meta is None:
+            record_forward_auth("deny")
+            audit("forward_auth", "deny", reason="invalid_api_key")
+            raise HTTPException(status_code=401, detail="Invalid API key",
+                                headers={"WWW-Authenticate": "ApiKey"})
+        username = "apikey:" + str(meta.get("name") or meta["id"])
+        subject = "apikey:" + str(meta["id"])
+    else:
         # No credentials -> deny. 401 tells the client to authenticate.
         record_forward_auth("deny")
         audit("forward_auth", "deny", reason="no_credentials")
-        raise HTTPException(status_code=401, detail="Missing bearer token",
+        raise HTTPException(status_code=401, detail="Missing credentials",
                             headers={"WWW-Authenticate": "Bearer"})
-    token = auth.split(" ", 1)[1].strip()
-    if not token:
-        record_forward_auth("deny")
-        audit("forward_auth", "deny", reason="empty_token")
-        raise HTTPException(status_code=401, detail="Empty bearer token",
-                            headers={"WWW-Authenticate": "Bearer"})
-
-    # Reuse the app's single token-validation path. This raises 401 for an
-    # inactive/expired token and 503 if the introspection backend is unreachable
-    # — both correct signals for Traefik (401 deny, 503 = auth temporarily down).
-    try:
-        token_info = _introspect_token(token)
-    except HTTPException:
-        # 401 (invalid token) or 503 (backend down) both mean "not allowed".
-        record_forward_auth("deny")
-        audit("forward_auth", "deny", reason="invalid_or_backend")
-        raise
 
     # Allowed. Hand identity back to the upstream via response headers that
     # Traefik is configured to copy (authResponseHeaders). The upstream must
     # treat these as trusted ONLY when they arrive via Traefik.
-    username = str(token_info.get("preferred_username", ""))
-    subject = str(token_info.get("sub", ""))
     # Defense-in-depth: strip control characters (CR/LF/NUL etc.) before these
     # validated-but-not-sanitized values go into response headers. The ASGI layer
     # already blocks CRLF header-splitting, so this isn't the primary defense —

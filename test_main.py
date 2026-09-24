@@ -2457,3 +2457,55 @@ def test_lockout_not_triggered_by_outage(client, monkeypatch):
     fake.token.return_value = {"access_token": "t"}
     assert client.post("/token", data={"username": "u", "password": "ok"}).status_code == 200
     account_lockout.reset_lockouts()
+
+
+# ── integrations: ForwardAuth via API key, lockout metric ───────────────────
+
+def test_forward_auth_accepts_valid_api_key(client, monkeypatch):
+    import api_keys
+    api_keys.reset_api_keys()
+    kid, key = api_keys.api_key_manager().create("svc-fwd")
+    r = client.get("/auth/forward", headers={"X-API-Key": key})
+    assert r.status_code == 200
+    assert r.headers.get("X-Auth-User") == "apikey:svc-fwd"
+    assert r.headers.get("X-Auth-Subject") == f"apikey:{kid}"
+    api_keys.reset_api_keys()
+
+
+def test_forward_auth_rejects_invalid_api_key(client, monkeypatch):
+    import api_keys
+    api_keys.reset_api_keys()
+    r = client.get("/auth/forward", headers={"X-API-Key": "ak_bogus_x"})
+    assert r.status_code == 401
+    api_keys.reset_api_keys()
+
+
+def test_forward_auth_bearer_still_works(client, monkeypatch):
+    # regression: the Bearer path is unchanged by the API-key addition
+    fake = MagicMock()
+    fake.introspect.return_value = {"active": True, "preferred_username": "bob",
+                                    "sub": "s1"}
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.get("/auth/forward", headers={"Authorization": "Bearer good"})
+    assert r.status_code == 200
+    assert r.headers.get("X-Auth-User") == "bob"
+
+
+def test_lockout_increments_metric(client, monkeypatch):
+    import rate_limit
+    import account_lockout
+    import metrics
+    monkeypatch.setenv("RATE_LIMIT_LOGIN_MAX", "100")
+    monkeypatch.setenv("LOCKOUT_MAX_FAILURES", "2")
+    rate_limit.reset_all()
+    account_lockout.reset_lockouts()
+    from keycloak.exceptions import KeycloakAuthenticationError
+    fake = MagicMock()
+    fake.token.side_effect = KeycloakAuthenticationError("bad")
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    before = metrics.ACCOUNT_LOCKOUTS._value.get()
+    for _ in range(2):
+        client.post("/token", data={"username": "vic", "password": "x"})
+    client.post("/token", data={"username": "vic", "password": "x"})  # locked -> metric
+    assert metrics.ACCOUNT_LOCKOUTS._value.get() == before + 1
+    account_lockout.reset_lockouts()

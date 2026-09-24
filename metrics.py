@@ -57,6 +57,13 @@ FORWARD_AUTH = Counter(
     ["decision"],   # "allow" | "deny"
 )
 
+# Account lockouts — a login denied because the account is temporarily locked
+# (per-user brute-force protection). A spike here signals an attack in progress.
+ACCOUNT_LOCKOUTS = Counter(
+    "auth_account_lockouts_total",
+    "Logins denied because the account was temporarily locked",
+)
+
 # Token-validation operations: introspect / userinfo / revoke, by outcome.
 TOKEN_OPS = Counter(
     "auth_token_ops_total",
@@ -70,6 +77,11 @@ def record_token_result(outcome: str) -> None:
     """Increment the token-issuance counter. outcome in
     {success, invalid_credentials, error}."""
     TOKEN_REQUESTS.labels(outcome=outcome).inc()
+
+
+def record_lockout() -> None:
+    """Increment the account-lockout counter (a login denied while locked)."""
+    ACCOUNT_LOCKOUTS.inc()
 
 
 def record_token_op(operation: str, outcome: str) -> None:
