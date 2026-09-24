@@ -651,7 +651,30 @@ async def lifespan(app: FastAPI):
         user_manager = None
     yield
 
-app = FastAPI(lifespan=lifespan)
+_DOCS_ENABLED = os.environ.get("DOCS_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on")
+
+app = FastAPI(
+    title="Auth Broker",
+    description=(
+        "Brokers authentication through Keycloak with Auth0 federation, "
+        "machine-to-machine access control (roles, scopes, audiences), token "
+        "lifecycle (issue, refresh, introspect, revoke, userinfo), a ForwardAuth "
+        "gateway for Traefik, and OpenBao-backed secrets."
+    ),
+    version=os.environ.get("APP_VERSION", "1.0.0"),
+    lifespan=lifespan,
+    # Interactive docs + the OpenAPI schema are on by default (handy in dev) but
+    # can be turned off in production so the full API surface isn't advertised.
+    docs_url="/docs" if _DOCS_ENABLED else None,
+    redoc_url="/redoc" if _DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if _DOCS_ENABLED else None,
+)
+
+# Compress large JSON responses (user/group/org lists, /metrics). Small responses
+# are left uncompressed — below minimum_size the CPU cost isn't worth it.
+from fastapi.middleware.gzip import GZipMiddleware  # noqa: E402
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 def _configure_cors(fastapi_app) -> bool:

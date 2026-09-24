@@ -2272,3 +2272,50 @@ def test_forward_auth_deny_emits_audit(client, monkeypatch, caplog):
         client.get("/auth/forward")  # no Authorization header -> deny
     assert any("event=forward_auth" in r.message and "outcome=deny" in r.message
                and "reason=no_credentials" in r.message for r in caplog.records)
+
+
+# ── web-API features: OpenAPI metadata, docs gating, GZip ────────────────────
+
+def test_openapi_has_title_and_version(client):
+    r = client.get("/openapi.json")
+    assert r.status_code == 200
+    info = r.json()["info"]
+    assert info["title"] == "Auth Broker"
+    assert info["version"]  # non-empty
+    # the new endpoints are documented in the schema
+    assert "/token/introspect" in r.json()["paths"]
+    assert "/userinfo" in r.json()["paths"]
+
+
+def test_docs_served_by_default(client):
+    assert client.get("/docs").status_code == 200
+
+
+def test_gzip_compresses_large_response(client, monkeypatch):
+    # a large body with Accept-Encoding: gzip should come back compressed
+    import main as m
+
+    @m.app.get("/_big_test")
+    def _big():
+        return {"data": "x" * 5000}
+    r = client.get("/_big_test", headers={"Accept-Encoding": "gzip"})
+    assert r.status_code == 200
+    assert r.headers.get("content-encoding") == "gzip"
+
+
+def test_docs_can_be_disabled_via_env():
+    # Fresh process with DOCS_ENABLED=false: /docs and /openapi.json become 404.
+    import subprocess
+    import sys
+    code = (
+        "import os;"
+        "os.environ.update(DOCS_ENABLED='false', AUTH0_DOMAIN='x',"
+        " AUTH0_CLIENT_ID='x', AUTH0_CLIENT_SECRET='x', KEYCLOAK_REQUIRED='false');"
+        "import main; from fastapi.testclient import TestClient;"
+        "c=TestClient(main.app);"
+        "assert c.get('/docs').status_code==404;"
+        "assert c.get('/openapi.json').status_code==404;"
+        "print('DOCS_DISABLED_OK')"
+    )
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert "DOCS_DISABLED_OK" in r.stdout, r.stderr
