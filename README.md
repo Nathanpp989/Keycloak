@@ -1,6 +1,5 @@
 # Keycloak + Auth0 + Azure Key Vault Integration
 
-<!-- CI badge: replace OWNER/REPO with your GitHub path (e.g. Nathanpp989/keycloak-auth-broker). -->
 [![CI](https://github.com/Nathanpp989/Keycloak/actions/workflows/ci.yml/badge.svg)](https://github.com/Nathanpp989/Keycloak/actions/workflows/ci.yml)
 
 A FastAPI application that brokers user authentication through Keycloak, with
@@ -661,6 +660,7 @@ This stack is a **local dev / demo** setup. Several deliberate shortcuts make it
   certs) so clients trust it without manual keychain steps.
 - **Storage.** OpenBao's `file` backend is deprecated by v2.7 — migrate to a
   supported backend (raft/integrated storage) before upgrading past it.
+- **API keys / lockout persistence.** API-key records are in-process by default; set `API_KEY_BACKEND=openbao` to persist them in OpenBao KV (survive restarts, shared across replicas). Account-lockout state is ephemeral high-frequency counters — for multi-replica use the Redis rate-limit backend, not OpenBao.
 - **Secrets.** Put real values in Key Vault / OpenBao KV, not demo data, and
   scope the AppRole policy to only the paths the app needs (it already grants
   read-only on the KV data path).
