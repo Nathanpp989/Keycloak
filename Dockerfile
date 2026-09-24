@@ -13,7 +13,7 @@
 #  Dockerfile is included too — it's a copy of this file — so both engines work
 #  with no extra flags.)
 
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 # Don't write .pyc files; unbuffer stdout/stderr so logs stream in real time.
 # App defaults below can be overridden at run time with -e / --env-file.

@@ -636,7 +636,7 @@ mock IdP, run:
 python e2e_smoke.py     # exit 0 = all checks passed
 ``` The suite covers
 every module and all HTTP endpoints. CI (`.github/workflows/ci.yml`) runs lint
-(`pyflakes`) and the full suite on every push against Python 3.11 and 3.12.
+(`pyflakes`) and the full suite on every push against Python 3.12, 3.13, and 3.14.
 
 ## Production hardening
 

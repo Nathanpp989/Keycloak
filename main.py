@@ -1320,7 +1320,8 @@ def protected_service(token_info: dict = Depends(require_scope("m2m:access"))):
 
 
 @app.api_route("/auth/forward", methods=["GET", "POST", "PUT", "DELETE",
-                                          "PATCH", "HEAD", "OPTIONS"])
+                                          "PATCH", "HEAD", "OPTIONS"],
+               include_in_schema=False)
 def traefik_forward_auth(request: Request):
     """
     Traefik ForwardAuth endpoint.
