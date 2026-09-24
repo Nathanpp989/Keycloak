@@ -2319,3 +2319,14 @@ def test_docs_can_be_disabled_via_env():
     )
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert "DOCS_DISABLED_OK" in r.stdout, r.stderr
+
+
+def test_gzip_response_still_gets_correlation_header(client):
+    import main as m
+
+    @m.app.get("/_big_corr")
+    def _bc():
+        return {"d": "z" * 5000}
+    r = client.get("/_big_corr", headers={"Accept-Encoding": "gzip"})
+    assert r.headers.get("content-encoding") == "gzip"
+    assert "x-request-id" in {k.lower() for k in r.headers}

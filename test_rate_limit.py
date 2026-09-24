@@ -170,3 +170,37 @@ def test_make_backend_falls_back_to_memory_when_redis_unreachable(monkeypatch):
     monkeypatch.setenv("REDIS_URL", "redis://127.0.0.1:6390/0")  # nothing there
     be = rl._make_backend(5, 60)
     assert isinstance(be, rl._MemoryBackend)
+
+
+def test_rate_limiter_exact_under_thread_contention():
+    """Under heavy concurrent access to one key, EXACTLY max_events are allowed —
+    proves the lock prevents over-allow and lost increments (a real race check)."""
+    import threading
+    import rate_limit
+    rl = rate_limit.RateLimiter(max_events=100, window_seconds=60)
+    allowed = []
+    lock = threading.Lock()
+
+    def worker():
+        for _ in range(50):
+            ok, _r = rl.check_and_consume("same-key")
+            if ok:
+                with lock:
+                    allowed.append(1)
+
+    threads = [threading.Thread(target=worker) for _ in range(20)]  # 1000 attempts
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(allowed) == 100
+
+
+def test_client_key_handles_missing_client():
+    """A request with no .client (some proxy/test paths) must not crash keying."""
+    import rate_limit
+
+    class _Req:
+        headers = {}
+        client = None
+    assert rate_limit.client_key(_Req()) == "unknown"
