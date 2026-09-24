@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 import requests
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
-from fastapi import FastAPI, Depends, HTTPException, Form, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, Depends, HTTPException, Form, WebSocket, WebSocketDisconnect, Request, Header
 from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPBearer
 from authorize import router as auth0_router, oauth2_scheme
@@ -30,7 +30,7 @@ from auth0_type import UserManager
 from logging_config import configure_logging, request_id_var  # noqa: E402
 from metrics import (  # noqa: E402
     metrics_middleware, render_metrics,
-    record_token_result, record_forward_auth, record_token_op,
+    record_token_result, record_forward_auth, record_token_op, time_upstream,
 )
 from authz import (  # noqa: E402
     make_require_role, enforce_org_access, filter_orgs_to_accessible,
@@ -40,6 +40,7 @@ from authz import (  # noqa: E402
 configure_logging()
 logger = logging.getLogger(__name__)
 _audit_logger = logging.getLogger("audit")
+_access_logger = logging.getLogger("access")
 
 
 def audit(event: str, outcome: str, **fields) -> None:
@@ -724,10 +725,21 @@ async def correlation_id_middleware(request: Request, call_next):
     # malicious client stuffing a huge header into every log line.
     rid = incoming[:128] if incoming else uuid.uuid4().hex
     token = request_id_var.set(rid)
+    _start = time.perf_counter()
     try:
         response = await call_next(request)
     finally:
         request_id_var.reset(token)
+    # Structured access log: one line per handled request (method, path, status,
+    # latency), on a dedicated 'access' logger so it can be routed/retained
+    # separately. Complements the audit trail (security events) and app logs.
+    _access_logger.info(
+        "%s %s -> %s %.1fms",
+        request.method,
+        request.url.path,
+        response.status_code,
+        (time.perf_counter() - _start) * 1000.0,
+    )
     response.headers["X-Request-ID"] = rid
     # Standard security headers on every response. These are the low-risk,
     # broadly-applicable ones (no CSP here — a broker serves JSON, and a wrong
@@ -994,12 +1006,26 @@ def login(request: Request,
         logger.warning("rate limiter error on /token (allowing): %s", exc)
     if keycloak_oidc is None:
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
+    # Per-user lockout: stop a distributed brute-force against ONE account that
+    # would otherwise slip past the per-IP rate limit.
+    from account_lockout import check_locked, note_failure, note_success
+    locked, lock_retry = check_locked(username)
+    if locked:
+        audit("token_issued", "denied", grant="password", user=username,
+              reason="account_locked")
+        raise HTTPException(
+            status_code=429,
+            detail="Account temporarily locked due to repeated failures.",
+            headers={"Retry-After": str(int(lock_retry) + 1)})
     try:
-        token_response = keycloak_oidc.token(username, password)
+        with time_upstream("token"):
+            token_response = keycloak_oidc.token(username, password)
+        note_success(username)
         record_token_result("success")
         audit("token_issued", "success", grant="password", user=username)
         return _shape_token_response(token_response)
     except KeycloakAuthenticationError:
+        note_failure(username)
         record_token_result("invalid_credentials")
         audit("token_issued", "denied", grant="password", user=username,
               reason="invalid_credentials")
@@ -1034,7 +1060,8 @@ def refresh_access_token(request: Request, refresh_token: str = Form(...)):
     if keycloak_oidc is None:
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
     try:
-        token_response = keycloak_oidc.refresh_token(refresh_token)
+        with time_upstream("refresh"):
+            token_response = keycloak_oidc.refresh_token(refresh_token)
         record_token_result("success")
         return _shape_token_response(token_response)
     except (KeycloakAuthenticationError, KeycloakPostError):
@@ -1068,7 +1095,8 @@ def introspect_token(request: Request, token: str = Form(...)):
         record_token_op("introspect", "unavailable")
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
     try:
-        info = keycloak_oidc.introspect(token)
+        with time_upstream("introspect"):
+            info = keycloak_oidc.introspect(token)
     except Exception as exc:  # noqa: BLE001
         logger.warning("introspection error (reporting inactive): %s", exc)
         record_token_op("introspect", "error")
@@ -1214,6 +1242,61 @@ def protected_audience(
     }
 
 
+# ── API keys (alternative auth for simple service clients) ───────────────────
+
+def require_api_key(x_api_key: str = Header(default="")) -> dict:
+    """Dependency: authenticate a request by an X-API-Key header. Returns the
+    key's metadata (id, name), or 401 if the key is missing/invalid/revoked.
+    An alternative to Bearer/OIDC for machine callers that just need a static
+    credential."""
+    from api_keys import api_key_manager
+    meta = api_key_manager().verify(x_api_key)
+    if meta is None:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key",
+                            headers={"WWW-Authenticate": "ApiKey"})
+    return meta
+
+
+@app.post("/admin/api-keys")
+def create_api_key(name: str = Form(default=""),
+                   token_info: dict = Depends(require_role(ADMIN_ROLE))):
+    """Create an API key (admin only). The plaintext key is returned ONCE here
+    and never again — store it now. Only its hash is kept server-side."""
+    from api_keys import api_key_manager
+    key_id, secret = api_key_manager().create(name)
+    audit("api_key_created", "success", key_id=key_id, name=name or "-",
+          by=token_info.get("preferred_username", "?"))
+    return {"id": key_id, "name": name, "api_key": secret,
+            "note": "store this now — it will not be shown again"}
+
+
+@app.get("/admin/api-keys")
+def list_api_keys(token_info: dict = Depends(require_role(ADMIN_ROLE))):
+    """List API-key metadata (admin only) — never the keys or hashes."""
+    from api_keys import api_key_manager
+    return {"keys": api_key_manager().list_keys()}
+
+
+@app.delete("/admin/api-keys/{key_id}")
+def revoke_api_key(key_id: str,
+                   token_info: dict = Depends(require_role(ADMIN_ROLE))):
+    """Revoke an API key by id (admin only). Idempotent-ish: 404 if unknown or
+    already revoked."""
+    from api_keys import api_key_manager
+    if not api_key_manager().revoke(key_id):
+        raise HTTPException(status_code=404, detail="Key not found or already revoked")
+    audit("api_key_revoked", "success", key_id=key_id,
+          by=token_info.get("preferred_username", "?"))
+    return {"revoked": True, "id": key_id}
+
+
+@app.get("/protected/apikey")
+def protected_by_api_key(key: dict = Depends(require_api_key)):
+    """Demo resource reachable with a valid X-API-Key header."""
+    return {"message": "authenticated via API key", "key_id": key["id"],
+            "key_name": key.get("name", "")}
+
+
 @app.get("/protected/service")
 def protected_service(token_info: dict = Depends(require_scope("m2m:access"))):
     """Machine-to-machine service resource — the guards in real use.
@@ -1351,7 +1434,8 @@ def userinfo(request: Request, token: str = Depends(oauth2_scheme)):
     if keycloak_oidc is None:
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
     try:
-        info = keycloak_oidc.userinfo(token)
+        with time_upstream("userinfo"):
+            info = keycloak_oidc.userinfo(token)
     except KeycloakAuthenticationError:
         record_token_op("userinfo", "invalid")
         raise HTTPException(status_code=401, detail="Invalid or expired token")

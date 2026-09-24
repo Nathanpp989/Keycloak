@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import time
+from contextlib import contextmanager
 
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
@@ -74,6 +75,32 @@ def record_token_result(outcome: str) -> None:
 def record_token_op(operation: str, outcome: str) -> None:
     """Increment the token-validation-op counter (introspect/userinfo/revoke)."""
     TOKEN_OPS.labels(operation=operation, outcome=outcome).inc()
+
+
+# Latency of upstream auth operations (Keycloak calls) — surfaces upstream
+# slowness distinct from app-side latency, so you can tell "is it us or Keycloak".
+UPSTREAM_LATENCY = Histogram(
+    "auth_upstream_op_duration_seconds",
+    "Latency of upstream auth operations (Keycloak) by operation",
+    ["operation"],   # token | refresh | introspect | userinfo | revoke | client
+)
+
+
+@contextmanager
+def time_upstream(operation: str):
+    """Time an upstream auth operation and record it into UPSTREAM_LATENCY.
+
+    Usage:
+        with time_upstream("introspect"):
+            keycloak_oidc.introspect(token)
+    Records the elapsed time whether the call succeeds or raises.
+    """
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        UPSTREAM_LATENCY.labels(operation=operation).observe(
+            time.perf_counter() - start)
 
 
 def record_forward_auth(decision: str) -> None:

@@ -2330,3 +2330,130 @@ def test_gzip_response_still_gets_correlation_header(client):
     r = client.get("/_big_corr", headers={"Accept-Encoding": "gzip"})
     assert r.headers.get("content-encoding") == "gzip"
     assert "x-request-id" in {k.lower() for k in r.headers}
+
+
+# ── #1 account lockout ──────────────────────────────────────────────────────
+
+def test_account_lockout_after_failures(client, monkeypatch):
+    import rate_limit
+    import account_lockout
+    monkeypatch.setenv("RATE_LIMIT_LOGIN_MAX", "100")   # don't let IP limit interfere
+    monkeypatch.setenv("LOCKOUT_MAX_FAILURES", "3")
+    monkeypatch.setenv("LOCKOUT_ENABLED", "true")
+    rate_limit.reset_all()
+    account_lockout.reset_lockouts()
+    from keycloak.exceptions import KeycloakAuthenticationError
+    fake = MagicMock()
+    fake.token.side_effect = KeycloakAuthenticationError("bad")
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    for _ in range(3):
+        assert client.post("/token", data={"username": "victim", "password": "w"}).status_code == 401
+    r = client.post("/token", data={"username": "victim", "password": "w"})
+    assert r.status_code == 429 and "locked" in r.json()["detail"].lower()
+    # a DIFFERENT user is unaffected
+    assert client.post("/token", data={"username": "other", "password": "w"}).status_code == 401
+    account_lockout.reset_lockouts()
+
+
+def test_lockout_cleared_on_success(client, monkeypatch):
+    import rate_limit
+    import account_lockout
+    monkeypatch.setenv("RATE_LIMIT_LOGIN_MAX", "100")
+    monkeypatch.setenv("LOCKOUT_MAX_FAILURES", "3")
+    rate_limit.reset_all()
+    account_lockout.reset_lockouts()
+    from keycloak.exceptions import KeycloakAuthenticationError
+    fake = MagicMock()
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    fake.token.side_effect = KeycloakAuthenticationError("bad")
+    for _ in range(2):
+        client.post("/token", data={"username": "u", "password": "x"})
+    fake.token.side_effect = None
+    fake.token.return_value = {"access_token": "t"}
+    assert client.post("/token", data={"username": "u", "password": "ok"}).status_code == 200
+    # counter reset -> two more failures don't lock
+    fake.token.side_effect = KeycloakAuthenticationError("bad")
+    for _ in range(2):
+        assert client.post("/token", data={"username": "u", "password": "x"}).status_code == 401
+    account_lockout.reset_lockouts()
+
+
+# ── #3 API-key auth ─────────────────────────────────────────────────────────
+
+def test_api_key_full_lifecycle(client, monkeypatch):
+    import api_keys
+    api_keys.reset_api_keys()
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        r = client.post("/admin/api-keys", data={"name": "svc1"})
+        assert r.status_code == 200
+        key, kid = r.json()["api_key"], r.json()["id"]
+        assert key.startswith("ak_")
+        # use it
+        r2 = client.get("/protected/apikey", headers={"X-API-Key": key})
+        assert r2.status_code == 200 and r2.json()["key_id"] == kid
+        # listed
+        assert any(k["id"] == kid for k in client.get("/admin/api-keys").json()["keys"])
+        # revoke -> key stops working
+        assert client.delete(f"/admin/api-keys/{kid}").status_code == 200
+        assert client.get("/protected/apikey", headers={"X-API-Key": key}).status_code == 401
+    finally:
+        main.app.dependency_overrides.clear()
+        api_keys.reset_api_keys()
+
+
+def test_api_key_missing_or_invalid_401(client):
+    assert client.get("/protected/apikey").status_code == 401
+    assert client.get("/protected/apikey", headers={"X-API-Key": "ak_x_y"}).status_code == 401
+
+
+def test_api_key_create_requires_admin(client, monkeypatch):
+    monkeypatch.setattr(main, "keycloak_oidc", None)  # no admin token
+    assert client.post("/admin/api-keys", data={"name": "x"}).status_code in (401, 403, 503)
+
+
+# ── #4 access log + #2 latency histogram ────────────────────────────────────
+
+def test_access_log_emitted(client, caplog):
+    import logging
+    with caplog.at_level(logging.INFO, logger="access"):
+        client.get("/health/live")
+    assert any("GET /health/live -> 200" in r.message for r in caplog.records)
+
+
+def test_upstream_latency_recorded(client, monkeypatch):
+    import metrics
+    fake = MagicMock()
+    fake.token.return_value = {"access_token": "t"}
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+
+    def _count(op):
+        for m in metrics.UPSTREAM_LATENCY.collect():
+            for s in m.samples:
+                if s.name.endswith("_count") and s.labels.get("operation") == op:
+                    return s.value
+        return 0.0
+    before = _count("token")
+    client.post("/token", data={"username": "u", "password": "p"})
+    assert _count("token") == before + 1
+
+
+def test_lockout_not_triggered_by_outage(client, monkeypatch):
+    # A Keycloak OUTAGE (generic error -> 503) must NOT count as a failed login,
+    # or an outage would lock users out. Only bad credentials count.
+    import rate_limit
+    import account_lockout
+    monkeypatch.setenv("RATE_LIMIT_LOGIN_MAX", "100")
+    monkeypatch.setenv("LOCKOUT_MAX_FAILURES", "2")
+    rate_limit.reset_all()
+    account_lockout.reset_lockouts()
+    fake = MagicMock()
+    fake.token.side_effect = RuntimeError("keycloak down")  # not an auth error
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    for _ in range(5):
+        client.post("/token", data={"username": "u", "password": "x"})  # -> 503s
+    # user must NOT be locked
+    fake.token.side_effect = None
+    fake.token.return_value = {"access_token": "t"}
+    assert client.post("/token", data={"username": "u", "password": "ok"}).status_code == 200
+    account_lockout.reset_lockouts()
