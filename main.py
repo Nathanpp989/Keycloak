@@ -1261,15 +1261,39 @@ def require_api_key(x_api_key: str = Header(default="")) -> dict:
 
 @app.post("/admin/api-keys")
 def create_api_key(name: str = Form(default=""),
+                   ttl_seconds: int = Form(default=0),
+                   scopes: str = Form(default=""),
                    token_info: dict = Depends(require_role(ADMIN_ROLE))):
     """Create an API key (admin only). The plaintext key is returned ONCE here
-    and never again — store it now. Only its hash is kept server-side."""
+    and never again — store it now. Only its hash is kept server-side.
+
+    ttl_seconds: >0 makes the key expire that many seconds from now (0 = never).
+    scopes: comma-separated list limiting what the key may do (enforced by
+    require_api_key_scope); empty = unrestricted."""
     from api_keys import api_key_manager
-    key_id, secret = api_key_manager().create(name)
+    scope_list = [s.strip() for s in scopes.split(",") if s.strip()]
+    key_id, secret = api_key_manager().create(
+        name, ttl_seconds=ttl_seconds or None, scopes=scope_list)
     audit("api_key_created", "success", key_id=key_id, name=name or "-",
+          ttl=ttl_seconds or "none", scopes=",".join(scope_list) or "-",
           by=token_info.get("preferred_username", "?"))
     return {"id": key_id, "name": name, "api_key": secret,
+            "expires_in": ttl_seconds or None, "scopes": scope_list,
             "note": "store this now — it will not be shown again"}
+
+
+def require_api_key_scope(*required: str):
+    """Dependency factory: authenticate via X-API-Key AND require the key to
+    carry all of `required` scopes. A key with no scopes is unrestricted only
+    where require_api_key (no scope) is used; here it must hold each scope."""
+    def _dep(key: dict = Depends(require_api_key)) -> dict:
+        have = set(key.get("scopes") or [])
+        if not set(required).issubset(have):
+            raise HTTPException(
+                status_code=403,
+                detail=f"API key missing required scope(s): {', '.join(required)}")
+        return key
+    return _dep
 
 
 @app.get("/admin/api-keys")
@@ -1297,6 +1321,13 @@ def protected_by_api_key(key: dict = Depends(require_api_key)):
     """Demo resource reachable with a valid X-API-Key header."""
     return {"message": "authenticated via API key", "key_id": key["id"],
             "key_name": key.get("name", "")}
+
+
+@app.get("/protected/apikey-scoped")
+def protected_by_api_key_scoped(key: dict = Depends(require_api_key_scope("read"))):
+    """Demo resource reachable only with an API key carrying the 'read' scope."""
+    return {"message": "reached with scope 'read'", "key_id": key["id"],
+            "scopes": key.get("scopes", [])}
 
 
 @app.get("/protected/service")

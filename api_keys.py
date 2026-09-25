@@ -97,17 +97,29 @@ class APIKeyManager:
         self._store = store if store is not None else _MemoryStore()
         self._lock = threading.Lock()   # serialize create/revoke within a process
 
-    def create(self, name: str = "") -> tuple[str, str]:
-        """Create a key. Returns (key_id, plaintext_key). Plaintext shown ONCE."""
+    def create(self, name: str = "", ttl_seconds: int | None = None,
+               scopes: list[str] | None = None) -> tuple[str, str]:
+        """Create a key. Returns (key_id, plaintext_key). Plaintext shown ONCE.
+
+        ttl_seconds: if set, the key expires that many seconds from now (None =
+        never expires). scopes: optional list limiting what the key may do
+        (enforced by require_api_key_scope); empty = no scope restriction.
+        """
         key_id = secrets.token_hex(8)
         full = f"{_KEY_PREFIX}{key_id}_{secrets.token_urlsafe(32)}"
+        now = time.time()
         with self._lock:
-            self._store.put(key_id, {"hash": _hash(full), "name": name,
-                                     "created": time.time(), "revoked": False})
+            self._store.put(key_id, {
+                "hash": _hash(full), "name": name, "created": now,
+                "revoked": False,
+                "expires_at": (now + ttl_seconds) if (ttl_seconds and ttl_seconds > 0) else None,
+                "scopes": list(scopes) if scopes else [],
+            })
         return key_id, full
 
     def verify(self, key: str) -> dict | None:
-        """Return {id,name,created} if the key is valid + not revoked, else None."""
+        """Return {id,name,created,expires_at,scopes} if the key is valid — not
+        revoked and not expired — else None."""
         if not key or not key.startswith(_KEY_PREFIX):
             return None
         body = key[len(_KEY_PREFIX):]
@@ -115,11 +127,16 @@ class APIKeyManager:
         if not key_id:
             return None
         rec = self._store.get(key_id)
-        if rec and not rec.get("revoked") and hmac.compare_digest(
-                str(rec.get("hash", "")), _hash(key)):
-            return {"id": key_id, "name": rec.get("name", ""),
-                    "created": rec.get("created")}
-        return None
+        if not rec or rec.get("revoked"):
+            return None
+        exp = rec.get("expires_at")
+        if exp is not None and time.time() > exp:      # expired
+            return None
+        if not hmac.compare_digest(str(rec.get("hash", "")), _hash(key)):
+            return None
+        return {"id": key_id, "name": rec.get("name", ""),
+                "created": rec.get("created"), "expires_at": exp,
+                "scopes": list(rec.get("scopes") or [])}
 
     def revoke(self, key_id: str) -> bool:
         with self._lock:
@@ -137,6 +154,8 @@ class APIKeyManager:
             if rec:
                 out.append({"id": kid, "name": rec.get("name", ""),
                             "created": rec.get("created"),
+                            "expires_at": rec.get("expires_at"),
+                            "scopes": list(rec.get("scopes") or []),
                             "revoked": bool(rec.get("revoked", False))})
         return out
 

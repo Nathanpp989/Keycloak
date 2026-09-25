@@ -84,3 +84,26 @@ def test_openbao_backed_store_full_roundtrip():
     assert kid in [k["id"] for k in m.list_keys()]
     assert m.revoke(kid) is True
     assert m.verify(key) is None           # revocation persisted (revoked=true)
+
+
+def test_api_key_expiration():
+    import time as t
+    import unittest.mock
+    from api_keys import APIKeyManager
+    m = APIKeyManager()
+    _, key = m.create("svc", ttl_seconds=1000)
+    assert m.verify(key) is not None                      # valid now
+    with unittest.mock.patch("api_keys.time.time", return_value=t.time() + 2000):
+        assert m.verify(key) is None                      # expired
+    _, perm = m.create("perm")                            # no ttl -> never expires
+    with unittest.mock.patch("api_keys.time.time", return_value=t.time() + 10**9):
+        assert m.verify(perm) is not None
+
+
+def test_api_key_scopes_carried():
+    from api_keys import APIKeyManager
+    m = APIKeyManager()
+    _, key = m.create("svc", scopes=["read", "write"])
+    meta = m.verify(key)
+    assert set(meta["scopes"]) == {"read", "write"}
+    assert meta["expires_at"] is None
