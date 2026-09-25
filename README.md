@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/Nathanpp989/Keycloak/actions/workflows/ci.yml/badge.svg)](https://github.com/Nathanpp989/Keycloak/actions/workflows/ci.yml)
 
+> **Configuration:** every environment variable is documented in [CONFIG.md](CONFIG.md). The HTTP API is browsable at `/docs` (OpenAPI) when `DOCS_ENABLED=true`. See [CHANGELOG.md](CHANGELOG.md) for what's in each release.
+
 A FastAPI application that brokers user authentication through Keycloak, with
 Auth0 wired in as an upstream OIDC identity provider (so users can log in via
 Auth0 and its social connections), and Azure Key Vault holding the Auth0
