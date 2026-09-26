@@ -1,6 +1,8 @@
 # authorize.py — Auth0 + Azure Key Vault helpers
 # Integrates with main.py (Keycloak).
 
+from __future__ import annotations
+
 import logging
 import os
 import threading

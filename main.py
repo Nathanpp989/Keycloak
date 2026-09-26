@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import json
 import logging
 import time
@@ -761,7 +763,11 @@ async def correlation_id_middleware(request: Request, call_next):
 app.middleware("http")(metrics_middleware)
 
 
-http_bearer     = HTTPBearer()
+# Missing/blank bearer credentials should be a 401, not a 403. FastAPI's
+# default HTTPBearer raises 403 when the Authorization header is absent; we
+# intercept that at the dependency boundary so the API presents a consistent
+# authentication failure to callers and clients.
+http_bearer = HTTPBearer(auto_error=False)
 
 # ── Auth dependency ───────────────────────────────────────────────────────────
 def _sanitize_header_value(value: str, max_len: int = 256) -> str:
@@ -825,6 +831,12 @@ def require_keycloak_auth(credentials=Depends(http_bearer)) -> dict:
     Returns the token info dict on success; raises 401/503 otherwise.
     Used to protect endpoints that must only be reachable by authenticated users.
     """
+    if credentials is None or not credentials.credentials:
+        raise HTTPException(
+            status_code=401,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     return _introspect_token(credentials.credentials)
 
 

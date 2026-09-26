@@ -37,6 +37,7 @@ import fnmatch
 import os
 import re
 import sys
+import sysconfig
 
 
 class Check:
@@ -161,7 +162,23 @@ def check_imports_shipped(c: Check) -> None:
                        fnmatch.fnmatch(name, p.rstrip("/")) for p in dockerignore)
 
     local = {f[:-3] for f in os.listdir(".") if f.endswith(".py")}
-    stdlib = set(sys.stdlib_module_names)
+    stdlib = set(sys.builtin_module_names)
+    stdlib_dirs = []
+    stdlib_path = sysconfig.get_paths().get("stdlib")
+    if stdlib_path:
+        stdlib_dirs.append(stdlib_path)
+        dynload = os.path.join(stdlib_path, "lib-dynload")
+        if os.path.isdir(dynload):
+            stdlib_dirs.append(dynload)
+    for base in stdlib_dirs:
+        if not os.path.isdir(base):
+            continue
+        for entry in os.listdir(base):
+            name, ext = os.path.splitext(entry)
+            if entry.endswith(".py") or entry.endswith(".so") or entry.endswith(".pyc"):
+                stdlib.add(name)
+            elif os.path.isdir(os.path.join(base, entry)) and not entry.startswith("__"):
+                stdlib.add(entry)
     reqs = open("requirements.txt").read().lower().replace("-", "") \
         if os.path.exists("requirements.txt") else ""
 
