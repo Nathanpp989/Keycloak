@@ -108,8 +108,16 @@ def test_protected_requires_credentials(client, monkeypatch):
     fake = MagicMock()
     monkeypatch.setattr(main, "keycloak_oidc", fake)
     r = client.get("/protected")  # no Authorization header
-    # HTTPBearer returns 401 when the Authorization header is absent
     assert r.status_code == 401
+    assert r.json()["detail"] == "Not authenticated"
+
+
+def test_protected_blank_bearer_header_is_401(client, monkeypatch):
+    fake = MagicMock()
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.get("/protected", headers={"Authorization": "Bearer "})
+    assert r.status_code == 401
+    assert r.json()["detail"] == "Not authenticated"
 
 def test_protected_introspect_returns_none(client, monkeypatch):
     # P2 regression: introspect returning None must yield 401, not an unhandled 500
