@@ -33,7 +33,7 @@ from logging_config import configure_logging, request_id_var  # noqa: E402
 from metrics import (  # noqa: E402
     metrics_middleware, render_metrics,
     record_token_result, record_forward_auth, record_token_op, time_upstream,
-    record_lockout,
+    record_lockout, record_api_key_auth,
 )
 from authz import (  # noqa: E402
     make_require_role, enforce_org_access, filter_orgs_to_accessible,
@@ -763,10 +763,10 @@ async def correlation_id_middleware(request: Request, call_next):
 app.middleware("http")(metrics_middleware)
 
 
-# Missing/blank bearer credentials should be a 401, not a 403. FastAPI's
-# default HTTPBearer raises 403 when the Authorization header is absent; we
-# intercept that at the dependency boundary so the API presents a consistent
-# authentication failure to callers and clients.
+# Missing/blank bearer credentials should be a 401, not a 403. FastAPI's default
+# HTTPBearer raises 403 when the Authorization header is absent; we intercept that
+# at the dependency boundary so the API presents a consistent authentication
+# failure (401) to callers and clients.
 http_bearer = HTTPBearer(auto_error=False)
 
 # ── Auth dependency ───────────────────────────────────────────────────────────
@@ -1266,8 +1266,10 @@ def require_api_key(x_api_key: str = Header(default="")) -> dict:
     from api_keys import api_key_manager
     meta = api_key_manager().verify(x_api_key)
     if meta is None:
+        record_api_key_auth("invalid")
         raise HTTPException(status_code=401, detail="Invalid or missing API key",
                             headers={"WWW-Authenticate": "ApiKey"})
+    record_api_key_auth("valid")
     return meta
 
 
@@ -1417,10 +1419,12 @@ def traefik_forward_auth(request: Request):
         from api_keys import api_key_manager
         meta = api_key_manager().verify(api_key)
         if meta is None:
+            record_api_key_auth("invalid")
             record_forward_auth("deny")
             audit("forward_auth", "deny", reason="invalid_api_key")
             raise HTTPException(status_code=401, detail="Invalid API key",
                                 headers={"WWW-Authenticate": "ApiKey"})
+        record_api_key_auth("valid")
         username = "apikey:" + str(meta.get("name") or meta["id"])
         subject = "apikey:" + str(meta["id"])
     else:

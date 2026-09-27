@@ -84,6 +84,20 @@ def record_lockout() -> None:
     ACCOUNT_LOCKOUTS.inc()
 
 
+# API-key authentication outcomes (via require_api_key or the ForwardAuth gateway).
+# A spike in "invalid" can signal a brute-force against the key endpoint.
+API_KEY_AUTH = Counter(
+    "auth_api_key_total",
+    "API-key authentication attempts by outcome",
+    ["outcome"],   # valid | invalid
+)
+
+
+def record_api_key_auth(outcome: str) -> None:
+    """Increment the API-key auth counter. outcome in {valid, invalid}."""
+    API_KEY_AUTH.labels(outcome=outcome).inc()
+
+
 def record_token_op(operation: str, outcome: str) -> None:
     """Increment the token-validation-op counter (introspect/userinfo/revoke)."""
     TOKEN_OPS.labels(operation=operation, outcome=outcome).inc()

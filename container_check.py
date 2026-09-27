@@ -33,11 +33,11 @@
 from __future__ import annotations
 
 import ast
+from pathlib import Path
 import fnmatch
 import os
 import re
 import sys
-import sysconfig
 
 
 class Check:
@@ -88,7 +88,7 @@ def check_dockerfile(path: str, c: Check) -> None:
     if not os.path.exists(path):
         c.fail(f"{path} is missing")
         return
-    text = open(path).read()
+    text = Path(path).read_text()
 
     # 1. No comment inside a continuation (silent truncation risk).
     bad = []
@@ -135,7 +135,7 @@ def check_dockerignore(c: Check) -> None:
         c.fail(".dockerignore is missing — tests and secrets would be sent to "
                "the build context")
         return
-    pats = [l.strip() for l in open(".dockerignore")
+    pats = [l.strip() for l in Path(".dockerignore").read_text().splitlines()
             if l.strip() and not l.startswith("#")]
 
     def ignored(name: str) -> bool:
@@ -153,7 +153,7 @@ def check_dockerignore(c: Check) -> None:
 def check_imports_shipped(c: Check) -> None:
     """Every module the app imports must be COPYed in, and every third-party
     package must be in requirements.txt, or the container dies on first run."""
-    dockerignore = [l.strip() for l in open(".dockerignore")
+    dockerignore = [l.strip() for l in Path(".dockerignore").read_text().splitlines()
                     if l.strip() and not l.startswith("#")] \
         if os.path.exists(".dockerignore") else []
 
@@ -162,24 +162,27 @@ def check_imports_shipped(c: Check) -> None:
                        fnmatch.fnmatch(name, p.rstrip("/")) for p in dockerignore)
 
     local = {f[:-3] for f in os.listdir(".") if f.endswith(".py")}
-    stdlib = set(sys.builtin_module_names)
-    stdlib_dirs = []
-    stdlib_path = sysconfig.get_paths().get("stdlib")
-    if stdlib_path:
-        stdlib_dirs.append(stdlib_path)
-        dynload = os.path.join(stdlib_path, "lib-dynload")
-        if os.path.isdir(dynload):
-            stdlib_dirs.append(dynload)
-    for base in stdlib_dirs:
-        if not os.path.isdir(base):
-            continue
-        for entry in os.listdir(base):
-            name, ext = os.path.splitext(entry)
-            if entry.endswith(".py") or entry.endswith(".so") or entry.endswith(".pyc"):
-                stdlib.add(name)
-            elif os.path.isdir(os.path.join(base, entry)) and not entry.startswith("__"):
-                stdlib.add(entry)
-    reqs = open("requirements.txt").read().lower().replace("-", "") \
+    # Prefer the fast built-in set (Python 3.10+); fall back to scanning the
+    # stdlib directory so this check also works on older interpreters.
+    if hasattr(sys, "stdlib_module_names"):
+        stdlib = set(sys.stdlib_module_names)
+    else:
+        import sysconfig
+        stdlib = set(sys.builtin_module_names)
+        stdlib_path = sysconfig.get_paths().get("stdlib")
+        for base in filter(None, [stdlib_path,
+                                  os.path.join(stdlib_path, "lib-dynload")
+                                  if stdlib_path else None]):
+            if not os.path.isdir(base):
+                continue
+            for entry in os.listdir(base):
+                name, _ext = os.path.splitext(entry)
+                if entry.endswith((".py", ".so", ".pyc")):
+                    stdlib.add(name)
+                elif (os.path.isdir(os.path.join(base, entry))
+                      and not entry.startswith("__")):
+                    stdlib.add(entry)
+    reqs = Path("requirements.txt").read_text().lower().replace("-", "") \
         if os.path.exists("requirements.txt") else ""
 
     # Walk the import graph from main.py through local modules only.
@@ -193,7 +196,7 @@ def check_imports_shipped(c: Check) -> None:
         if not shipped(f):
             missing_local.append(f)
             continue
-        for node in ast.walk(ast.parse(open(f).read())):
+        for node in ast.walk(ast.parse(Path(f).read_text())):
             mods = []
             if isinstance(node, ast.Import):
                 mods = [a.name.split(".")[0] for a in node.names]
@@ -230,7 +233,7 @@ def check_imports_shipped(c: Check) -> None:
         if not f.endswith(".py") or not shipped(f):
             continue
         try:
-            tree = ast.parse(open(f).read())
+            tree = ast.parse(Path(f).read_text())
         except SyntaxError:
             continue
         for node in ast.walk(tree):
@@ -260,7 +263,7 @@ def check_twins(c: Check) -> None:
     if not os.path.exists("Containerfile"):
         c.ok("single Dockerfile (standard Docker setup; no Containerfile twin)")
         return
-    if open("Dockerfile").read() == open("Containerfile").read():
+    if Path("Dockerfile").read_text() == Path("Containerfile").read_text():
         c.ok("Dockerfile and Containerfile are identical")
     else:
         c.fail("Dockerfile and Containerfile have DIVERGED — the two engines "
@@ -277,7 +280,7 @@ def check_compose(c: Check) -> None:
         c.warn("pyyaml not installed; skipping compose checks")
         return
     try:
-        conf = yaml.safe_load(open("compose.yaml"))
+        conf = yaml.safe_load(Path("compose.yaml").read_text())
     except Exception as exc:  # noqa: BLE001
         c.fail(f"compose.yaml is not valid YAML: {exc}")
         return
@@ -312,7 +315,7 @@ def check_traefik(c: Check) -> None:
     except ImportError:
         c.warn("pyyaml not installed; skipping Traefik checks")
         return
-    conf = yaml.safe_load(open("compose.yaml"))
+    conf = yaml.safe_load(Path("compose.yaml").read_text())
     services = conf.get("services") or {}
     if "traefik" not in services:
         return  # Traefik is optional; nothing to check.
@@ -360,7 +363,7 @@ def check_traefik(c: Check) -> None:
         c.fail(f"traefik: {dyn} is missing — the forward-auth middleware is "
                "referenced but never defined")
         return
-    d = yaml.safe_load(open(dyn))
+    d = yaml.safe_load(Path(dyn).read_text())
     mws = ((d or {}).get("http") or {}).get("middlewares") or {}
     fa = (mws.get("forward-auth") or {}).get("forwardAuth") or {}
     addr = fa.get("address", "")
@@ -384,7 +387,7 @@ def check_monitoring(c: Check) -> None:
         import yaml
     except ImportError:
         return
-    conf = yaml.safe_load(open("compose.yaml"))
+    conf = yaml.safe_load(Path("compose.yaml").read_text())
     services = conf.get("services") or {}
     if "prometheus" not in services and "grafana" not in services:
         return  # monitoring is optional; nothing to check
@@ -394,7 +397,7 @@ def check_monitoring(c: Check) -> None:
     if not os.path.exists(prom_cfg):
         c.fail(f"monitoring: {prom_cfg} missing — Prometheus has nothing to scrape")
     else:
-        pc = yaml.safe_load(open(prom_cfg))
+        pc = yaml.safe_load(Path(prom_cfg).read_text())
         targets = set()
         for job in pc.get("scrape_configs", []):
             for sc in job.get("static_configs", []):
@@ -436,7 +439,7 @@ def check_monitoring(c: Check) -> None:
                    "monitoring/alertmanager.yml missing")
         # Prometheus must reference the rules and point at alertmanager.
         if os.path.exists("monitoring/prometheus.yml"):
-            pbody = open("monitoring/prometheus.yml").read()
+            pbody = Path("monitoring/prometheus.yml").read_text()
             if "alert-rules.yml" in pbody:
                 c.ok("monitoring: Prometheus loads the alert rules")
             else:
@@ -452,12 +455,12 @@ def check_monitoring(c: Check) -> None:
     ds = "monitoring/grafana/provisioning/datasources/prometheus.yml"
     dash_dir = "monitoring/grafana/provisioning/dashboards"
     if os.path.exists(ds) and os.path.isdir(dash_dir):
-        ds_conf = yaml.safe_load(open(ds))
+        ds_conf = yaml.safe_load(Path(ds).read_text())
         ds_uids = {d.get("uid") for d in ds_conf.get("datasources", [])}
         import glob
         import json as _json
         for dash in glob.glob(os.path.join(dash_dir, "*.json")):
-            body = open(dash).read()
+            body = Path(dash).read_text()
             try:
                 _json.loads(body)  # must be valid JSON
             except ValueError:
