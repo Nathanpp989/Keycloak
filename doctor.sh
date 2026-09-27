@@ -69,7 +69,7 @@ if [ -n "${AUTH0_DOMAIN:-}" ]; then
   else _warn "Auth0 discovery not reachable ($AUTH0_DOMAIN)"; fi
 else _warn "AUTH0_DOMAIN not set — skipping Auth0 discovery check"; fi
 
-# 7. Traefik cert present + from the internal CA
+# 7. Traefik cert present + from the internal CA + not expiring soon
 CERT="traefik/dynamic/openbao-cert.pem"
 if [ -f "$CERT" ]; then
   if command -v openssl >/dev/null 2>&1; then
@@ -78,6 +78,18 @@ if [ -f "$CERT" ]; then
       *"Auth Broker Internal Root CA"*) _pass "Traefik cert present, issued by internal CA" ;;
       *) _warn "Traefik cert present but issuer unexpected: ${iss#issuer=}" ;;
     esac
+    # Expiry: warn under 14 days, fail if already expired.
+    end="$(openssl x509 -in "$CERT" -noout -enddate 2>/dev/null | cut -d= -f2)"
+    if [ -n "$end" ]; then
+      end_epoch="$(date -j -f '%b %d %T %Y %Z' "$end" +%s 2>/dev/null \
+                   || date -d "$end" +%s 2>/dev/null || echo 0)"
+      if [ "$end_epoch" -gt 0 ]; then
+        days=$(( (end_epoch - $(date +%s)) / 86400 ))
+        if [ "$days" -lt 0 ]; then _fail "Traefik cert EXPIRED ($end) — re-issue now"
+        elif [ "$days" -lt 14 ]; then _warn "Traefik cert expires in ${days}d ($end) — renew soon"
+        else _pass "Traefik cert valid for ${days} more days"; fi
+      fi
+    fi
   else _pass "Traefik cert present ($CERT)"; fi
 else _warn "no Traefik cert at $CERT (run ./bootstrap.sh to issue one)"; fi
 

@@ -611,6 +611,8 @@ def create_pki_role(role_name: str, *, mount: str = PKI_MOUNT,
                     allow_localhost: bool = True,
                     allow_ip_sans: bool = True,
                     max_ttl: str = "720h",
+                    key_type: str = "rsa",
+                    key_bits: int = 2048,
                     token: str | None = None,
                     addr: str | None = None) -> bool:
     """Create/replace a PKI role that constrains what certificates may be issued.
@@ -630,8 +632,8 @@ def create_pki_role(role_name: str, *, mount: str = PKI_MOUNT,
         "allow_localhost": allow_localhost,
         "allow_ip_sans": allow_ip_sans,
         "max_ttl": max_ttl,
-        "key_type": "rsa",
-        "key_bits": 2048,
+        "key_type": key_type,
+        "key_bits": key_bits,
     }
     if allowed_domains:
         body["allowed_domains"] = allowed_domains

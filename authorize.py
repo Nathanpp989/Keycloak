@@ -145,6 +145,30 @@ def get_secret(secret_name: str) -> str:
                             detail="Secret store unavailable")
     return value
 
+# ── Auth0 audience — cached (stable config; was a secret-store call per verify) ──
+_audience_cache: str | None = None
+_audience_lock = threading.Lock()
+
+
+def _get_auth0_audience() -> str:
+    """Return the Auth0 API audience, cached. It's a stable config value, so this
+    avoids a Key Vault / OpenBao round-trip on every token verification (which,
+    on a per-request auth path, was real latency and load on the secret store)."""
+    global _audience_cache
+    if _audience_cache is None:
+        with _audience_lock:
+            if _audience_cache is None:
+                _audience_cache = get_secret("AUTH0_AUDIENCE")
+    return _audience_cache
+
+
+def reset_auth0_audience_cache() -> None:
+    """Test hook: clear the cached audience."""
+    global _audience_cache
+    with _audience_lock:
+        _audience_cache = None
+
+
 # ── Auth0 M2M token — cached to avoid 4 external calls per request (I2 FIX) ──
 _auth0_token_cache: str | None = None
 _auth0_token_expiry: datetime = datetime.min.replace(tzinfo=timezone.utc)
@@ -195,7 +219,7 @@ def get_auth0_token() -> str:
         if _auth0_token_cache is None or datetime.now(timezone.utc) >= _auth0_token_expiry:
             client_id     = get_secret("AUTH0_CLIENT_ID")
             client_secret = get_secret("AUTH0_CLIENT_SECRET")
-            audience      = get_secret("AUTH0_AUDIENCE")
+            audience      = _get_auth0_audience()
             token, expires_in = authenticate_with_auth0(client_id, client_secret, audience)
             _auth0_token_cache  = token
             _auth0_token_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in - 60)
@@ -259,7 +283,7 @@ def _get_signing_key(domain: str, token: str):
 def verify_auth0_token(token: str) -> dict:
     """Validate an Auth0 JWT (RS256) using cached JWKS."""
     domain      = os.getenv("AUTH0_DOMAIN", "your-auth0-domain")
-    audience    = get_secret("AUTH0_AUDIENCE")
+    audience    = _get_auth0_audience()
     signing_key = _get_signing_key(domain, token)
     try:
         return jwt.decode(token, signing_key, algorithms=["RS256"],

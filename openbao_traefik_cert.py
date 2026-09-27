@@ -63,13 +63,24 @@ def ensure_pki(role: str, ca_common_name: str, allowed_domains: list) -> None:
     """
     ob.enable_pki_engine()
     ob.configure_pki_root_ca(ca_common_name)
-    ob.create_pki_role(role, allowed_domains=allowed_domains)
+    ob.create_pki_role(
+        role, allowed_domains=allowed_domains,
+        # RSA-2048 by default (widest client compatibility); set
+        # OPENBAO_CERT_KEY_TYPE=ec + OPENBAO_CERT_KEY_BITS=256 for ECDSA P-256.
+        key_type=os.environ.get("OPENBAO_CERT_KEY_TYPE", "rsa"),
+        key_bits=int(os.environ.get("OPENBAO_CERT_KEY_BITS", "2048")))
 
 
 def write_cert_files(cert_data: dict, out_dir: str) -> tuple[str, str]:
     """Write cert.pem (leaf + issuing CA) and key.pem into out_dir. Returns the
     two paths. The leaf is concatenated with the issuing CA so clients receive
-    the full chain, and key.pem is written 0600."""
+    the full chain, and key.pem is written 0600.
+
+    Writes are ATOMIC (temp file + os.replace): Traefik watches this directory
+    and hot-reloads on change, so a direct write could expose a half-written
+    cert and break TLS during rotation. With rename, Traefik only ever sees the
+    complete old or complete new file.
+    """
     os.makedirs(out_dir, exist_ok=True)
     cert_path = os.path.join(out_dir, "openbao-cert.pem")
     key_path = os.path.join(out_dir, "openbao-key.pem")
@@ -78,12 +89,21 @@ def write_cert_files(cert_data: dict, out_dir: str) -> tuple[str, str]:
     issuing = cert_data.get("issuing_ca", "")
     chain = leaf if not issuing else (leaf.rstrip() + "\n" + issuing.rstrip() + "\n")
 
-    # Write key first, locked down, THEN the cert — never leave a key world-readable.
-    fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # Key first (locked down), then cert — never leave a key world-readable, and
+    # both fully written to temp files before either is renamed into place.
+    key_tmp = key_path + ".tmp"
+    fd = os.open(key_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write(cert_data["private_key"].rstrip() + "\n")
-    with open(cert_path, "w") as f:
+        f.flush()
+        os.fsync(f.fileno())
+    cert_tmp = cert_path + ".tmp"
+    with open(cert_tmp, "w") as f:
         f.write(chain)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(key_tmp, key_path)     # atomic
+    os.replace(cert_tmp, cert_path)   # atomic
     return cert_path, key_path
 
 
@@ -97,6 +117,41 @@ def write_traefik_tls_config(out_dir: str, cert_container_path: str,
         f.write(_TRAEFIK_TLS_TEMPLATE.format(
             cert_path=cert_container_path, key_path=key_container_path))
     return config_path
+
+
+def cert_status(cert_path: str) -> dict:
+    """Return the current leaf cert's expiry status — read-only, for monitoring
+    and doctor.sh. Keys: exists, not_after (ISO), days_remaining, expired,
+    needs_renewal. Never raises; an unreadable cert reports exists=False."""
+    from datetime import datetime, timezone
+    from cryptography import x509
+    out = {"exists": False, "not_after": None, "days_remaining": None,
+           "expired": None, "needs_renewal": True}
+    if not os.path.exists(cert_path):
+        return out
+    try:
+        with open(cert_path, "rb") as f:
+            data = f.read()
+        import re as _re
+        blocks = _re.findall(
+            rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+            data, _re.DOTALL)
+        if not blocks:
+            return out
+        leaf = x509.load_pem_x509_certificate(blocks[0])
+    except Exception:  # noqa: BLE001
+        return out
+    now = datetime.now(timezone.utc)
+    na = leaf.not_valid_after_utc
+    remaining = (na - now).total_seconds()
+    out.update({
+        "exists": True,
+        "not_after": na.isoformat(),
+        "days_remaining": round(remaining / 86400.0, 1),
+        "expired": remaining <= 0,
+        "needs_renewal": cert_needs_renewal(cert_path),
+    })
+    return out
 
 
 def cert_needs_renewal(cert_path: str, *, renew_before_fraction: float = 0.33,
@@ -199,7 +254,21 @@ def main() -> int:
     p.add_argument("--renew", action="store_true",
                    help="Renewal mode: only re-issue if the existing cert is due "
                         "(safe to run on a cron/timer). Assumes PKI is set up.")
+    p.add_argument("--check", action="store_true",
+                   help="Report the current cert's expiry status and exit "
+                        "(read-only; needs no OpenBao). Exit 1 if expired.")
     args = p.parse_args()
+
+    # Expiry check: read-only, no OpenBao needed. Handy for monitoring/cron.
+    if args.check:
+        import json as _json
+        cert_path = os.path.join(args.out_dir, "openbao-cert.pem")
+        status = cert_status(cert_path)
+        print(_json.dumps(status, indent=2))
+        if not status["exists"]:
+            print("no cert found")
+            return 1
+        return 1 if status["expired"] else 0
 
     if not os.environ.get("OPENBAO_TOKEN"):
         print("SKIP: set OPENBAO_ADDR and OPENBAO_TOKEN to issue a cert.")

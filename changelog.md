@@ -73,7 +73,7 @@ monitoring stack. 728 tests; CI runs the unit suite plus a live smoke test.
 - Prometheus metrics: request counts/latency, token issuance, ForwardAuth
   decisions, token-validation ops (`auth_token_ops_total`), upstream Keycloak
   latency (`auth_upstream_op_duration_seconds`), account lockouts
-  (`auth_account_lockouts_total`).
+  (`auth_account_lockouts_total`), API-key auth (`auth_api_key_total`).
 - Alert rules: service down, high token-error / forward-deny / 5xx / latency
   rates, plus `HighAccountLockoutRate`, `HighUpstreamAuthLatency`,
   `HighTokenOpErrorRate`. Grafana + Alertmanager wired.
@@ -100,6 +100,7 @@ monitoring stack. 728 tests; CI runs the unit suite plus a live smoke test.
   app + the 9-check curl suite).
 
 ### Changed
+- Certificate process: `openbao_traefik_cert.py --check` reports cert expiry (read-only, no OpenBao); `doctor.sh` warns when the Traefik cert is expiring; the PKI role's key algorithm is configurable (OPENBAO_CERT_KEY_TYPE/BITS — RSA-2048 default, ECDSA opt-in).
 - Runs on the latest Python (3.14); container base image and CI updated. The suite passes on Python 3.12, 3.13, and 3.14 (all 728 tests). Pinned dependencies verified to install and work on 3.14.
 - Dependencies pinned to exact tested versions (`==`) for reproducible builds.
 - `/token/introspect`, `/token/revoke`, and `/userinfo` use a dedicated,
@@ -109,6 +110,10 @@ monitoring stack. 728 tests; CI runs the unit suite plus a live smoke test.
   startup 404 window without coupling Traefik's own startup to the app.
 
 ### Fixed
+- Test coverage: `test_api_keys.py`, `test_account_lockout.py`, and `test_openbao_traefik_cert.py` were missing from pytest.ini's `python_files` allow-list, so ~28 tests never ran in the full suite / CI. Now collected (suite: 731 -> 759).
+- Auth0: the API audience is cached instead of fetched from the secret store on every token verification (was a network round-trip per request).
+- OpenBao/Traefik: TLS cert/key files are written atomically (temp + rename), so Traefik can't hot-reload a half-written cert during rotation.
+- Missing/blank bearer credentials now return 401 (was 403): a consistent authentication failure. `container_check.py` no longer leaks file handles (uses `Path.read_text()`); stdlib detection works on older interpreters too.
 - `cmd_approle` passed an invalid keyword to `configure_approle`; provisioning
   crashed. Fixed with a regression test.
 - `configure_approle` did not enable the KV engine it grants access to, so a

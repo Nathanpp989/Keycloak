@@ -15,4 +15,9 @@ import rate_limit
 @pytest.fixture(autouse=True)
 def _reset_rate_limiters():
     rate_limit.reset_all()
+    try:
+        import authorize
+        authorize.reset_auth0_audience_cache()
+    except Exception:
+        pass
     yield
