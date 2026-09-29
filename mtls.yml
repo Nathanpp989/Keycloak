@@ -20,9 +20,17 @@ http:
       # reach the app with no TLS and no client cert. Pin it to websecure only.
       entryPoints:
         - websecure
-      service: app@docker          # reuse the app backend from the docker provider
+      # Point at the app backend explicitly (same address forward-auth.yml uses),
+      # rather than a cross-provider `app@docker` reference — more robust and it
+      # actually routes, so mtls.test.local serves the app (not a Traefik 404).
+      service: mtls-app
       tls:
         options: mtls@file
+  services:
+    mtls-app:
+      loadBalancer:
+        servers:
+          - url: "http://app:8000"
 
 tls:
   options:
