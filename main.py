@@ -1123,7 +1123,7 @@ def introspect_token(request: Request, token: str = Form(...)):
     # Surface only useful, non-sensitive claims.
     return {k: info[k] for k in
             ("active", "sub", "username", "preferred_username", "scope",
-             "aud", "exp", "iat", "client_id", "token_type")
+             "aud", "exp", "iat", "client_id", "token_type", "amr", "acr")
             if k in info}
 
 
@@ -1153,6 +1153,51 @@ def revoke_token(request: Request, refresh_token: str = Form(...)):
     record_token_op("revoke", "success")
     audit("token_revoked", "success")
     return {"revoked": True}
+
+
+@app.post("/token/exchange")
+def exchange_token_endpoint(
+        request: Request,
+        subject_token: str = Form(...),
+        audience: str = Form(default=""),
+        requested_token_type: str = Form(
+            default="urn:ietf:params:oauth:token-type:access_token")):
+    """RFC 8693 token exchange: swap a valid subject token for a new token scoped
+    to a target audience (delegation / downstream-service auth). Rate-limited
+    (token-ops bucket), fails closed. NOTE: Keycloak must have the token-exchange
+    feature enabled and the client configured for it, or this returns 4xx."""
+    try:
+        from rate_limit import token_ops_limiter, client_key
+        allowed, retry = token_ops_limiter().check_and_consume(client_key(request))
+        if not allowed:
+            raise HTTPException(
+                status_code=429, detail="Too many exchange attempts; slow down.",
+                headers={"Retry-After": str(int(retry) + 1)})
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("rate limiter error on /token/exchange (allowing): %s", exc)
+    if keycloak_oidc is None:
+        record_token_op("exchange", "unavailable")
+        raise HTTPException(status_code=503, detail="Authentication service unavailable")
+    try:
+        with time_upstream("exchange"):
+            tr = keycloak_oidc.exchange_token(
+                subject_token, audience=audience or None,
+                requested_token_type=requested_token_type)
+        record_token_op("exchange", "success")
+        audit("token_exchanged", "success", audience=audience or "-")
+        return _shape_token_response(tr)
+    except KeycloakAuthenticationError:
+        record_token_op("exchange", "invalid")
+        audit("token_exchanged", "denied", audience=audience or "-",
+              reason="invalid_or_not_permitted")
+        raise HTTPException(status_code=401,
+                            detail="Token exchange denied or not permitted")
+    except Exception as exc:  # noqa: BLE001
+        record_token_op("exchange", "error")
+        logger.error("Token exchange failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=503, detail="Authentication service unavailable")
 
 
 @app.post("/token/client")

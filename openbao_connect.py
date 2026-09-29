@@ -91,7 +91,7 @@ def _require_token(token: str | None) -> str:
 
 def _request(method: str, path: str, token: str | None = None,
              json_body: dict | None = None, addr: str | None = None,
-             timeout: int = 10) -> requests.Response:
+             timeout: int = 10, wrap_ttl: str | None = None) -> requests.Response:
     """Low-level OpenBao API call. `path` is the part after /v1/."""
     base = (addr or OPENBAO_ADDR).rstrip("/")
     # Catch the common "pasted the placeholder" mistake (OPENBAO_ADDR=... or an
@@ -105,7 +105,10 @@ def _request(method: str, path: str, token: str | None = None,
             "placeholder literally?")
     url = f"{base}/v1/{path.lstrip('/')}"
     try:
-        resp = requests.request(method, url, headers=_headers(token),
+        hdrs = _headers(token)
+        if wrap_ttl:
+            hdrs["X-Vault-Wrap-TTL"] = wrap_ttl
+        resp = requests.request(method, url, headers=hdrs,
                                 json=json_body, timeout=timeout)
     except requests.RequestException as exc:
         raise OpenBaoError(f"Could not reach OpenBao at {base}: {exc}. "
@@ -460,6 +463,23 @@ class OpenBaoSecrets:
             raise OpenBaoError(
                 f"Secret '{name}' has no 'value' field at {self.mount}/data/{name}")
         return value
+
+    def get_secret_wrapped(self, name: str, *, wrap_ttl: str = "120s") -> str:
+        """Read a secret but return a single-use RESPONSE-WRAPPING token instead of
+        the value. The value never reaches the caller directly — they exchange the
+        token once at sys/wrapping/unwrap (within wrap_ttl) to retrieve it. Tightens
+        delivery: a token leaked in transit/logs is useless once unwrapped, and
+        can't be unwrapped twice. Raises if OpenBao didn't wrap the response."""
+        _require_token(self.token)
+        resp = _request("GET", f"{self.mount}/data/{name}", token=self.token,
+                        addr=self.addr, wrap_ttl=wrap_ttl)
+        data = _check(resp, f"wrapped read '{name}'")
+        wrap_token = (data.get("wrap_info") or {}).get("token")
+        if not wrap_token:
+            raise OpenBaoError(
+                f"OpenBao did not wrap the response for '{name}' "
+                "(check the wrap_ttl and server support)")
+        return wrap_token
 
 
 def resolve_secret(name: str, *, prefer: str = "openbao") -> str:

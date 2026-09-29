@@ -14,6 +14,9 @@ access control, a Traefik ForwardAuth gateway, OpenBao-backed secrets, and a
 monitoring stack. 728 tests; CI runs the unit suite plus a live smoke test.
 
 ### Added — token & authorization API
+- `POST /token/exchange` — RFC 8693 token exchange (delegation to a target audience; needs Keycloak token-exchange enabled).
+- `/token/introspect` now surfaces `amr`/`acr` (MFA/auth-level) claims.
+- OpenBao `get_secret_wrapped()` — response-wrapped secret delivery (a single-use unwrap token instead of the plaintext value).
 - `POST /token` — password-grant login. Now also returns `refresh_token` and
   `expires_in` when Keycloak provides them.
 - `POST /token/refresh` — exchange a refresh token for a fresh access token.
