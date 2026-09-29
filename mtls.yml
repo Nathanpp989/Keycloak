@@ -1,0 +1,29 @@
+# mTLS at the edge — ACTIVE config.
+#
+# Serves a SEPARATE hostname (mtls.test.local) that requires callers to present a
+# client certificate signed by the internal CA. A separate host is deliberate:
+# Traefik resolves tls.options per-SNI (hostname), not per-path, so putting mTLS
+# on a path of app.test.local would force client certs on the WHOLE host and
+# break the browser/smoke tests. This host reuses the same app backend
+# (service: app@docker) but adds the client-cert requirement.
+#
+# Setup is handled by ./enable-mtls.sh (reissues the server cert to cover this
+# host, issues a client cert, writes openbao-ca.pem). Then add to /etc/hosts:
+#   127.0.0.1 mtls.test.local
+http:
+  routers:
+    mtls-demo:
+      rule: "Host(`mtls.test.local`)"
+      entrypoints: websecure
+      service: app@docker          # reuse the app backend from the docker provider
+      tls:
+        options: mtls@file
+
+tls:
+  options:
+    # Distinct name from `default` (in forward-auth.yml) so the two merge cleanly.
+    mtls:
+      clientAuth:
+        clientAuthType: RequireAndVerifyClientCert
+        caFiles:
+          - /etc/traefik/dynamic/openbao-ca.pem

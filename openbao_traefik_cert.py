@@ -119,6 +119,37 @@ def write_traefik_tls_config(out_dir: str, cert_container_path: str,
     return config_path
 
 
+def _atomic_write(path: str, content: str, mode: int) -> None:
+    """Write content to path atomically (temp + fsync + rename) with `mode`."""
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def issue_client_cert(common_name: str, out_dir: str, *, role: str = "traefik",
+                      ttl: str = "72h", token: str | None = None,
+                      addr: str | None = None) -> tuple[str, str, str]:
+    """Issue a CLIENT certificate (for mTLS callers) from the internal CA and
+    write client-<cn>.pem, client-<cn>-key.pem (0600), and openbao-ca.pem (the CA
+    Traefik verifies clients against). PKI roles allow client auth by default.
+    Returns (cert_path, key_path, ca_path)."""
+    import openbao_connect as ob
+    cert = ob.issue_certificate(role, common_name, ttl=ttl, token=token, addr=addr)
+    os.makedirs(out_dir, exist_ok=True)
+    safe = common_name.replace("*", "_").replace("/", "_")
+    cert_path = os.path.join(out_dir, f"client-{safe}.pem")
+    key_path = os.path.join(out_dir, f"client-{safe}-key.pem")
+    ca_path = os.path.join(out_dir, "openbao-ca.pem")
+    _atomic_write(key_path, cert["private_key"].rstrip() + "\n", 0o600)
+    _atomic_write(cert_path, cert["certificate"].rstrip() + "\n", 0o644)
+    _atomic_write(ca_path, (cert.get("issuing_ca") or "").rstrip() + "\n", 0o644)
+    return cert_path, key_path, ca_path
+
+
 def cert_status(cert_path: str) -> dict:
     """Return the current leaf cert's expiry status — read-only, for monitoring
     and doctor.sh. Keys: exists, not_after (ISO), days_remaining, expired,
@@ -240,7 +271,8 @@ def main() -> int:
     p.add_argument("--hostnames",
                    default="app.localhost,keycloak.localhost,openbao.localhost,"
                            "app.test.local,keycloak.test.local,"
-                           "openbao.test.local,traefik.test.local",
+                           "openbao.test.local,traefik.test.local,"
+                           "mtls.test.local",
                    help="Comma-separated hostnames for the cert (first is CN).")
     p.add_argument("--out-dir", default="./traefik/dynamic",
                    help="Where to write the cert files + Traefik TLS config.")
@@ -257,6 +289,9 @@ def main() -> int:
     p.add_argument("--check", action="store_true",
                    help="Report the current cert's expiry status and exit "
                         "(read-only; needs no OpenBao). Exit 1 if expired.")
+    p.add_argument("--client-cert", metavar="CN", default="",
+                   help="Issue a CLIENT certificate with this common name (for "
+                        "mTLS callers) into --out-dir, plus the CA, and exit.")
     args = p.parse_args()
 
     # Expiry check: read-only, no OpenBao needed. Handy for monitoring/cron.
@@ -269,6 +304,17 @@ def main() -> int:
             print("no cert found")
             return 1
         return 1 if status["expired"] else 0
+
+    if args.client_cert:
+        if not os.environ.get("OPENBAO_TOKEN"):
+            print("SKIP: set OPENBAO_ADDR and OPENBAO_TOKEN to issue a client cert.")
+            return 0
+        cert_path, key_path, ca_path = issue_client_cert(
+            args.client_cert, args.out_dir, role=args.role, ttl=args.ttl)
+        print(f"client cert: {cert_path}\nclient key:  {key_path}\nca:          {ca_path}")
+        print(f"\nUse it:  curl --cert {cert_path} --key {key_path} "
+              "https://app.test.local/...")
+        return 0
 
     if not os.environ.get("OPENBAO_TOKEN"):
         print("SKIP: set OPENBAO_ADDR and OPENBAO_TOKEN to issue a cert.")

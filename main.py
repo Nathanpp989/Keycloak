@@ -19,7 +19,8 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPBearer
 from authorize import router as auth0_router, oauth2_scheme
 from keycloak import KeycloakOpenID, KeycloakAdmin
-from keycloak.exceptions import KeycloakAuthenticationError, KeycloakPostError
+from keycloak.exceptions import (KeycloakAuthenticationError, KeycloakPostError,
+                                 KeycloakGetError)
 
 # User-flow integration (auth0_connect.py / auth0_talk.py / auth0_type.py)
 from auth0_connect import Auth0Connect, get_keycloak_admin_token
@@ -1667,6 +1668,51 @@ def users_membership(
     except Exception as exc:
         logger.error("Membership lookup failed: %s", exc)
         raise HTTPException(status_code=500, detail="Membership lookup failed")
+
+@app.get("/admin/users/{user_id}/sessions")
+def list_user_sessions(user_id: str,
+                       token_info: dict = Depends(require_role(ADMIN_ROLE))):
+    """List a user's active Keycloak sessions (admin only) — session id, IP, and
+    start/last-access times as Keycloak reports them. 404 if the user doesn't
+    exist; 503 if the Keycloak admin API is unreachable."""
+    try:
+        admin = _build_keycloak_admin()
+        sessions = admin.get_sessions(user_id)
+    except KeycloakGetError as exc:
+        if getattr(exc, "response_code", None) == 404:
+            raise HTTPException(status_code=404, detail=f"user '{user_id}' not found")
+        logger.error("session lookup failed for user '%s': %s", user_id, exc)
+        raise HTTPException(status_code=503, detail="Keycloak admin unavailable")
+    except Exception as exc:  # noqa: BLE001
+        logger.error("session lookup failed for user '%s': %s", user_id, exc)
+        raise HTTPException(status_code=503, detail="Keycloak admin unavailable")
+    audit("user_sessions_listed", "success", user_id=user_id,
+          count=len(sessions or []),
+          by=token_info.get("preferred_username", "?"))
+    return {"user_id": user_id, "sessions": sessions or []}
+
+
+@app.post("/admin/users/{user_id}/logout")
+def admin_logout_user(user_id: str,
+                token_info: dict = Depends(require_role(ADMIN_ROLE))):
+    """Force-logout a user: revoke ALL their Keycloak sessions immediately (admin
+    only). Use after a compromise or offboarding. 404 if the user doesn't exist;
+    503 if the Keycloak admin API is unreachable."""
+    try:
+        admin = _build_keycloak_admin()
+        admin.user_logout(user_id)
+    except (KeycloakGetError, KeycloakPostError) as exc:
+        if getattr(exc, "response_code", None) == 404:
+            raise HTTPException(status_code=404, detail=f"user '{user_id}' not found")
+        logger.error("logout failed for user '%s': %s", user_id, exc)
+        raise HTTPException(status_code=503, detail="Keycloak admin unavailable")
+    except Exception as exc:  # noqa: BLE001
+        logger.error("logout failed for user '%s': %s", user_id, exc)
+        raise HTTPException(status_code=503, detail="Keycloak admin unavailable")
+    audit("user_logged_out", "success", user_id=user_id,
+          by=token_info.get("preferred_username", "?"))
+    return {"user_id": user_id, "logged_out": True}
+
 
 @app.post("/admin/service-accounts/{client_id}/grants")
 def grant_service_account(

@@ -1,0 +1,27 @@
+# Postgres overlay for OpenBao dynamic database secrets.
+#
+#   docker compose -f compose.yaml -f compose.postgres.yaml up -d postgres
+#
+# Adds a Postgres that OpenBao connects to (as the admin user `vaultadmin`) to
+# create and drop SHORT-LIVED database users on demand. Nothing in the base stack
+# depends on it — it's opt-in, only for the dynamic-secrets flow.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: appdb
+      # OpenBao uses THIS account to create/drop the ephemeral users. Keep it out
+      # of the app's own credentials — the app never uses it directly.
+      POSTGRES_USER: vaultadmin
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-change-me-in-env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vaultadmin -d appdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  postgres-data:

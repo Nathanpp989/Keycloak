@@ -14,6 +14,7 @@ access control, a Traefik ForwardAuth gateway, OpenBao-backed secrets, and a
 monitoring stack. 728 tests; CI runs the unit suite plus a live smoke test.
 
 ### Added — token & authorization API
+- `GET /admin/users/{id}/sessions` and `POST /admin/users/{id}/logout` — list a user's active Keycloak sessions and force-logout (revoke all sessions) for compromise/offboarding response (admin only).
 - `POST /token/exchange` — RFC 8693 token exchange (delegation to a target audience; needs Keycloak token-exchange enabled).
 - `/token/introspect` now surfaces `amr`/`acr` (MFA/auth-level) claims.
 - OpenBao `get_secret_wrapped()` — response-wrapped secret delivery (a single-use unwrap token instead of the plaintext value).
@@ -51,6 +52,7 @@ monitoring stack. 728 tests; CI runs the unit suite plus a live smoke test.
   backend for shared limits across replicas.
 
 ### Added — secrets, PKI & auto-unseal (OpenBao)
+- Dynamic database secrets: `openbao_dynamic_secrets.py` (engine API), `compose.postgres.yaml` (opt-in Postgres), `provision_dynamic_secrets.py` (wires OpenBao->Postgres), and `test-dynamic-secrets.sh` (end-to-end lease lifecycle proof on a real stack).
 - Secrets resolved from Azure Key Vault and OpenBao, with AppRole login
   (least-privilege, token caching) so the app needs no root token.
 - OpenBao as an internal certificate authority: root CA, issuing role, safe
@@ -63,6 +65,7 @@ monitoring stack. 728 tests; CI runs the unit suite plus a live smoke test.
   to run). Also `BAO_UNSEAL_KEY` for an externally-provided unseal key.
 
 ### Added — edge, gateway & web-API
+- mTLS (activatable): `traefik/dynamic/mtls.yml` serves a separate `mtls.test.local` host requiring client certs; `enable-mtls.sh` reissues the server cert to cover it + issues a client cert; `test-mtls.sh` proves the handshake. Separate host avoids Traefik's per-SNI tls.options limit. Original scaffolding: `issue_client_cert()` + `--client-cert` issue a client cert from the internal CA; `traefik/dynamic/mtls.yml.example` requires client certs on a route; `test-mtls.sh` proves the handshake (rejected without a cert, accepted with) on a real stack.
 - Traefik ForwardAuth gateway (`/auth/forward`): fail-closed Bearer/API-key
   validation, sanitized `X-Auth-*` identity headers for upstreams.
 - `.test.local` / `.localhost` routing with browser-trusted TLS from the
