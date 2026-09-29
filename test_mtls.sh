@@ -10,7 +10,7 @@ if [ -f .env ]; then set -a; . ./.env; set +a; fi
 : "${OPENBAO_ADDR:=http://127.0.0.1:8200}"
 URL="${MTLS_URL:-https://mtls.test.local/health/live}"
 OUT="${OUT_DIR:-./traefik/dynamic}"
-CN="${CLIENT_CN:-mtls-test}"
+CN="${CLIENT_CN:-mtls.test.local}"
 
 pass() { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 fail() { printf '  \033[31m✗\033[0m %s\n' "$1"; exit 1; }
@@ -47,5 +47,13 @@ else
   pass "mTLS handshake succeeded with the client cert (HTTP $code past the TLS layer)"
 fi
 
+echo "3. Plain HTTP (port 80) must NOT reach the app (mTLS bypass guard)..."
+http_code="$(curl -s -o /dev/null -w '%{http_code}' "http://mtls.test.local/health/live" 2>/dev/null || echo 000)"
+if [ "$http_code" = "200" ]; then
+  fail "plain HTTP reached the app — the mtls router is on web:80 too (entryPoints bug)"
+else
+  pass "plain HTTP does not reach the app (HTTP $http_code — router is websecure-only)"
+fi
+
 echo ""
-echo "mTLS verified: rejected without a client cert, accepted with one."
+echo "mTLS verified: rejected without a client cert, accepted with one, no HTTP bypass."

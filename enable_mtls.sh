@@ -12,7 +12,7 @@ COMPOSE="docker compose -f compose.yaml -f compose.postgres.yaml"
 if [ -f .env ]; then set -a; . ./.env; set +a; fi
 : "${OPENBAO_ADDR:=http://127.0.0.1:8200}"
 OUT="${OUT_DIR:-./traefik/dynamic}"
-CN="${CLIENT_CN:-mtls-test}"
+CN="${CLIENT_CN:-mtls.test.local}"
 
 pass() { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 note() { printf '  \033[33m•\033[0m %s\n' "$1"; }

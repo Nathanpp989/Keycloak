@@ -14,7 +14,12 @@ http:
   routers:
     mtls-demo:
       rule: "Host(`mtls.test.local`)"
-      entrypoints: websecure
+      # File-provider YAML uses camelCase `entryPoints` as a LIST. The lowercase
+      # scalar form (valid only in docker labels) is ignored here, which would
+      # attach the router to ALL entrypoints incl. web:80 — letting plain HTTP
+      # reach the app with no TLS and no client cert. Pin it to websecure only.
+      entryPoints:
+        - websecure
       service: app@docker          # reuse the app backend from the docker provider
       tls:
         options: mtls@file
