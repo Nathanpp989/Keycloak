@@ -11,14 +11,14 @@
 
 set -uo pipefail
 OPENBAO_ADDR="${OPENBAO_ADDR:-http://127.0.0.1:8200}"
-APP_ADDR="${APP_ADDR:-http://127.0.0.1:8000}"
+APP_ADDR="${APP_ADDR:-https://app.test.local}"
 fails=0; warns=0
 
 _pass() { printf '  PASS  %s\n' "$1"; }
 _fail() { printf '  FAIL  %s\n' "$1"; fails=$((fails + 1)); }
 _warn() { printf '  WARN  %s\n' "$1"; warns=$((warns + 1)); }
 
-_code() { _o="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$1" 2>/dev/null)"; echo "${_o:-000}"; }
+_code() { _o="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "$1" 2>/dev/null)"; echo "${_o:-000}"; }
 
 echo "=============================================================="
 echo " auth-broker doctor"

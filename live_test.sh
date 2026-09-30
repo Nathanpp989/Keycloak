@@ -13,19 +13,31 @@ if [ -f .env ]; then set -a; . ./.env; set +a; fi
 
 names=(); results=()
 record() { names+=("$1"); results+=("$2"); }
+# Resolve a script to whatever it's actually named on this machine — hyphen or
+# underscore (this repo is edited on a Mac that uses underscore names).
+resolve() {
+  local n="$1" cand
+  for cand in "$n" "${n//-/_}" "${n//_/-}"; do
+    [ -f "./$cand" ] && { printf '%s' "$cand"; return 0; }
+  done
+  return 1
+}
 run() {
-  local name="$1" script="$2"; shift 2
+  local name="$1" base="$2"; shift 2
   printf '\n======================================================================\n'
   printf '  %s\n' "$name"
   printf '======================================================================\n'
-  if [ ! -f "./$script" ]; then record "$name" "SKIP (missing ./$script)"; return; fi
-  if "./$script" "$@"; then record "$name" "PASS"; else record "$name" "FAIL"; fi
+  local script
+  if ! script="$(resolve "$base")"; then record "$name" "SKIP (missing $base)"; return; fi
+  # Invoke via `bash` so an un-chmod'd script still runs (no +x required).
+  if bash "./$script" "$@"; then record "$name" "PASS"; else record "$name" "FAIL"; fi
 }
 
 echo "Preparing: ensuring Postgres is up + mTLS is activated..."
 $COMPOSE up -d postgres >/dev/null 2>&1 || true
 if [ ! -f traefik/dynamic/mtls.yml ] || [ ! -f traefik/dynamic/openbao-ca.pem ]; then
-  [ -x ./enable-mtls.sh ] && ./enable-mtls.sh || true
+  em="$(resolve enable-mtls.sh || true)"
+  [ -n "$em" ] && bash "./$em" || true
   docker compose restart traefik >/dev/null 2>&1 || true
   sleep 3
 fi
