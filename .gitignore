@@ -61,8 +61,6 @@ traefik/dynamic/tls-openbao.yml
 # against an accidental bind-mount or local copy.
 openbao/bao-init.json
 **/bao-init.json
-premalytics-broker-synced.tar.gz
-MANIFEST.txt
-.env.broken.bak
-server.key
-server.crt
+
+# Activated mTLS config (references the generated CA) — activate via enable-mtls.sh
+traefik/dynamic/mtls.yml

@@ -25,6 +25,14 @@ fi
 export OPENBAO_ADDR OPENBAO_TOKEN
 pass "OpenBao token acquired"
 
+echo "0. Activating mtls.yml from the template (if not already present)..."
+if [ ! -f "$OUT/mtls.yml" ]; then
+  cp "$OUT/mtls.yml.example" "$OUT/mtls.yml"
+  pass "activated $OUT/mtls.yml"
+else
+  pass "$OUT/mtls.yml already present"
+fi
+
 echo "1. Reissuing the server cert (now covers mtls.test.local)..."
 python3 openbao_traefik_cert.py >/dev/null
 pass "server cert reissued (SANs include mtls.test.local)"

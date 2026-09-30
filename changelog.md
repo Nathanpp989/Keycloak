@@ -90,6 +90,7 @@ monitoring stack. 728 tests; CI runs the unit suite plus a live smoke test.
   request id per request.
 
 ### Added — tooling
+- `live-test.sh` — one command runs every live proof against the running stack (health -> smoke -> dynamic secrets -> mTLS) and prints a pass/fail summary. `disable-mtls.sh` deactivates the opt-in mTLS route.
 - `bootstrap.sh` — one-command full-stack bring-up: cert issuance, optional
   `--provision`, and a `.env` preflight.
 - `provision.sh` — idempotent OpenBao AppRole + KV provisioning, writing creds
