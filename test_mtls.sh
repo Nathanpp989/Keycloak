@@ -31,29 +31,30 @@ fi
 [ -f "$CERT" ] && [ -f "$KEY" ] && [ -f "$CA" ] || fail "client cert/key/CA missing (run ./enable-mtls.sh)"
 pass "client cert present: $CERT"
 
-echo "1. Request WITHOUT a client cert should be REJECTED..."
-if curl -sf --cacert "$CA" "$URL" >/dev/null 2>&1; then
-  fail "request without a client cert SUCCEEDED — mTLS is not enforced on this host"
+echo "1. WITHOUT a client cert: must be refused at the TLS layer (no HTTP response)..."
+if curl -s -o /dev/null --cacert "$CA" "$URL" 2>/dev/null; then
+  code="$(curl -s -o /dev/null -w '%{http_code}' --cacert "$CA" "$URL" 2>/dev/null || true)"
+  fail "got an HTTP response (${code:-?}) without a client cert — mTLS is NOT enforced (mtls route/option not loaded)"
 else
-  pass "request without a client cert was rejected (as expected)"
+  pass "TLS handshake refused without a client cert — mTLS IS enforced"
 fi
 
-echo "2. Request WITH the client cert should SUCCEED..."
-code="$(curl -s -o /dev/null -w '%{http_code}' --cacert "$CA" \
-        --cert "$CERT" --key "$KEY" "$URL" 2>/dev/null || echo 000)"
-if [ "$code" = "000" ]; then
-  fail "TLS handshake failed even WITH the client cert (check caFiles / cert chain / hostname)"
-else
-  pass "mTLS handshake succeeded with the client cert (HTTP $code past the TLS layer)"
-fi
+echo "2. WITH the client cert: must succeed with HTTP 200 (reaches the app)..."
+code_cert="$(curl -s -o /dev/null -w '%{http_code}' --cacert "$CA" \
+             --cert "$CERT" --key "$KEY" "$URL" 2>/dev/null || true)"
+case "$code_cert" in
+  200)    pass "HTTP 200 with the client cert — mTLS handshake AND routing both work" ;;
+  ""|000) fail "TLS handshake failed even WITH the client cert (stale openbao-ca.pem? run ./enable-mtls.sh)" ;;
+  *)      fail "handshake OK but HTTP $code_cert (not 200) — the mtls route isn't serving the app (check the service in mtls.yml)" ;;
+esac
 
 echo "3. Plain HTTP (port 80) must NOT reach the app (mTLS bypass guard)..."
-http_code="$(curl -s -o /dev/null -w '%{http_code}' "http://mtls.test.local/health/live" 2>/dev/null || echo 000)"
+http_code="$(curl -s -o /dev/null -w '%{http_code}' "http://mtls.test.local/health/live" 2>/dev/null || true)"
 if [ "$http_code" = "200" ]; then
   fail "plain HTTP reached the app — the mtls router is on web:80 too (entryPoints bug)"
 else
-  pass "plain HTTP does not reach the app (HTTP $http_code — router is websecure-only)"
+  pass "plain HTTP does not reach the app (HTTP ${http_code:-000} — router is websecure-only)"
 fi
 
 echo ""
-echo "mTLS verified: rejected without a client cert, accepted with one, no HTTP bypass."
+echo "mTLS verified: refused without a client cert (no TLS), HTTP 200 with one, no HTTP bypass."
