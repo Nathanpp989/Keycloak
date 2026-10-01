@@ -46,6 +46,7 @@ run "Health (doctor.sh)"          doctor.sh
 run "Smoke tests"                 smoke-test.sh
 run "Dynamic secrets"             test-dynamic-secrets.sh
 run "mTLS"                        test-mtls.sh
+run "Auth0 org-sync"              test-org-sync.sh
 
 printf '\n======================================================================\n'
 printf '  LIVE TEST SUMMARY\n'
