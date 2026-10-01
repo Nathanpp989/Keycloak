@@ -1714,6 +1714,27 @@ def admin_logout_user(user_id: str,
     return {"user_id": user_id, "logged_out": True}
 
 
+@app.post("/admin/org-sync")
+def admin_org_sync(dry_run: bool = Form(default=False),
+                   token_info: dict = Depends(require_role(ADMIN_ROLE))):
+    """Sync Auth0 Organizations into Keycloak groups (one-way, adopt-and-link),
+    admin only. dry_run=true computes the plan without writing to Keycloak.
+    Returns {created, adopted, failed, total, dry_run}."""
+    from auth0_org_sync import run_sync
+    try:
+        summary = run_sync(dry_run=dry_run)
+    except KeyError as exc:
+        raise HTTPException(status_code=503,
+                            detail=f"Auth0 not configured (missing {exc})")
+    except Exception as exc:  # noqa: BLE001
+        logger.error("org-sync failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=502, detail="Organization sync failed")
+    audit("org_sync", "success", created=len(summary["created"]),
+          adopted=len(summary["adopted"]), failed=len(summary["failed"]),
+          dry_run=dry_run, by=token_info.get("preferred_username", "?"))
+    return summary
+
+
 @app.post("/admin/service-accounts/{client_id}/grants")
 def grant_service_account(
     client_id: str,

@@ -14,6 +14,7 @@ access control, a Traefik ForwardAuth gateway, OpenBao-backed secrets, and a
 monitoring stack. 728 tests; CI runs the unit suite plus a live smoke test.
 
 ### Added — token & authorization API
+- Auth0 org-sync: `POST /admin/org-sync` mirrors Auth0 Organizations into Keycloak groups (one-way, adopt-and-link; `auth0_org_sync.py`). `test-org-sync.sh` proves it end to end against a real tenant. Needs the M2M app scoped for `read:organizations` (and `create:organizations` for the live test).
 - `GET /admin/users/{id}/sessions` and `POST /admin/users/{id}/logout` — list a user's active Keycloak sessions and force-logout (revoke all sessions) for compromise/offboarding response (admin only).
 - `POST /token/exchange` — RFC 8693 token exchange (delegation to a target audience; needs Keycloak token-exchange enabled).
 - `/token/introspect` now surfaces `amr`/`acr` (MFA/auth-level) claims.
