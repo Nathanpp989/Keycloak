@@ -73,6 +73,9 @@ when `DOCS_ENABLED=true`.
 | Variable | Default | Purpose |
 |---|---|---|
 | `BAO_AUTO_UNSEAL` | `0` | `1` = seal-backed auto-unseal (KMS/transit); init with recovery keys, no persisted unseal key. |
+| `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` | _(empty)_ | Azure Key Vault seal creds (omit the secret for a managed identity). |
+| `AZURE_KEY_VAULT_NAME` | _(empty)_ | Key Vault holding the unseal key (compose passes it as `VAULT_NAME`). |
+| `AZURE_UNSEAL_KEY_NAME` | `openbao-unseal` | RSA key name for the seal (passed as `VAULT_KEY_NAME`). |
 | `BAO_UNSEAL_KEY` | _(empty)_ | Unseal from this key (e.g. a Docker secret) instead of the volume file. |
 
 ## Rate limiting
