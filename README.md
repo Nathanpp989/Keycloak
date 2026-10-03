@@ -753,6 +753,8 @@ Trust the CA once and it stays valid across restarts:
     openssl x509 -in /tmp/openbao-ca.pem -noout -subject          # sanity check
     sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain /tmp/openbao-ca.pem
 
+   **Cross-platform:** `./trust-ca.sh` detects your OS (macOS, Linux Debian/RHEL, or Windows) and runs the right CA-trust + hosts step; `./trust-ca.sh --print` shows the exact commands without running them.
+
 Note: the app's `OPENBAO_TOKEN` env still defaults to `root`, which no longer
 exists. OpenBao secret resolution is opt-in and off by default (`OPENBAO_MODE=auto`
 falls back to Key Vault), so this doesn't affect normal operation — but if you

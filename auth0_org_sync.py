@@ -81,6 +81,84 @@ def sync_organizations(orgs_api, admin, *, dry_run: bool = False) -> dict:
     return summary
 
 
+def _all_members(orgs_api, org_id: str, page_size: int = 50) -> list:
+    """Fetch every member of an Auth0 org, paging until a short page."""
+    out: list = []
+    page = 0
+    while True:
+        batch = orgs_api.list_members(org_id, page=page, per_page=page_size)
+        out.extend(batch)
+        if len(batch) < page_size:
+            return out
+        page += 1
+
+
+def sync_org_members(orgs_api, admin, *, dry_run: bool = False) -> dict:
+    """For each Auth0 org, add its members to the org's Keycloak group, matching
+    Auth0 users to Keycloak users by EMAIL.
+
+    ADD-only: it never removes anyone from a group. Removing members that have
+    left the Auth0 org is a deliberate, higher-risk reconciliation step (it
+    revokes access) and is intentionally NOT done here. Requires each org's group
+    to already exist — run sync_organizations first (orgs with no group yet are
+    reported under no_group).
+
+    Matching is by email because that's the one stable identifier both systems
+    share; a member with no email, or with no Keycloak user at that email, is
+    reported under unmatched rather than guessed at.
+
+    Returns {added, already_member, unmatched, no_group, failed, orgs, dry_run} —
+    each a list of emails (or org names for no_group).
+    """
+    orgs = _all_organizations(orgs_api)
+    kc_groups = {g.get("name"): g for g in admin.get_groups()}
+    summary: dict = {"added": [], "already_member": [], "unmatched": [],
+                     "no_group": [], "failed": [], "orgs": len(orgs),
+                     "dry_run": dry_run}
+    for org in orgs:
+        name = org.get("name") or ""
+        group = kc_groups.get(name)
+        if not group:
+            summary["no_group"].append(name)
+            continue
+        gid = group["id"]
+        existing_ids = {u.get("id") for u in admin.get_group_members(gid)}
+        for member in _all_members(orgs_api, org.get("id")):
+            email = member.get("email")
+            if not email:
+                continue
+            matches = admin.get_users({"email": email, "exact": True})
+            if not matches:
+                summary["unmatched"].append(email)
+                continue
+            uid = matches[0].get("id")
+            if uid in existing_ids:
+                summary["already_member"].append(email)
+                continue
+            try:
+                if not dry_run:
+                    admin.group_user_add(uid, gid)
+                summary["added"].append(email)
+            except Exception as exc:  # noqa: BLE001 — one bad add shouldn't abort
+                logger.error("adding '%s' to group '%s' failed: %s", email, name, exc)
+                summary["failed"].append(email)
+    return summary
+
+
+def run_member_sync(*, dry_run: bool = False) -> dict:
+    """Build clients from env/broker config and sync org membership."""
+    import os
+    from auth0_talk import Auth0Connect, Auth0OrganizationsAPI
+    from main import _build_keycloak_admin
+
+    auth0 = Auth0Connect(os.environ["AUTH0_DOMAIN"],
+                         os.environ["AUTH0_CLIENT_ID"],
+                         os.environ["AUTH0_CLIENT_SECRET"])
+    orgs_api = Auth0OrganizationsAPI(auth0)
+    admin = _build_keycloak_admin()
+    return sync_org_members(orgs_api, admin, dry_run=dry_run)
+
+
 def run_sync(*, dry_run: bool = False) -> dict:
     """Build the Auth0 + Keycloak clients from env/broker config and sync.
     Used by the /admin/org-sync endpoint and the live-test script."""

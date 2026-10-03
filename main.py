@@ -1735,6 +1735,27 @@ def admin_org_sync(dry_run: bool = Form(default=False),
     return summary
 
 
+@app.post("/admin/org-sync/members")
+def admin_org_member_sync(dry_run: bool = Form(default=False),
+                          token_info: dict = Depends(require_role(ADMIN_ROLE))):
+    """Sync Auth0 org MEMBERSHIP into Keycloak group membership (add-only, matched
+    by email), admin only. Run after /admin/org-sync (members need their group to
+    exist). dry_run=true previews without writing. Returns the member-sync summary."""
+    from auth0_org_sync import run_member_sync
+    try:
+        summary = run_member_sync(dry_run=dry_run)
+    except KeyError as exc:
+        raise HTTPException(status_code=503,
+                            detail=f"Auth0 not configured (missing {exc})")
+    except Exception as exc:  # noqa: BLE001
+        logger.error("org member-sync failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=502, detail="Organization member sync failed")
+    audit("org_member_sync", "success", added=len(summary["added"]),
+          already=len(summary["already_member"]), unmatched=len(summary["unmatched"]),
+          dry_run=dry_run, by=token_info.get("preferred_username", "?"))
+    return summary
+
+
 @app.post("/admin/service-accounts/{client_id}/grants")
 def grant_service_account(
     client_id: str,
