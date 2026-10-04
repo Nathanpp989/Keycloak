@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-broker
+  namespace: auth-broker
+  labels:
+    app: auth-broker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: auth-broker
+  template:
+    metadata:
+      labels:
+        app: auth-broker
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: auth-broker
+          image: REGISTRY/auth-broker:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: auth-broker-config
+            - secretRef:
+                name: auth-broker-secrets
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: keys
+              mountPath: /data/keys
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # Per-pod ephemeral. For RSA keys SHARED across replicas, mount a Secret
+        # or a ReadWriteMany PVC instead (see k8s/README.md).
+        - name: keys
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

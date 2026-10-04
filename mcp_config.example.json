@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "auth-broker": {
+      "command": "python3",
+      "args": ["/absolute/path/to/mcp_server.py"],
+      "env": {
+        "BROKER_URL": "https://app.test.local",
+        "BROKER_TOKEN": "<an admin bearer token>",
+        "BROKER_VERIFY": "true"
+      }
+    }
+  }
+}

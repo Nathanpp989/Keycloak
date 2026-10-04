@@ -15,7 +15,7 @@ monitoring stack. 728 tests; CI runs the unit suite plus a live smoke test.
 
 ### Added — token & authorization API
 - Auth0 org-sync: `POST /admin/org-sync` mirrors Auth0 Organizations into Keycloak groups (one-way, adopt-and-link; `auth0_org_sync.py`). `test-org-sync.sh` proves it end to end against a real tenant. Needs the M2M app scoped for `read:organizations` (and `create:organizations` for the live test).
-- `POST /admin/org-sync/members` adds Auth0 org members to their Keycloak group (matched by email, add-only); `test-org-membership.sh` proves it end to end. Needs `read:organization_members` (+ user scopes for the test).
+- `POST /admin/org-sync/members` adds Auth0 org members to their Keycloak group (matched by email). Add-only by default; `remove_absent=true` reconciles (removes members no longer in the Auth0 org — opt-in, revokes access). `test-org-membership.sh` proves it end to end. Needs `read:organization_members` (+ user scopes for the test).
 - `GET /admin/users/{id}/sessions` and `POST /admin/users/{id}/logout` — list a user's active Keycloak sessions and force-logout (revoke all sessions) for compromise/offboarding response (admin only).
 - `POST /token/exchange` — RFC 8693 token exchange (delegation to a target audience; needs Keycloak token-exchange enabled).
 - `/token/introspect` now surfaces `amr`/`acr` (MFA/auth-level) claims.
@@ -54,6 +54,7 @@ monitoring stack. 728 tests; CI runs the unit suite plus a live smoke test.
   backend for shared limits across replicas.
 
 ### Added — secrets, PKI & auto-unseal (OpenBao)
+- Azure Key Vault auto-unseal scaffolding: `openbao/config.azure.hcl.example` (env-driven seal), `compose.azure-kms.yaml` overlay, and `check-azure-kms.sh` preflight (verifies the Vault/key before boot). Mechanism proven via the transit seal; the Azure path is verify-on-your-Key-Vault.
 - Dynamic database secrets: `openbao_dynamic_secrets.py` (engine API), `compose.postgres.yaml` (opt-in Postgres), `provision_dynamic_secrets.py` (wires OpenBao->Postgres), and `test-dynamic-secrets.sh` (end-to-end lease lifecycle proof on a real stack).
 - Secrets resolved from Azure Key Vault and OpenBao, with AppRole login
   (least-privilege, token caching) so the app needs no root token.
@@ -92,6 +93,7 @@ monitoring stack. 728 tests; CI runs the unit suite plus a live smoke test.
   request id per request.
 
 ### Added — tooling
+- MCP server (`mcp_server.py`, optional — own deps in requirements-mcp.txt): exposes safe operational tools (health, token introspection, API-key management, user sessions, org-sync) to an AI assistant via the Model Context Protocol. Does NOT expose password-grant login. `mcp-config.example.json` shows how to register it.
 - `live-test.sh` — one command runs every live proof against the running stack (health -> smoke -> dynamic secrets -> mTLS) and prints a pass/fail summary. `disable-mtls.sh` deactivates the opt-in mTLS route.
 - `bootstrap.sh` — one-command full-stack bring-up: cert issuance, optional
   `--provision`, and a `.env` preflight.

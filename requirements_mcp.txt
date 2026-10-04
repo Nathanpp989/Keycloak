@@ -1,0 +1,4 @@
+# Dependencies for the OPTIONAL MCP server (mcp_server.py) only — NOT needed by
+# the broker itself. Install separately:  pip install -r requirements-mcp.txt
+mcp==2.3.0
+httpx==0.28.1

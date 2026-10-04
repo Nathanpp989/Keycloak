@@ -69,7 +69,13 @@ def sync_organizations(orgs_api, admin, *, dry_run: bool = False) -> dict:
         try:
             if name in existing:
                 if not dry_run:
-                    admin.update_group(existing[name]["id"], {"attributes": attrs})
+                    # MERGE, don't replace: a group that already existed (e.g.
+                    # created by hand) may carry attributes we must not wipe.
+                    gid = existing[name]["id"]
+                    current = (admin.get_group(gid) or {}).get("attributes") or {}
+                    merged = dict(current)
+                    merged.update(attrs)
+                    admin.update_group(gid, {"attributes": merged})
                 summary["adopted"].append(name)
             else:
                 if not dry_run:
@@ -93,28 +99,33 @@ def _all_members(orgs_api, org_id: str, page_size: int = 50) -> list:
         page += 1
 
 
-def sync_org_members(orgs_api, admin, *, dry_run: bool = False) -> dict:
+def sync_org_members(orgs_api, admin, *, dry_run: bool = False,
+                     remove_absent: bool = False) -> dict:
     """For each Auth0 org, add its members to the org's Keycloak group, matching
     Auth0 users to Keycloak users by EMAIL.
 
-    ADD-only: it never removes anyone from a group. Removing members that have
-    left the Auth0 org is a deliberate, higher-risk reconciliation step (it
-    revokes access) and is intentionally NOT done here. Requires each org's group
-    to already exist — run sync_organizations first (orgs with no group yet are
-    reported under no_group).
+    By default this is ADD-only. With remove_absent=True it also RECONCILES:
+    Keycloak group members who are not current Auth0-org members are removed —
+    i.e. the Auth0 org becomes the source of truth for that group. This is opt-in
+    and higher-risk: it revokes access, and it will also remove anyone added to
+    the group by hand (they aren't in the Auth0 org). Leave it off unless you
+    truly want Auth0 to own the membership.
 
-    Matching is by email because that's the one stable identifier both systems
-    share; a member with no email, or with no Keycloak user at that email, is
-    reported under unmatched rather than guessed at.
+    Requires each org's group to already exist — run sync_organizations first
+    (orgs with no group yet are reported under no_group).
 
-    Returns {added, already_member, unmatched, no_group, failed, orgs, dry_run} —
-    each a list of emails (or org names for no_group).
+    Matching is by email (the one stable shared identifier); a member with no
+    email, or no Keycloak user at that email, is reported under unmatched.
+
+    Returns {added, already_member, removed, unmatched, no_group, failed, orgs,
+    dry_run, remove_absent} — lists of emails (org names for no_group).
     """
     orgs = _all_organizations(orgs_api)
     kc_groups = {g.get("name"): g for g in admin.get_groups()}
-    summary: dict = {"added": [], "already_member": [], "unmatched": [],
-                     "no_group": [], "failed": [], "orgs": len(orgs),
-                     "dry_run": dry_run}
+    summary: dict = {"added": [], "already_member": [], "removed": [],
+                     "unmatched": [], "no_group": [], "failed": [],
+                     "orgs": len(orgs), "dry_run": dry_run,
+                     "remove_absent": remove_absent}
     for org in orgs:
         name = org.get("name") or ""
         group = kc_groups.get(name)
@@ -122,7 +133,9 @@ def sync_org_members(orgs_api, admin, *, dry_run: bool = False) -> dict:
             summary["no_group"].append(name)
             continue
         gid = group["id"]
-        existing_ids = {u.get("id") for u in admin.get_group_members(gid)}
+        existing = {u.get("id"): u for u in admin.get_group_members(gid)}
+        existing_ids = set(existing)
+        auth0_kc_ids: set = set()        # KC ids backed by a CURRENT Auth0 member
         for member in _all_members(orgs_api, org.get("id")):
             email = member.get("email")
             if not email:
@@ -132,6 +145,7 @@ def sync_org_members(orgs_api, admin, *, dry_run: bool = False) -> dict:
                 summary["unmatched"].append(email)
                 continue
             uid = matches[0].get("id")
+            auth0_kc_ids.add(uid)
             if uid in existing_ids:
                 summary["already_member"].append(email)
                 continue
@@ -142,10 +156,23 @@ def sync_org_members(orgs_api, admin, *, dry_run: bool = False) -> dict:
             except Exception as exc:  # noqa: BLE001 — one bad add shouldn't abort
                 logger.error("adding '%s' to group '%s' failed: %s", email, name, exc)
                 summary["failed"].append(email)
+        if remove_absent:
+            # KC group members not backed by a current Auth0 org member.
+            for uid in existing_ids - auth0_kc_ids:
+                who = existing[uid].get("email") or uid
+                try:
+                    if not dry_run:
+                        admin.group_user_remove(uid, gid)
+                    summary["removed"].append(who)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("removing '%s' from group '%s' failed: %s",
+                                 who, name, exc)
+                    summary["failed"].append(who)
     return summary
 
 
-def run_member_sync(*, dry_run: bool = False) -> dict:
+def run_member_sync(*, dry_run: bool = False,
+                     remove_absent: bool = False) -> dict:
     """Build clients from env/broker config and sync org membership."""
     import os
     from auth0_talk import Auth0Connect, Auth0OrganizationsAPI
@@ -156,7 +183,8 @@ def run_member_sync(*, dry_run: bool = False) -> dict:
                          os.environ["AUTH0_CLIENT_SECRET"])
     orgs_api = Auth0OrganizationsAPI(auth0)
     admin = _build_keycloak_admin()
-    return sync_org_members(orgs_api, admin, dry_run=dry_run)
+    return sync_org_members(orgs_api, admin, dry_run=dry_run,
+                            remove_absent=remove_absent)
 
 
 def run_sync(*, dry_run: bool = False) -> dict:

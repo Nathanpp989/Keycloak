@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: auth-broker
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - secret.yaml        # create from secret.example.yaml (gitignored)
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+images:
+  - name: REGISTRY/auth-broker
+    newName: your-registry.example.com/auth-broker
+    newTag: "1.0.0"

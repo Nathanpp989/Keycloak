@@ -1737,13 +1737,14 @@ def admin_org_sync(dry_run: bool = Form(default=False),
 
 @app.post("/admin/org-sync/members")
 def admin_org_member_sync(dry_run: bool = Form(default=False),
+                          remove_absent: bool = Form(default=False),
                           token_info: dict = Depends(require_role(ADMIN_ROLE))):
     """Sync Auth0 org MEMBERSHIP into Keycloak group membership (add-only, matched
     by email), admin only. Run after /admin/org-sync (members need their group to
     exist). dry_run=true previews without writing. Returns the member-sync summary."""
     from auth0_org_sync import run_member_sync
     try:
-        summary = run_member_sync(dry_run=dry_run)
+        summary = run_member_sync(dry_run=dry_run, remove_absent=remove_absent)
     except KeyError as exc:
         raise HTTPException(status_code=503,
                             detail=f"Auth0 not configured (missing {exc})")
@@ -1751,8 +1752,9 @@ def admin_org_member_sync(dry_run: bool = Form(default=False),
         logger.error("org member-sync failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=502, detail="Organization member sync failed")
     audit("org_member_sync", "success", added=len(summary["added"]),
-          already=len(summary["already_member"]), unmatched=len(summary["unmatched"]),
-          dry_run=dry_run, by=token_info.get("preferred_username", "?"))
+          removed=len(summary["removed"]), already=len(summary["already_member"]),
+          unmatched=len(summary["unmatched"]), dry_run=dry_run,
+          remove_absent=remove_absent, by=token_info.get("preferred_username", "?"))
     return summary
 
 
