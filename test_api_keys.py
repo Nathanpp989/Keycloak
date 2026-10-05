@@ -107,3 +107,27 @@ def test_api_key_scopes_carried():
     meta = m.verify(key)
     assert set(meta["scopes"]) == {"read", "write"}
     assert meta["expires_at"] is None
+
+
+def test_openbao_store_get_degrades_on_error():
+    from api_keys import _OpenBaoStore
+    from unittest.mock import MagicMock
+    secrets = MagicMock()
+    secrets.get_secret.side_effect = RuntimeError("openbao down")
+    store = _OpenBaoStore(secrets)
+    assert store.get("some-id") is None          # error -> no record, no crash
+
+
+def test_openbao_store_list_degrades_on_error():
+    from api_keys import _OpenBaoStore
+    from unittest.mock import MagicMock
+    import openbao_connect as ob
+    secrets = MagicMock(); secrets.mount = "secret"; secrets.token = "t"; secrets.addr = "http://x"
+    store = _OpenBaoStore(secrets)
+    # make the underlying LIST request raise -> list_ids returns []
+    orig = ob._request
+    ob._request = MagicMock(side_effect=RuntimeError("list failed"))
+    try:
+        assert store.list_ids() == []
+    finally:
+        ob._request = orig

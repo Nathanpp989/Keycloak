@@ -93,6 +93,7 @@ monitoring stack. 728 tests; CI runs the unit suite plus a live smoke test.
   request id per request.
 
 ### Added — tooling
+- Kubernetes manifests (`k8s/`): schema-validated Deployment/Service/Ingress/ConfigMap/Secret + kustomization for the broker app (non-root, health probes, readonly rootfs). Dependencies (Keycloak/OpenBao/Postgres) use upstream charts/managed services. Verify-on-cluster.
 - MCP server (`mcp_server.py`, optional — own deps in requirements-mcp.txt): exposes safe operational tools (health, token introspection, API-key management, user sessions, org-sync) to an AI assistant via the Model Context Protocol. Does NOT expose password-grant login. `mcp-config.example.json` shows how to register it.
 - `live-test.sh` — one command runs every live proof against the running stack (health -> smoke -> dynamic secrets -> mTLS) and prints a pass/fail summary. `disable-mtls.sh` deactivates the opt-in mTLS route.
 - `bootstrap.sh` — one-command full-stack bring-up: cert issuance, optional
@@ -111,6 +112,7 @@ monitoring stack. 728 tests; CI runs the unit suite plus a live smoke test.
   app + the 9-check curl suite).
 
 ### Changed
+- CI hardened: a `lint-scripts` job runs shellcheck on all `*.sh` (catches quoting / SC2015 / unquoted-expansion bugs the Python suite can't), and a `validate-k8s` job schema-checks the k8s manifests. Both pass on the current tree.
 - Certificate process: `openbao_traefik_cert.py --check` reports cert expiry (read-only, no OpenBao); `doctor.sh` warns when the Traefik cert is expiring; the PKI role's key algorithm is configurable (OPENBAO_CERT_KEY_TYPE/BITS — RSA-2048 default, ECDSA opt-in).
 - Runs on the latest Python (3.14); container base image and CI updated. The suite passes on Python 3.12, 3.13, and 3.14 (all 728 tests). Pinned dependencies verified to install and work on 3.14.
 - Dependencies pinned to exact tested versions (`==`) for reproducible builds.
@@ -121,6 +123,7 @@ monitoring stack. 728 tests; CI runs the unit suite plus a live smoke test.
   startup 404 window without coupling Traefik's own startup to the app.
 
 ### Fixed
+- Coverage-driven test pass: added 12 tests for previously-untested edge cases and error paths — nameless orgs / emailless members skipped, member pagination, non-numeric lockout env fallback, disabled-lockout no-op, sliding-window prune, Redis-backend selection + fallback, OpenBao api-key store graceful degradation, dynamic-secrets enable error. All passed (the paths were correct but unverified); coverage of the core modules now ~93%.
 - Test coverage: `test_api_keys.py`, `test_account_lockout.py`, and `test_openbao_traefik_cert.py` were missing from pytest.ini's `python_files` allow-list, so ~28 tests never ran in the full suite / CI. Now collected (suite: 731 -> 759).
 - Auth0: the API audience is cached instead of fetched from the secret store on every token verification (was a network round-trip per request).
 - OpenBao/Traefik: TLS cert/key files are written atomically (temp + rename), so Traefik can't hot-reload a half-written cert during rotation.

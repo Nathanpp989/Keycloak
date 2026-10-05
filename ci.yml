@@ -204,3 +204,47 @@ jobs:
         run: |
           echo "=== app ==="; tail -60 /tmp/app.log 2>/dev/null || true
           echo "=== keycloak ==="; docker logs kc 2>/dev/null | tail -40 || true
+
+  # ── Shell-script linting. Catches the class of bug the Python suite can't:
+  #    quoting, A && B || C (SC2015), unquoted expansions, etc. — several of
+  #    which have bitten this project's ops scripts. Runs fast, on every push.
+  lint-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: shellcheck (*.sh)
+        # -S warning: fail on warnings+errors; SC1091 excluded (can't follow .env
+        # sourced at runtime — expected, not a defect).
+        run: shellcheck -S warning -e SC1091 *.sh
+
+  # ── Kubernetes manifest validation. Schema-checks the k8s/ manifests so a
+  #    malformed Deployment/Service/Ingress is caught in CI, not at apply time.
+  validate-k8s:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate manifests
+        run: |
+          pip install kubernetes-validate pyyaml
+          python - <<'PY'
+          import glob, yaml, kubernetes_validate as kv
+          n = 0
+          for f in sorted(glob.glob("k8s/*.yaml")):
+              if f.endswith("secret.example.yaml"):
+                  continue
+              for d in yaml.safe_load_all(open(f)):
+                  if not d or d.get("kind") == "Kustomization":
+                      continue
+                  kv.validate(d, "1.29.0", strict=True)
+                  n += 1
+                  print(f"  ok: {d['kind']}/{d['metadata']['name']}")
+          print(f"{n} manifests valid")
+          PY
