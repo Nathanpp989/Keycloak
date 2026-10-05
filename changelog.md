@@ -93,6 +93,7 @@ monitoring stack. 728 tests; CI runs the unit suite plus a live smoke test.
   request id per request.
 
 ### Added — tooling
+- `SECURITY.md`: documented security posture + threat model (trust boundaries, defense-in-depth, production-hardening checklist, known limitations) — every control cross-checked against the implementation.
 - Kubernetes manifests (`k8s/`): schema-validated Deployment/Service/Ingress/ConfigMap/Secret + kustomization for the broker app (non-root, health probes, readonly rootfs). Dependencies (Keycloak/OpenBao/Postgres) use upstream charts/managed services. Verify-on-cluster.
 - MCP server (`mcp_server.py`, optional — own deps in requirements-mcp.txt): exposes safe operational tools (health, token introspection, API-key management, user sessions, org-sync) to an AI assistant via the Model Context Protocol. Does NOT expose password-grant login. `mcp-config.example.json` shows how to register it.
 - `live-test.sh` — one command runs every live proof against the running stack (health -> smoke -> dynamic secrets -> mTLS) and prints a pass/fail summary. `disable-mtls.sh` deactivates the opt-in mTLS route.
