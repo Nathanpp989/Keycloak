@@ -31,3 +31,8 @@ endpoint_smoke.py
 integration_test_live.py
 openbao_smoke.py
 openbao_login_smoke.py
+# MCP server is a SEPARATE external component (own deps in requirements-mcp.txt),
+# not part of the broker image. COPY *.py would otherwise ship it with unmet imports.
+mcp_server.py
+requirements-mcp.txt
+mcp-config.example.json
