@@ -70,3 +70,6 @@ k8s/secret.yaml
 # against an accidental bind-mount or local copy.
 openbao/bao-init.json
 **/bao-init.json
+bin/
+LICENSE.txt
+.DS_Store
