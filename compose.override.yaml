@@ -1,0 +1,7 @@
+
+# compose.override.yaml — local-only: https frontend for browser login flows.
+services:
+  keycloak:
+    environment:
+      KC_HOSTNAME: https://keycloak.test.local
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
