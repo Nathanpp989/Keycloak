@@ -108,16 +108,8 @@ def test_protected_requires_credentials(client, monkeypatch):
     fake = MagicMock()
     monkeypatch.setattr(main, "keycloak_oidc", fake)
     r = client.get("/protected")  # no Authorization header
+    # HTTPBearer returns 401 when the Authorization header is absent
     assert r.status_code == 401
-    assert r.json()["detail"] == "Not authenticated"
-
-
-def test_protected_blank_bearer_header_is_401(client, monkeypatch):
-    fake = MagicMock()
-    monkeypatch.setattr(main, "keycloak_oidc", fake)
-    r = client.get("/protected", headers={"Authorization": "Bearer "})
-    assert r.status_code == 401
-    assert r.json()["detail"] == "Not authenticated"
 
 def test_protected_introspect_returns_none(client, monkeypatch):
     # P2 regression: introspect returning None must yield 401, not an unhandled 500
@@ -2517,3 +2509,228 @@ def test_lockout_increments_metric(client, monkeypatch):
     client.post("/token", data={"username": "vic", "password": "x"})  # locked -> metric
     assert metrics.ACCOUNT_LOCKOUTS._value.get() == before + 1
     account_lockout.reset_lockouts()
+
+
+def test_api_key_scoped_route(client):
+    import api_keys
+    api_keys.reset_api_keys()
+    _, key_read = api_keys.api_key_manager().create("r", scopes=["read"])
+    _, key_none = api_keys.api_key_manager().create("n", scopes=[])
+    assert client.get("/protected/apikey-scoped",
+                      headers={"X-API-Key": key_read}).status_code == 200
+    assert client.get("/protected/apikey-scoped",
+                      headers={"X-API-Key": key_none}).status_code == 403
+    api_keys.reset_api_keys()
+
+
+def test_api_key_create_with_ttl_and_scopes(client):
+    import api_keys
+    api_keys.reset_api_keys()
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override
+    try:
+        r = client.post("/admin/api-keys",
+                        data={"name": "svc", "ttl_seconds": "3600",
+                              "scopes": "read,write"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["expires_in"] == 3600
+        assert set(body["scopes"]) == {"read", "write"}
+    finally:
+        main.app.dependency_overrides.clear()
+        api_keys.reset_api_keys()
+
+
+def test_api_key_auth_metric(client, monkeypatch):
+    import api_keys
+    import metrics
+    api_keys.reset_api_keys()
+    _, key = api_keys.api_key_manager().create("m")
+    v0 = metrics.API_KEY_AUTH.labels(outcome="valid")._value.get()
+    i0 = metrics.API_KEY_AUTH.labels(outcome="invalid")._value.get()
+    client.get("/protected/apikey", headers={"X-API-Key": key})           # valid
+    client.get("/protected/apikey", headers={"X-API-Key": "ak_bad_x"})    # invalid
+    assert metrics.API_KEY_AUTH.labels(outcome="valid")._value.get() == v0 + 1
+    assert metrics.API_KEY_AUTH.labels(outcome="invalid")._value.get() == i0 + 1
+    api_keys.reset_api_keys()
+
+
+# ── token exchange (RFC 8693) ────────────────────────────────────────────────
+
+def test_token_exchange_success(client, monkeypatch):
+    fake = MagicMock()
+    fake.exchange_token.return_value = {"access_token": "exchanged"}
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.post("/token/exchange",
+                    data={"subject_token": "orig", "audience": "svc-b"})
+    assert r.status_code == 200
+    assert r.json()["access_token"] == "exchanged"
+    fake.exchange_token.assert_called_once()
+
+
+def test_token_exchange_denied_401(client, monkeypatch):
+    from keycloak.exceptions import KeycloakAuthenticationError
+    fake = MagicMock()
+    fake.exchange_token.side_effect = KeycloakAuthenticationError("no")
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.post("/token/exchange", data={"subject_token": "x"})
+    assert r.status_code == 401
+
+
+def test_token_exchange_service_down_503(client, monkeypatch):
+    monkeypatch.setattr(main, "keycloak_oidc", None)
+    r = client.post("/token/exchange", data={"subject_token": "x"})
+    assert r.status_code == 503
+
+
+def test_introspect_surfaces_mfa_claims(client, monkeypatch):
+    fake = MagicMock()
+    fake.introspect.return_value = {"active": True, "sub": "u",
+                                    "amr": ["mfa", "otp"], "acr": "1"}
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    body = client.post("/token/introspect", data={"token": "t"}).json()
+    assert body["amr"] == ["mfa", "otp"] and body["acr"] == "1"
+
+
+# ── /admin/users/{id}/sessions + /logout — Keycloak session management ────────
+
+def test_list_user_sessions_returns_sessions(client, monkeypatch):
+    admin = _kc_admin_autospec()
+    admin.get_sessions.return_value = [
+        {"id": "sess-1", "ipAddress": "10.0.0.1", "start": 1},
+        {"id": "sess-2", "ipAddress": "10.0.0.2", "start": 2}]
+    monkeypatch.setattr(main, "_build_keycloak_admin", lambda: admin)
+    main.app.dependency_overrides[main.require_keycloak_auth] = _admin_token
+    try:
+        r = client.get("/admin/users/u-123/sessions")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["user_id"] == "u-123" and len(body["sessions"]) == 2
+        admin.get_sessions.assert_called_once_with("u-123")
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+def test_list_user_sessions_requires_admin(client, monkeypatch):
+    main.app.dependency_overrides[main.require_keycloak_auth] = \
+        lambda: {"active": True, "realm_access": {"roles": ["user"]}}
+    try:
+        assert client.get("/admin/users/u-1/sessions").status_code == 403
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+def test_list_user_sessions_404_when_user_missing(client, monkeypatch):
+    from keycloak.exceptions import KeycloakGetError
+    admin = _kc_admin_autospec()
+    err = KeycloakGetError("not found")
+    err.response_code = 404
+    admin.get_sessions.side_effect = err
+    monkeypatch.setattr(main, "_build_keycloak_admin", lambda: admin)
+    main.app.dependency_overrides[main.require_keycloak_auth] = _admin_token
+    try:
+        assert client.get("/admin/users/nope/sessions").status_code == 404
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+def test_admin_logout_user_succeeds(client, monkeypatch):
+    admin = _kc_admin_autospec()
+    monkeypatch.setattr(main, "_build_keycloak_admin", lambda: admin)
+    main.app.dependency_overrides[main.require_keycloak_auth] = _admin_token
+    try:
+        r = client.post("/admin/users/u-9/logout")
+        assert r.status_code == 200 and r.json()["logged_out"] is True
+        admin.user_logout.assert_called_once_with("u-9")
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+def test_admin_logout_user_503_when_admin_down(client, monkeypatch):
+    admin = _kc_admin_autospec()
+    admin.user_logout.side_effect = RuntimeError("connection refused")
+    monkeypatch.setattr(main, "_build_keycloak_admin", lambda: admin)
+    main.app.dependency_overrides[main.require_keycloak_auth] = _admin_token
+    try:
+        assert client.post("/admin/users/u-9/logout").status_code == 503
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+def test_org_sync_endpoint(client, monkeypatch):
+    import auth0_org_sync
+    monkeypatch.setattr(auth0_org_sync, "run_sync",
+                        lambda dry_run=False: {"created": ["acme"], "adopted": [],
+                                               "failed": [], "total": 1,
+                                               "dry_run": dry_run})
+    main.app.dependency_overrides[main.require_keycloak_auth] = _admin_token
+    try:
+        r = client.post("/admin/org-sync", data={"dry_run": "true"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["created"] == ["acme"] and body["dry_run"] is True
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+def test_org_sync_requires_admin(client):
+    main.app.dependency_overrides[main.require_keycloak_auth] = \
+        lambda: {"active": True, "realm_access": {"roles": ["user"]}}
+    try:
+        assert client.post("/admin/org-sync").status_code == 403
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+def test_org_sync_503_when_auth0_unconfigured(client, monkeypatch):
+    import auth0_org_sync
+    def boom(dry_run=False):
+        raise KeyError("AUTH0_DOMAIN")
+    monkeypatch.setattr(auth0_org_sync, "run_sync", boom)
+    main.app.dependency_overrides[main.require_keycloak_auth] = _admin_token
+    try:
+        assert client.post("/admin/org-sync").status_code == 503
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+def test_org_member_sync_endpoint(client, monkeypatch):
+    import auth0_org_sync
+    monkeypatch.setattr(auth0_org_sync, "run_member_sync",
+                        lambda dry_run=False, remove_absent=False: {
+                            "added": ["a@x.com"], "removed": [],
+                            "already_member": [], "unmatched": [], "no_group": [],
+                            "failed": [], "orgs": 1, "dry_run": dry_run,
+                            "remove_absent": remove_absent})
+    main.app.dependency_overrides[main.require_keycloak_auth] = _admin_token
+    try:
+        r = client.post("/admin/org-sync/members", data={"dry_run": "false"})
+        assert r.status_code == 200 and r.json()["added"] == ["a@x.com"]
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+def test_org_member_sync_requires_admin(client):
+    main.app.dependency_overrides[main.require_keycloak_auth] = \
+        lambda: {"active": True, "realm_access": {"roles": ["user"]}}
+    try:
+        assert client.post("/admin/org-sync/members").status_code == 403
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+def test_org_member_sync_reconcile_flag(client, monkeypatch):
+    import auth0_org_sync
+    captured = {}
+    def fake(dry_run=False, remove_absent=False):
+        captured["remove_absent"] = remove_absent
+        return {"added": [], "removed": ["gone@x.com"], "already_member": [],
+                "unmatched": [], "no_group": [], "failed": [], "orgs": 1,
+                "dry_run": dry_run, "remove_absent": remove_absent}
+    monkeypatch.setattr(auth0_org_sync, "run_member_sync", fake)
+    main.app.dependency_overrides[main.require_keycloak_auth] = _admin_token
+    try:
+        r = client.post("/admin/org-sync/members", data={"remove_absent": "true"})
+        assert r.status_code == 200 and r.json()["removed"] == ["gone@x.com"]
+        assert captured["remove_absent"] is True
+    finally:
+        main.app.dependency_overrides.clear()

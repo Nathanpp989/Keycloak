@@ -157,3 +157,79 @@ def test_renew_failure_preserves_existing_cert():
             except ob.OpenBaoError:
                 pass
         assert open(cert_p).read() == original  # unchanged
+
+
+def _make_leaf_cert(days_valid):
+    from datetime import datetime, timezone, timedelta
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "app.test.local")])
+    now = datetime.now(timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+            .public_key(key.public_key()).serial_number(1)
+            .not_valid_before(now - timedelta(days=1))
+            .not_valid_after(now + timedelta(days=days_valid))
+            .sign(key, hashes.SHA256()))
+    return cert.public_bytes(serialization.Encoding.PEM)
+
+
+def test_cert_status_valid(tmp_path):
+    import openbao_traefik_cert as m
+    p = tmp_path / "openbao-cert.pem"
+    p.write_bytes(_make_leaf_cert(30))
+    st = m.cert_status(str(p))
+    assert st["exists"] and st["expired"] is False
+    assert 28 < st["days_remaining"] < 31
+
+
+def test_cert_status_expired(tmp_path):
+    import openbao_traefik_cert as m
+    p = tmp_path / "openbao-cert.pem"
+    p.write_bytes(_make_leaf_cert(-1))   # already expired
+    st = m.cert_status(str(p))
+    assert st["exists"] and st["expired"] is True and st["needs_renewal"] is True
+
+
+def test_cert_status_missing():
+    import openbao_traefik_cert as m
+    st = m.cert_status("/nonexistent/openbao-cert.pem")
+    assert st["exists"] is False and st["needs_renewal"] is True
+
+
+def test_create_pki_role_ecdsa_option():
+    import openbao_connect as ob
+    import responses
+    import json
+
+    @responses.activate
+    def _run():
+        responses.add(responses.POST, "http://x/v1/pki/roles/r", status=204)
+        ob.create_pki_role("r", token="t", addr="http://x",
+                           key_type="ec", key_bits=256)
+        body = json.loads(responses.calls[0].request.body)
+        assert body["key_type"] == "ec" and body["key_bits"] == 256
+    _run()
+
+
+def test_issue_client_cert(tmp_path):
+    import openbao_traefik_cert as m
+    import responses
+    import os
+    import stat
+    ADDR = "http://bao:8200"
+
+    @responses.activate
+    def _run():
+        responses.add(responses.POST, f"{ADDR}/v1/pki/issue/traefik",
+                      json={"data": {"certificate": "CC", "private_key": "CK",
+                                     "issuing_ca": "CA"}}, status=200)
+        cert, key, ca = m.issue_client_cert("svc-a", str(tmp_path),
+                                            token="root", addr=ADDR)
+        assert open(cert).read().strip() == "CC"
+        assert open(key).read().strip() == "CK"
+        assert open(ca).read().strip() == "CA"
+        assert oct(stat.S_IMODE(os.stat(key).st_mode)) == "0o600"
+    _run()

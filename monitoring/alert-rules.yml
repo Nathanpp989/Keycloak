@@ -86,3 +86,45 @@ groups:
         annotations:
           summary: "High p95 request latency"
           description: "95th-percentile request latency has been above 2s for 10 minutes."
+
+      # A spike in account lockouts means many accounts are hitting the per-user
+      # failed-login threshold — a distributed brute-force in progress, or a
+      # broken client hammering with bad credentials.
+      - alert: HighAccountLockoutRate
+        expr: |
+          sum(rate(auth_account_lockouts_total[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Accounts being locked out"
+          description: "Logins are being denied due to account lockout at >0.1/s over 5m — possible distributed brute-force; check the audit log for reason=account_locked."
+
+      # Upstream (Keycloak) latency, distinct from app latency: tells you whether
+      # slow token operations are the app's fault or Keycloak's.
+      - alert: HighUpstreamAuthLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, operation) (rate(auth_upstream_op_duration_seconds_bucket[5m]))
+          ) > 1.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Slow upstream auth operations (Keycloak)"
+          description: "p95 latency of an upstream auth operation ({{ $labels.operation }}) has been above 1.5s for 10m — check Keycloak health."
+
+      # Errors on token-validation ops (introspect/userinfo) — a broken token
+      # path or Keycloak trouble, distinct from normal invalid-token traffic.
+      - alert: HighTokenOpErrorRate
+        expr: |
+          sum(rate(auth_token_ops_total{outcome="error"}[5m]))
+            /
+          clamp_min(sum(rate(auth_token_ops_total[5m])), 0.001)
+            > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High token-validation error rate"
+          description: "More than 20% of introspect/userinfo/revoke operations have errored over 5m — check Keycloak connectivity."

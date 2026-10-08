@@ -10,8 +10,9 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.12", "3.13", "3.14"]
 
     steps:
       - name: Check out code
@@ -29,12 +30,19 @@ jobs:
           # If this is incomplete (e.g. a missing package like python-multipart),
           # the import of main.py during tests will fail and CI catches it.
           pip install -r requirements.txt
-          # Test-only tooling
+          # MCP server deps, so test_mcp_server.py actually runs instead of
+          # being skipped by its importorskip("mcp") guard.
+          pip install -r requirements-mcp.txt
+          # Test-only tooling.
           pip install pytest responses pyflakes
 
       - name: Lint (pyflakes)
         run: |
           python -m pyflakes *.py
+
+      - name: Static container build check
+        run: |
+          python container_check.py
 
       - name: Run tests
         env:
@@ -75,10 +83,9 @@ jobs:
           pip install -r requirements.txt
           pip install requests
 
-      # The service container above pulls the image and starts the container,
-      # but the Keycloak image needs an explicit "start-dev" command. The
-      # simplest robust approach on Actions is to run Keycloak ourselves as a
-      # detached container with the right command, then poll for readiness.
+      # The Keycloak image needs an explicit "start-dev" command. The simplest
+      # robust approach on Actions is to run Keycloak ourselves as a detached
+      # container with the right command, then poll for readiness.
       - name: Start Keycloak (start-dev)
         run: |
           docker run -d --name kc -p 8080:8080 \
@@ -204,3 +211,56 @@ jobs:
         run: |
           echo "=== app ==="; tail -60 /tmp/app.log 2>/dev/null || true
           echo "=== keycloak ==="; docker logs kc 2>/dev/null | tail -40 || true
+
+  # ── Shell lint: every committed .sh must pass shellcheck. These scripts are
+  #    the operator surface (bootstrap, smoke, mTLS enable/disable, doctor), so
+  #    a quoting or portability bug here is an outage waiting to happen.
+  lint-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Run shellcheck
+        run: |
+          # -S warning: fail on warning and above (not style/info nits).
+          # -e SC1091: don't fail on "not following sourced file" — the sourced
+          #   files (.env, helper libs) aren't present at lint time.
+          shellcheck -S warning -e SC1091 $(git ls-files '*.sh')
+
+  # ── Kubernetes manifest validation: the manifests must be well-formed and
+  #    schema-valid so `kubectl apply -k k8s/` can't fail on a typo'd field.
+  validate-k8s:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install kubernetes-validate
+        run: |
+          python -m pip install --upgrade pip
+          pip install kubernetes-validate
+
+      - name: Render kustomize and validate against the k8s schema
+        run: |
+          # The kustomization references secret.yaml, which is gitignored (only
+          # secret.example.yaml is committed). Materialize it from the template
+          # so `kubectl kustomize` can resolve the resource; its placeholder
+          # values are schema-valid, which is all this job checks.
+          cp k8s/secret.example.yaml k8s/secret.yaml
+          # kustomize ships with recent kubectl; render the overlay to a single
+          # stream, then schema-validate every resource.
+          kubectl kustomize k8s/ > /tmp/rendered.yaml
+          echo "----- rendered manifests -----"
+          cat /tmp/rendered.yaml
+          python -m kubernetes_validate -k 1.29.0 /tmp/rendered.yaml

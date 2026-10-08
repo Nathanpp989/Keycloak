@@ -72,3 +72,13 @@ def test_renew_lease():
 def test_revoke_lease():
     responses.add(responses.PUT, f"{ADDR}/v1/sys/leases/revoke", status=204)
     assert ds.revoke_lease("lid", token="root", addr=ADDR) is True
+
+
+@responses.activate
+def test_enable_database_engine_raises_on_real_error():
+    # a non-"already in use" 400 must raise, not be swallowed
+    responses.add(responses.POST, f"{ADDR}/v1/sys/mounts/database",
+                  json={"errors": ["permission denied"]}, status=403)
+    import pytest
+    with pytest.raises(ds.OpenBaoError if hasattr(ds, "OpenBaoError") else Exception):
+        ds.enable_database_engine(token="root", addr=ADDR)

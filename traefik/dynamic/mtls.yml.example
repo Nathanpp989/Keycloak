@@ -1,0 +1,33 @@
+# mTLS at the edge (OPT-IN) — copied to mtls.yml by ./enable-mtls.sh.
+#
+# Serves a SEPARATE hostname (mtls.test.local) that requires callers to present a
+# client certificate signed by the internal CA. A separate host is deliberate:
+# Traefik resolves tls.options per-SNI (hostname), not per-path, so mTLS on a path
+# of app.test.local would force client certs on the whole host.
+#
+# Don't commit the activated mtls.yml: it references openbao-ca.pem, which
+# enable-mtls.sh generates at setup time. Committing it would leave a dangling
+# caFile reference on a fresh checkout. enable-mtls.sh activates this template AND
+# writes the CA together.
+http:
+  routers:
+    mtls-demo:
+      rule: "Host(`mtls.test.local`)"
+      entryPoints:
+        - websecure
+      service: mtls-app
+      tls:
+        options: mtls@file
+  services:
+    mtls-app:
+      loadBalancer:
+        servers:
+          - url: "http://app:8000"
+
+tls:
+  options:
+    mtls:
+      clientAuth:
+        clientAuthType: RequireAndVerifyClientCert
+        caFiles:
+          - /etc/traefik/dynamic/openbao-ca.pem

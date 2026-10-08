@@ -719,3 +719,24 @@ def test_configure_approle_secret_id_lifetime_configurable():
     body = json.loads(role_call.request.body)
     assert body["secret_id_ttl"] == "24h"
     assert body["secret_id_num_uses"] == 5
+
+
+@responses.activate
+def test_get_secret_wrapped_returns_wrap_token():
+    responses.add(responses.GET, f"{ADDR}/v1/secret/data/mysecret",
+                  json={"wrap_info": {"token": "wrap-abc", "ttl": 120}}, status=200)
+    s = ob.OpenBaoSecrets(addr=ADDR, token="root")
+    tok = s.get_secret_wrapped("mysecret")
+    assert tok == "wrap-abc"
+    # the request carried the wrap-ttl header
+    assert responses.calls[0].request.headers.get("X-Vault-Wrap-TTL") == "120s"
+
+
+@responses.activate
+def test_get_secret_wrapped_raises_if_not_wrapped():
+    responses.add(responses.GET, f"{ADDR}/v1/secret/data/mysecret",
+                  json={"data": {"data": {"value": "plain"}}}, status=200)
+    s = ob.OpenBaoSecrets(addr=ADDR, token="root")
+    import pytest
+    with pytest.raises(ob.OpenBaoError):
+        s.get_secret_wrapped("mysecret")

@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: auth-broker-config
+  namespace: auth-broker
+data:
+  # Point these at your in-cluster or managed dependencies (see k8s/README.md).
+  HOST: "0.0.0.0"
+  PORT: "8000"
+  APP_URL: "https://app.example.com"
+  DOCS_ENABLED: "false"
+  LOG_LEVEL: "INFO"
+  KEYCLOAK_URL: "http://keycloak.auth-broker.svc.cluster.local:8080"
+  KEYCLOAK_REALM: "Premkey"
+  KEYCLOAK_CLIENT_ID: "Hello-World-app"
+  AUTH0_DOMAIN: "dev-xxxx.us.auth0.com"
+  AUTH0_CLIENT_ID: "REPLACE_AUTH0_CLIENT_ID"
+  OPENBAO_ADDR: "http://openbao.auth-broker.svc.cluster.local:8200"
