@@ -1,0 +1,46 @@
+# Auth-broker CI — drop into the Keycloak/Premkey repo at .github/workflows/ci.yml
+#
+# Runs the full offline test suite on every push/PR and gates coverage on the
+# two modules hardened in this work (main.py, mcp_server.py). Tests isolate the
+# app from live Keycloak/Auth0/OpenBao (lifespan bypassed, globals mocked), so
+# no external services are needed.
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        # App deps + the optional MCP-server component's deps (so test_mcp_server
+        # runs rather than skips) + test tooling.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-mcp.txt
+          pip install pytest responses coverage
+
+      - name: Run full test suite with coverage
+        # pytest.ini already restricts collection to the dedicated test files.
+        # test_container_check enforces .dockerignore hygiene — keep it green by
+        # excluding optional/test files from the image build context.
+        run: |
+          coverage run --branch -m pytest -q
+
+      - name: Coverage gate (hardened modules)
+        # Floors sit just below the current numbers (main.py 81%, mcp_server 91%)
+        # so honest refactors have room but a real regression fails the build.
+        run: |
+          coverage report -m --include="*main.py,*mcp_server.py"
+          coverage report --include="*main.py"       --fail-under=78
+          coverage report --include="*mcp_server.py"  --fail-under=88

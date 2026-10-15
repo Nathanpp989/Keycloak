@@ -3,10 +3,24 @@ isn't installed (it's not a broker dependency). The handlers are pure (client in
 dict out), so they're exercised with a mocked httpx client — no live broker."""
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 
 pytest.importorskip("mcp")          # optional component; skip if SDK absent
 import mcp_server as m               # noqa: E402
+
+
+class _CM:
+    """Minimal context manager returning a preset client, for monkeypatching
+    mcp_server._client (which _safe_call uses as `with _client() as c:`)."""
+    def __init__(self, client):
+        self.client = client
+
+    def __enter__(self):
+        return self.client
+
+    def __exit__(self, *a):
+        return False
 
 
 def _client(status=200, body=None):
@@ -73,3 +87,121 @@ def test_tools_are_registered():
                  "create_api_key", "revoke_api_key", "list_user_sessions",
                  "sync_organizations"):
         assert callable(getattr(m, name))
+
+
+# ── resilience: broker unreachable / errors don't raise into the MCP client ──
+
+def test_safe_call_turns_transport_error_into_clean_result(monkeypatch):
+    # Broker down: the client's request raises a connect error. The tool must
+    # return a readable error dict, not raise.
+    c = MagicMock()
+    c.get.side_effect = httpx.ConnectError("connection refused")
+    monkeypatch.setattr(m, "_client", lambda: _CM(c))
+    out = m.broker_health()
+    assert out["ok"] is False
+    assert out["status"] == 0
+    assert "failed" in out["error"]
+    assert "ConnectError" in out["error"]
+    assert out["broker_url"] == m.BROKER_URL
+
+
+def test_safe_call_handles_timeout(monkeypatch):
+    c = MagicMock()
+    c.get.side_effect = httpx.TimeoutException("timed out")
+    monkeypatch.setattr(m, "_client", lambda: _CM(c))
+    out = m.list_api_keys()
+    assert out["ok"] is False and out["status"] == 0
+    assert "TimeoutException" in out["error"]
+
+
+def test_safe_call_handles_unexpected_error(monkeypatch):
+    c = MagicMock()
+    c.post.side_effect = RuntimeError("boom")
+    monkeypatch.setattr(m, "_client", lambda: _CM(c))
+    out = m.introspect_token("tok")
+    assert out["ok"] is False and out["status"] == 0
+    assert "unexpected error" in out["error"] and "RuntimeError" in out["error"]
+
+
+def test_safe_call_success_path_through_tool(monkeypatch):
+    resp = MagicMock(status_code=200, is_success=True)
+    resp.json.return_value = {"status": "alive"}
+    c = MagicMock(); c.get.return_value = resp
+    monkeypatch.setattr(m, "_client", lambda: _CM(c))
+    out = m.broker_health()
+    assert out == {"status": 200, "ok": True, "body": {"status": "alive"}}
+
+
+def test_version_present():
+    assert isinstance(m.VERSION, str) and m.VERSION
+
+
+def test_result_hints_on_401_without_token(monkeypatch):
+    monkeypatch.setattr(m, "BROKER_TOKEN", "")
+    resp = MagicMock(status_code=401, is_success=False)
+    resp.json.return_value = {"detail": "unauthorized"}
+    out = m._result(resp)
+    assert out["ok"] is False and out["status"] == 401
+    assert "BROKER_TOKEN" in out.get("hint", "")
+
+
+def test_result_no_hint_when_token_present(monkeypatch):
+    monkeypatch.setattr(m, "BROKER_TOKEN", "admin-bearer")
+    resp = MagicMock(status_code=401, is_success=False)
+    resp.json.return_value = {"detail": "unauthorized"}
+    out = m._result(resp)
+    assert "hint" not in out        # a real 401 with a token set isn't the misstep
+
+
+def test_safe_call_logs_on_transport_error(monkeypatch, caplog):
+    c = MagicMock()
+    c.get.side_effect = httpx.ConnectError("refused")
+    monkeypatch.setattr(m, "_client", lambda: _CM(c))
+    with caplog.at_level("WARNING"):
+        m.broker_health()
+    assert any("broker request failed" in r.message for r in caplog.records)
+
+
+def test_safe_call_handles_eof_remote_protocol_error(monkeypatch):
+    # Broker closed the connection mid-response (EOF / truncated body). httpx
+    # raises RemoteProtocolError, which must become a clean envelope, not a crash.
+    c = MagicMock()
+    c.get.side_effect = httpx.RemoteProtocolError(
+        "peer closed connection without sending complete message body (EOF)")
+    monkeypatch.setattr(m, "_client", lambda: _CM(c))
+    out = m.broker_health()
+    assert out["ok"] is False and out["status"] == 0
+    assert "RemoteProtocolError" in out["error"]
+
+
+def test_safe_call_wrong_server_connect_error(monkeypatch):
+    # BROKER_URL points at the wrong/old host: the connection is refused. The
+    # tool must report it readably (with the URL it tried), not raise.
+    c = MagicMock()
+    c.get.side_effect = httpx.ConnectError("[Errno 111] Connection refused")
+    monkeypatch.setattr(m, "_client", lambda: _CM(c))
+    out = m.broker_health()
+    assert out["ok"] is False and out["broker_url"] == m.BROKER_URL
+    assert "reachable" in out.get("hint", "").lower()
+
+
+def test_all_tools_return_normalized_result(monkeypatch):
+    # Invoke every admin tool once through a mocked client so the thin wrappers
+    # are all exercised (coverage) and each returns a clean normalized envelope.
+    resp = MagicMock(status_code=200, is_success=True)
+    resp.json.return_value = {"ok_body": True}
+    c = MagicMock()
+    for verb in ("get", "post", "delete"):
+        getattr(c, verb).return_value = resp
+    monkeypatch.setattr(m, "_client", lambda: _CM(c))
+    calls = [
+        lambda: m.introspect_token("tok"),
+        lambda: m.list_api_keys(),
+        lambda: m.create_api_key("svc", "read", 3600),
+        lambda: m.revoke_api_key("k1"),
+        lambda: m.list_user_sessions("u1"),
+        lambda: m.sync_organizations(True),
+    ]
+    for call in calls:
+        out = call()
+        assert out["status"] == 200 and out["ok"] is True

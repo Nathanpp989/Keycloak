@@ -2734,3 +2734,72 @@ def test_org_member_sync_reconcile_flag(client, monkeypatch):
         assert captured["remove_absent"] is True
     finally:
         main.app.dependency_overrides.clear()
+
+
+# ──────────────────────────────────────────────
+# /health/ready deep live-probe (mid-process Keycloak outage / DR)
+# ──────────────────────────────────────────────
+def test_health_ready_default_does_not_live_probe(client, monkeypatch):
+    # Default readiness must stay fast: it must NOT call Keycloak (well_known).
+    fake = MagicMock()
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.get("/health/ready")
+    assert r.status_code == 200 and r.json() == {"status": "ready"}
+    fake.well_known.assert_not_called()
+
+
+def test_health_ready_deep_ok(client, monkeypatch):
+    fake = MagicMock()
+    fake.well_known.return_value = {"issuer": "https://kc/realms/Premkey"}
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.get("/health/ready", params={"deep": "true"})
+    assert r.status_code == 200 and r.json() == {"status": "ready"}
+    fake.well_known.assert_called_once()
+
+
+def test_health_ready_deep_detects_mid_process_outage(client, monkeypatch):
+    # Started healthy (client object exists) but Keycloak is now unreachable.
+    fake = MagicMock()
+    fake.well_known.side_effect = Exception("connection refused")
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.get("/health/ready", params={"deep": "true"})
+    assert r.status_code == 503
+    assert r.json()["status"] == "not_ready"
+    assert "unreachable" in r.json()["reason"]
+
+
+def test_health_ready_deep_still_503_when_degraded_start(client, monkeypatch):
+    monkeypatch.setattr(main, "keycloak_oidc", None)
+    r = client.get("/health/ready", params={"deep": "true"})
+    assert r.status_code == 503
+
+
+# ──────────────────────────────────────────────
+# Mid-flow failures: EOF / connection drop / upstream gone part-way
+# (Keycloak reachable at start, then the stream dies mid-request.)
+# ──────────────────────────────────────────────
+def test_token_connection_drop_returns_503_not_500(client, monkeypatch):
+    # A non-auth error (peer closed connection / EOF) must map to a clean 503,
+    # never an unhandled 500. Proves the generic safety net on /token.
+    fake = MagicMock()
+    fake.token.side_effect = ConnectionError("server closed connection (EOF)")
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.post("/token", data={"username": "u", "password": "p"})
+    assert r.status_code == 503
+    assert r.json()["detail"] == "Authentication service unavailable"
+
+
+def test_token_refresh_connection_drop_returns_503(client, monkeypatch):
+    fake = MagicMock()
+    fake.refresh_token.side_effect = ConnectionError("peer reset mid-stream (EOF)")
+    monkeypatch.setattr(main, "keycloak_oidc", fake)
+    r = client.post("/token/refresh", data={"refresh_token": "rt"})
+    assert r.status_code == 503
+
+
+def test_subsystems_reports_keycloak_down_without_crashing(client, monkeypatch):
+    # DR view: Keycloak not connected must be reported, not raise.
+    monkeypatch.setattr(main, "keycloak_oidc", None)
+    r = client.get("/status/subsystems")
+    assert r.status_code == 200
+    assert r.json()["keycloak"]["enabled"] is False

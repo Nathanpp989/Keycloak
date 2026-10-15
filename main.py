@@ -654,7 +654,15 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.error("Could not initialise user manager: %s", exc)
         user_manager = None
-    yield
+    # Serve until shutdown. The finally runs on a GRACEFUL stop (SIGTERM from
+    # `docker stop`, SIGINT/Ctrl-C, or an orchestrator draining the process), so
+    # a clean shutdown is visible in the (structured) logs rather than silent. A
+    # hard SIGKILL skips it — acceptable, as the broker holds no unflushed state
+    # of its own (tokens/keys live in Keycloak/OpenBao, committed per request).
+    try:
+        yield
+    finally:
+        logger.info("Auth broker shutting down (graceful); releasing resources.")
 
 _DOCS_ENABLED = os.environ.get("DOCS_ENABLED", "true").strip().lower() in (
     "1", "true", "yes", "on")
@@ -968,20 +976,41 @@ def health_live():
 
 
 @app.get("/health/ready")
-def health_ready():
+def health_ready(deep: bool = False):
     """Readiness: can the app actually serve auth right now? Unlike liveness,
     this DOES check the critical dependency: keycloak_oidc is None when the app
     started degraded (Keycloak unreachable), so it can't issue or validate
     tokens. A failing readiness probe tells a load balancer to stop sending
     traffic here WITHOUT restarting — the right response to a transient
     dependency outage. Returns 503 when not ready so orchestrators/monitors read
-    it correctly."""
+    it correctly.
+
+    The default check is fast and based on the startup-built client existing. It
+    does NOT catch a Keycloak outage that begins AFTER a healthy start — the
+    client object is still present, so traffic would keep being routed here while
+    /token 5xxes. Pass ?deep=true for a bounded LIVE probe (fetches Keycloak's
+    OIDC discovery doc); on failure it returns 503 so a load balancer drains this
+    instance during a mid-process outage. Deep checks do network I/O, so use them
+    at a sane interval, not on a tight liveness loop."""
     if keycloak_oidc is None:
         return JSONResponse(
             status_code=503,
             content={"status": "not_ready",
                      "reason": "Keycloak not connected (degraded start or outage)"},
         )
+    if deep:
+        # Live reachability: catches a Keycloak outage that started after boot.
+        # Never raises — any failure is reported as not_ready with the cause.
+        try:
+            keycloak_oidc.well_known()
+        except Exception as exc:  # noqa: BLE001 - readiness must not 500
+            logger.warning("Readiness deep-check: Keycloak unreachable: %s", exc)
+            return JSONResponse(
+                status_code=503,
+                content={"status": "not_ready",
+                         "reason": f"Keycloak unreachable (live check failed): "
+                                   f"{exc.__class__.__name__}"},
+            )
     return {"status": "ready"}
 
 
