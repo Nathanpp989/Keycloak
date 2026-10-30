@@ -100,11 +100,49 @@ def test_client_key_ignores_forwarded_by_default(monkeypatch):
     assert rl.client_key(Req()) == "10.0.0.1"
 
 def test_client_key_trusts_forwarded_when_opted_in(monkeypatch):
+    # When a proxy is trusted, the real client is the RIGHTMOST hop (the one the
+    # proxy appended), not the leftmost (which the client can forge). Header
+    # "<client-sent>, <appended-by-proxy>" -> take the appended value.
     monkeypatch.setenv("RATE_LIMIT_TRUST_PROXY", "true")
+    monkeypatch.delenv("RATE_LIMIT_TRUSTED_PROXY_COUNT", raising=False)
     class Req:
         client = type("C", (), {"host": "10.0.0.1"})()
-        headers = {"x-forwarded-for": "1.2.3.4, 10.0.0.1"}
-    assert rl.client_key(Req()) == "1.2.3.4"
+        headers = {"x-forwarded-for": "1.2.3.4, 203.0.113.9"}
+    assert rl.client_key(Req()) == "203.0.113.9"
+
+def test_client_key_forwarded_not_spoofable_by_prepended_entry(monkeypatch):
+    # The attack: a client PREPENDS a forged IP; an append-mode proxy adds the
+    # real peer on the right. Taking the right hop must ignore the forged left.
+    monkeypatch.setenv("RATE_LIMIT_TRUST_PROXY", "true")
+    monkeypatch.delenv("RATE_LIMIT_TRUSTED_PROXY_COUNT", raising=False)
+    def key_for(xff):
+        class Req:
+            client = type("C", (), {"host": "10.0.0.1"})()
+            headers = {"x-forwarded-for": xff}
+        return rl.client_key(Req())
+    # one real client behind the proxy; only the forged leftmost varies
+    keys = {key_for(f"{i}.{i}.{i}.{i}, 203.0.113.9") for i in range(1, 5)}
+    assert keys == {"203.0.113.9"}          # all map to the one real client
+
+def test_client_key_trusted_proxy_count_picks_nth_from_right(monkeypatch):
+    # Two trusted proxies: XFF = "<forged>, <client>, <proxy1-ip>"; the real
+    # client is the 2nd entry from the right.
+    monkeypatch.setenv("RATE_LIMIT_TRUST_PROXY", "true")
+    monkeypatch.setenv("RATE_LIMIT_TRUSTED_PROXY_COUNT", "2")
+    class Req:
+        client = type("C", (), {"host": "10.0.0.2"})()
+        headers = {"x-forwarded-for": "6.6.6.6, 203.0.113.9, 10.0.0.1"}
+    assert rl.client_key(Req()) == "203.0.113.9"
+
+def test_client_key_count_clamps_on_short_list(monkeypatch):
+    # More trusted proxies configured than entries present: never index into a
+    # forged/leftmost position out of range — clamp to the leftmost available.
+    monkeypatch.setenv("RATE_LIMIT_TRUST_PROXY", "true")
+    monkeypatch.setenv("RATE_LIMIT_TRUSTED_PROXY_COUNT", "5")
+    class Req:
+        client = type("C", (), {"host": "10.0.0.1"})()
+        headers = {"x-forwarded-for": "203.0.113.9"}
+    assert rl.client_key(Req()) == "203.0.113.9"
 
 def test_client_key_never_raises():
     class Bad:

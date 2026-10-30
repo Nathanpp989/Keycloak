@@ -268,6 +268,63 @@ def test_lookup_runtime_error_becomes_502(client, monkeypatch):
         main.app.dependency_overrides.clear()
 
 
+def _auth_override_no_org():
+    """A valid authenticated token that carries NO organization claim — the case
+    strict tenant scoping must treat as a denial rather than unscoped access."""
+    return {"active": True, "realm_access": {"roles": ["tenant-admin"]}}
+
+
+def test_lookup_strict_mode_denies_token_without_org_claim(client, monkeypatch):
+    # STRICT: a caller with no org claim must be refused, not given unscoped access.
+    monkeypatch.setattr(main, "USER_TENANT_SCOPING", True)
+    monkeypatch.setattr(main, "USER_TENANT_SCOPING_STRICT", True)
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override_no_org
+    try:
+        mgr = MagicMock()
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.get("/users/lookup", params={"username": "u", "email": "e@x.com"})
+        assert r.status_code == 403
+        assert "organization claim" in r.json()["detail"]
+        mgr.get_user_org_refs.assert_not_called()   # denied before any lookup
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+def test_lookup_lenient_mode_allows_token_without_org_claim(client, monkeypatch):
+    # DEFAULT (lenient): no org claim == single-tenant context == allowed.
+    from auth0_type import UserSystem
+    monkeypatch.setattr(main, "USER_TENANT_SCOPING", True)
+    monkeypatch.setattr(main, "USER_TENANT_SCOPING_STRICT", False)
+    main.app.dependency_overrides[main.require_keycloak_auth] = _auth_override_no_org
+    try:
+        mgr = MagicMock()
+        mgr.determine_user_system.return_value = UserSystem.BOTH
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.get("/users/lookup", params={"username": "u", "email": "e@x.com"})
+        assert r.status_code == 200
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+def test_lookup_strict_mode_superadmin_without_org_claim_is_allowed(client, monkeypatch):
+    # A superadmin legitimately carries no tenant org claim; strict must not lock
+    # them out (the superadmin bypass precedes the org-claim check).
+    from auth0_type import UserSystem
+    monkeypatch.setattr(main, "USER_TENANT_SCOPING", True)
+    monkeypatch.setattr(main, "USER_TENANT_SCOPING_STRICT", True)
+    monkeypatch.setattr(main, "_SUPERADMIN_ROLES", ("platform-admin",))
+    main.app.dependency_overrides[main.require_keycloak_auth] = \
+        lambda: {"active": True, "realm_access": {"roles": ["platform-admin"]}}
+    try:
+        mgr = MagicMock()
+        mgr.determine_user_system.return_value = UserSystem.BOTH
+        monkeypatch.setattr(main, "user_manager", mgr)
+        r = client.get("/users/lookup", params={"username": "u", "email": "e@x.com"})
+        assert r.status_code == 200
+    finally:
+        main.app.dependency_overrides.clear()
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

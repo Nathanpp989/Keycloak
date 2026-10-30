@@ -889,11 +889,19 @@ ADMIN_ROLE = os.environ.get("ADMIN_ROLE", "tenant-admin")
 SUPERADMIN_ROLE = os.environ.get("SUPERADMIN_ROLE", "")
 _SUPERADMIN_ROLES = (SUPERADMIN_ROLE,) if SUPERADMIN_ROLE else ()
 
-# Whether to tenant-scope user lookups. On by default when the deployment is
-# multi-tenant (a SUPERADMIN_ROLE is configured, or callers carry org claims).
-# Set USER_TENANT_SCOPING=off to disable (e.g. a single-tenant deployment where
-# every admin should see every user).
-USER_TENANT_SCOPING = os.environ.get("USER_TENANT_SCOPING", "on").lower() != "off"
+# Whether to tenant-scope user lookups. Three modes via USER_TENANT_SCOPING:
+#   on     (default) — scope callers that carry an org claim; a caller WITHOUT
+#                      one is treated as a single-tenant context and allowed
+#                      (keeps single-tenant deployments working unchanged).
+#   strict           — multi-tenant posture: a caller without an org claim is
+#                      DENIED (403) rather than given unscoped access. Use when
+#                      every legitimate caller is expected to carry org
+#                      membership, so a missing claim is a misconfigured or
+#                      cross-tenant token, not a single-tenant one.
+#   off              — no scoping (every admin may see every user).
+_TENANT_SCOPING_MODE = os.environ.get("USER_TENANT_SCOPING", "on").strip().lower()
+USER_TENANT_SCOPING = _TENANT_SCOPING_MODE != "off"
+USER_TENANT_SCOPING_STRICT = _TENANT_SCOPING_MODE == "strict"
 
 
 def _enforce_user_tenant_scope(token_info: dict, email: str) -> None:
@@ -908,10 +916,16 @@ def _enforce_user_tenant_scope(token_info: dict, email: str) -> None:
         return
     if is_superadmin(token_info, _SUPERADMIN_ROLES):
         return
-    # If the caller has no org claim at all, treat as non-multi-tenant context
-    # and skip (avoids breaking single-tenant deployments). Multi-tenant callers
-    # always carry org membership.
+    # Caller carries no org claim. In STRICT mode (multi-tenant) that is a
+    # denial: a token without org membership must not get unscoped access to
+    # another tenant's users. In the default lenient mode it's treated as a
+    # single-tenant context and allowed, to avoid breaking those deployments.
     if not extract_org_ids(token_info):
+        if USER_TENANT_SCOPING_STRICT:
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden: token carries no organization claim "
+                       "(strict tenant scoping is enabled)")
         return
     if user_manager is None:
         return

@@ -27,9 +27,35 @@ class TokenData(BaseModel):
 
 ALGORITHM = "HS256"
 
+# The secret shipped in the source as a visible placeholder. It must never be a
+# live signing key: a deployment that leaves SECRET_KEY unset would otherwise
+# verify locally-issued tokens against this PUBLIC value, letting anyone forge a
+# valid token. Treated as "not configured" so verification fails CLOSED.
+_PLACEHOLDER_SECRET = "change-me-in-production"
+
+
+def _local_token_secret() -> str:
+    """The HS256 signing secret for locally-issued tokens, or fail CLOSED.
+
+    Refuses to return a secret when SECRET_KEY is unset or still the shipped
+    placeholder: in that state every local token is rejected (503) rather than
+    trusted against a public default. Set SECRET_KEY to a strong value to enable
+    local token auth."""
+    secret = os.getenv("SECRET_KEY", "")
+    if not secret or secret == _PLACEHOLDER_SECRET:
+        logger.error(
+            "SECRET_KEY is unset or the shipped placeholder — refusing to verify "
+            "local tokens. Set SECRET_KEY to a strong, unique value.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Local token auth is not configured",
+        )
+    return secret
+
+
 def verify_token(token: str) -> TokenData:
     """Verify a locally-issued HS256 token."""
-    secret_key = os.getenv("SECRET_KEY", "change-me-in-production")
+    secret_key = _local_token_secret()
     try:
         payload = jwt.decode(token, secret_key, algorithms=[ALGORITHM])
     except ExpiredSignatureError:

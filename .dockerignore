@@ -1,48 +1,54 @@
-# Build-context excludes (used by both docker and podman).
-# Keeps the image slim and, importantly, prevents shipping a .py file whose
-# imports aren't in requirements.txt (COPY *.py bakes in every non-ignored .py,
-# and any one of them could be run inside the container via `exec`). The static
-# validator (container_check.py) enforces this invariant in CI.
+\# Build-context exclusions for the auth broker image.
+# Goal: ship ONLY what the running service imports (main.py's transitive
+# module graph + requirements.txt). Everything here is a test, a dev/CI tool,
+# a cross-project file, a secret, or build junk — none belong in the image.
+# container_check.py enforces this (test_real_project_passes_all_container_checks).
+
+# ── tests (pull in pytest/responses, never run in the image) ──
+test_*.py
+*_test.py
+conftest.py
+pytest.ini
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── dev / diagnostic / CI tooling (not part of the running service) ──
+container_check.py
+auth_probe.py
+connectivity.py
+diagnose_idp.py
+login_flow.py
+fix_redirect_uri.py
+endpoint_smoke.py
+live_smoke.py
+e2e_smoke.py
+integration_test_live.py
+auth0_endpoints_live.py
+auth0_pagination_live.py
+
+# ── cross-project files that landed in this directory ──
+# (the PremDispatch broker + its MCP tooling — a different service)
+premdispatch_server.py
+mcp_server.py
+rag_ingest.py
+MCP_server_layer/
+
+# ── secrets & local config — must NEVER enter the build context ──
+.env
+.env.*
+*.pem
+*.key
+*.p12
+
+# ── VCS / CI / editor / build junk ──
+.git/
+.github/
+.gitignore
+*.yml
+*.yaml
 __pycache__/
 *.pyc
 *.pyo
-.pytest_cache/
-.git/
-.gitignore
-venv/
-.venv/
-env/
-.env
-*.pem
-# Tests never belong in the image.
-tests/
-*_test.py
-test_*.py
-conftest.py
-pytest.ini
-# Docs / CI / dev config.
-.github/
-*.md
-mcp-config.example.json
-
-# ── Dev/test/operational tooling that imports packages NOT in requirements.txt,
-# or that the app never imports at runtime. Excluding these keeps the runtime
-# import graph clean. The OPERATIONAL tools you may want to `exec` inside a
-# running container (openbao_setup.py, rotate_secret.py, diagnose_idp.py,
-# fix_redirect_uri.py, login_flow.py, provision_dynamic_secrets.py) rely only on
-# packages already in requirements.txt, so they are deliberately NOT excluded.
-
-# container_check.py imports pyyaml (a dev-only dependency).
-container_check.py
-# The MCP server is a separate component with its own deps (requirements-mcp.txt:
-# mcp, httpx). Shipping it in the broker image would be an unmet-import crash.
-mcp_server.py
-requirements-mcp.txt
-# Smoke / integration / live harnesses — dev-only, not part of the runtime graph.
-e2e_smoke.py
-endpoint_smoke.py
-integration_test_live.py
-openbao_smoke.py
-openbao_login_smoke.py
-auth0_endpoints_live.py
-auth0_pagination_live.py
+*.pyd
+.DS_Store

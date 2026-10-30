@@ -281,14 +281,26 @@ def client_key(request) -> str:
     peer IP. Does NOT trust X-Forwarded-For unless RATE_LIMIT_TRUST_PROXY is
     set, because a spoofable key lets an attacker dodge the limit AND lock out
     victims by forging their IP.
+
+    When the proxy IS trusted, the client IP is taken from the RIGHT of the
+    X-Forwarded-For list, not the left. A reverse proxy in the common append
+    mode (e.g. nginx's $proxy_add_x_forwarded_for) appends the peer it saw to
+    whatever the client sent, so the LEFTMOST entries are client-supplied and
+    forgeable — only the rightmost hops, added by proxies you control, are
+    trustworthy. With N trusted proxies in front of the app the real client is
+    the Nth entry from the right; set RATE_LIMIT_TRUSTED_PROXY_COUNT=N (default
+    1, the single-proxy case = take the rightmost entry).
     """
     try:
         if os.environ.get("RATE_LIMIT_TRUST_PROXY", "").strip().lower() in (
                 "1", "true", "yes", "on"):
             fwd = request.headers.get("x-forwarded-for", "")
-            if fwd:
-                # First hop is the original client per convention.
-                return fwd.split(",")[0].strip()
+            parts = [p.strip() for p in fwd.split(",") if p.strip()]
+            if parts:
+                # Count hops from the right; clamp so a short list (fewer hops
+                # than configured) never indexes into client-controlled entries.
+                count = max(1, _int_env("RATE_LIMIT_TRUSTED_PROXY_COUNT", 1))
+                return parts[max(0, len(parts) - count)]
         client = getattr(request, "client", None)
         if client and client.host:
             return client.host
