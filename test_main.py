@@ -178,6 +178,23 @@ def test_register_success(client, monkeypatch):
     assert body["auth0_id"] == "auth0|1"
     mgr.add_user.assert_called_once_with(email="alice@x.com", password="pw", username=None)
 
+def test_register_safe_response_hides_enumeration_signals(client, monkeypatch):
+    # REGISTER_SAFE_RESPONSE=on: the public response must not disclose account
+    # existence/IdP (pre_existing) or internal ids — a user-enumeration channel.
+    monkeypatch.setattr(main, "REGISTER_SAFE_RESPONSE", True)
+    mgr = MagicMock()
+    mgr.add_user.return_value = {
+        "username": "alice-ab12cd", "email": "alice@x.com",
+        "keycloak_id": "kc-1", "auth0_id": "auth0|1", "pre_existing": "both",
+    }
+    monkeypatch.setattr(main, "user_manager", mgr)
+    r = client.post("/register", data={"email": "alice@x.com", "password": "pw"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["username"] == "alice-ab12cd"            # caller-supplied, fine
+    for leaked in ("pre_existing", "keycloak_id", "auth0_id"):
+        assert leaked not in body, f"{leaked} leaked in safe-response mode"
+
 def test_register_runtime_error_becomes_502(client, monkeypatch):
     mgr = MagicMock()
     mgr.add_user.side_effect = RuntimeError("missing read:users scope")

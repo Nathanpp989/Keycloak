@@ -910,6 +910,15 @@ _TENANT_SCOPING_MODE = os.environ.get("USER_TENANT_SCOPING", "on").strip().lower
 USER_TENANT_SCOPING = _TENANT_SCOPING_MODE != "off"
 USER_TENANT_SCOPING_STRICT = _TENANT_SCOPING_MODE == "strict"
 
+# /register is PUBLIC and, by default, echoes `pre_existing` (which IdP already
+# holds the account) plus the internal keycloak_id/auth0_id. That lets an
+# unauthenticated caller enumerate which emails have accounts and where — the
+# same disclosure /users/lookup is gated against. Set REGISTER_SAFE_RESPONSE=1
+# to return a uniform minimal response (message + username only), closing the
+# channel. Default off so callers that consume the ids keep working.
+REGISTER_SAFE_RESPONSE = os.environ.get(
+    "REGISTER_SAFE_RESPONSE", "").strip().lower() in ("1", "true", "yes", "on")
+
 
 def _enforce_user_tenant_scope(token_info: dict, email: str) -> None:
     """Deny looking up a user outside the caller's organization(s).
@@ -1657,6 +1666,13 @@ def register(
         logger.error("Unexpected registration error: %s", exc)
         raise HTTPException(status_code=500, detail="Registration failed")
 
+    if REGISTER_SAFE_RESPONSE:
+        # Uniform response for a public endpoint: reveal neither account
+        # existence/IdP (pre_existing) nor internal ids. The message is the same
+        # whether or not the account pre-existed, so nothing distinguishes the
+        # two cases to an unauthenticated caller.
+        return {"message": "Registration processed.",
+                "username": result["username"]}
     return {
         "message": f"User '{result['username']}' registered.",
         "username": result["username"],

@@ -339,7 +339,11 @@ def main() -> None:
     kc_token = get_keycloak_admin_token(keycloak_url, keycloak_admin_user, keycloak_admin_pass)
 
     new_secret = rotate_and_sync(auth0, keycloak_url, realm_name, kc_token)
-    logger.info("Rotation complete. New secret (first 4 chars): %s...", new_secret[:4])
+    # Never log secret material — not even a prefix. A short prefix narrows a
+    # brute-force search space and can appear in shared/aggregated logs; the
+    # operator confirms success by a working login, not by eyeballing the value.
+    logger.info("Rotation complete (new secret written to Keycloak + configured stores; %d chars).",
+                len(new_secret))
     logger.info("If running elsewhere, update AUTH0_CLIENT_SECRET in those environments too.")
 
 
