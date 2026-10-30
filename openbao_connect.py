@@ -438,10 +438,22 @@ class OpenBaoSecrets:
     def __init__(self, addr: str | None = None, token: str | None = None,
                  mount: str = KV_MOUNT):
         self.addr = (addr or OPENBAO_ADDR).rstrip("/")
-        # A caller may pass an explicit token; otherwise use the auth provider,
-        # which returns the static OPENBAO_TOKEN or logs in via AppRole.
-        self.token = token or _get_auth_token()
+        # Keep the caller's explicit token (if any) and resolve the auth token
+        # LAZILY via the `token` property below. A long-lived client — e.g. the
+        # api-key store held by the process-singleton APIKeyManager — must follow
+        # AppRole token refresh, not pin the token captured at construction (which
+        # expires with the AppRole TTL and then 403s every read/write).
+        self._explicit_token = token
         self.mount = mount
+
+    @property
+    def token(self) -> "str | None":
+        """The OpenBao token for each request. An explicit token stays fixed;
+        otherwise it is resolved live per use so AppRole refresh (handled by the
+        cache in _get_auth_token) is picked up. Mirrors the original
+        `token or _get_auth_token()` truthiness, so an empty explicit token still
+        falls through to the auth provider."""
+        return self._explicit_token or _get_auth_token()
 
     def put_secret(self, name: str, value: str) -> None:
         """Write a single-value secret at <mount>/data/<name> (KV v2 shape)."""

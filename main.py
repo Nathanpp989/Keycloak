@@ -857,7 +857,14 @@ def require_keycloak_auth(credentials=Depends(http_bearer)) -> dict:
 # ADMIN_ROLE is the role that gates tenant-management operations (creating and
 # deleting groups/organizations, assigning roles, editing other users). Override
 # via env so it can match whatever your Keycloak realm actually calls it.
-require_role = make_require_role(require_keycloak_auth)
+# Client-aware role checks (opt-in). Empty (default) = flatten-all: a role
+# granted on ANY Keycloak client satisfies require_role (back-compat). Set
+# AUTHZ_ROLE_CLIENT to the app's own client — e.g. KEYCLOAK_CLIENT_ID — so only
+# realm roles plus THAT client's roles authorize admin actions here, and a role
+# scoped to an unrelated client no longer counts.
+AUTHZ_ROLE_CLIENT = os.environ.get("AUTHZ_ROLE_CLIENT", "").strip()
+require_role = make_require_role(require_keycloak_auth,
+                                 default_client=AUTHZ_ROLE_CLIENT or None)
 
 
 def require_scope(*required_scopes: str):

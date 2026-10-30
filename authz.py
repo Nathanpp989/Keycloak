@@ -25,12 +25,22 @@ from typing import Callable, Iterable
 from fastapi import Depends, HTTPException
 
 
-def extract_roles(token_info: dict) -> set[str]:
-    """Collect all roles from a Keycloak introspection response.
+def extract_roles(token_info: dict,
+                  client: "str | Iterable[str] | None" = None) -> set[str]:
+    """Collect roles from a Keycloak introspection response.
 
-    Merges realm roles and every client's resource roles into one set. Missing
-    or malformed sections are treated as "no roles there" rather than errors —
-    a token without the section simply has none of those roles.
+    Always includes realm_access roles. For client-scoped (resource_access)
+    roles the behaviour depends on `client`:
+      - None (default): merge EVERY client's resource roles (back-compat — a
+        role under any client counts). Convenient, but means a role scoped to
+        one client satisfies a check meant for another.
+      - a client id, or an iterable of ids: include only THOSE clients'
+        resource roles; a role scoped to any other client is ignored. This is
+        the client-aware check — pair it with the app's own client id so an
+        unrelated client's role can't authorize an action here.
+
+    Missing or malformed sections are treated as "no roles there" rather than
+    errors — a token without the section simply has none of those roles.
     """
     roles: set[str] = set()
 
@@ -42,7 +52,12 @@ def extract_roles(token_info: dict) -> set[str]:
 
     resource = token_info.get("resource_access")
     if isinstance(resource, dict):
-        for client_block in resource.values():
+        if client is None:
+            blocks = list(resource.values())
+        else:
+            wanted = {client} if isinstance(client, str) else set(client)
+            blocks = [resource.get(c) for c in wanted]
+        for client_block in blocks:
             if isinstance(client_block, dict):
                 r = client_block.get("roles")
                 if isinstance(r, list):
@@ -51,9 +66,11 @@ def extract_roles(token_info: dict) -> set[str]:
     return roles
 
 
-def user_has_any_role(token_info: dict, required: Iterable[str]) -> bool:
-    """True if the token carries at least one of the required roles."""
-    have = extract_roles(token_info)
+def user_has_any_role(token_info: dict, required: Iterable[str],
+                      client: "str | Iterable[str] | None" = None) -> bool:
+    """True if the token carries at least one of the required roles. `client`
+    scopes which resource_access roles count (see extract_roles)."""
+    have = extract_roles(token_info, client)
     return any(r in have for r in required)
 
 
@@ -105,27 +122,38 @@ def user_can_access_org(token_info: dict, *org_refs: str) -> bool:
     return any(ref in accessible for ref in org_refs if ref)
 
 
-def make_require_role(introspect_dependency: Callable) -> Callable:
+def make_require_role(introspect_dependency: Callable,
+                      default_client: "str | None" = None) -> Callable:
     """Build the require_role factory, wired to the app's auth dependency.
 
     Passing the introspection dependency in (rather than importing it) keeps this
     module decoupled from main.py and trivially testable: a test can supply a
     fake dependency that returns any token_info it wants.
 
+    default_client scopes which resource_access roles satisfy a check for EVERY
+    require_role built by this factory: pass the app's own Keycloak client id so
+    a role granted on some other client can't authorize an action here. None
+    (default) keeps the back-compat flatten-all behaviour; an individual
+    require_role(...) call can still override via its own `client=` argument.
+
     Usage in main.py:
-        require_role = make_require_role(require_keycloak_auth)
+        require_role = make_require_role(require_keycloak_auth,
+                                         default_client=KEYCLOAK_CLIENT_ID)
         @app.post("/groups")
         def create_group(token_info = Depends(require_role("tenant-admin"))):
             ...
     """
-    def require_role(*allowed_roles: str) -> Callable:
+    def require_role(*allowed_roles: str,
+                     client: "str | Iterable[str] | None" = None) -> Callable:
         if not allowed_roles:
             raise ValueError("require_role needs at least one role")
+        # Per-call client overrides the factory default; empty -> flatten-all.
+        use_client = (client if client is not None else default_client) or None
 
         def dependency(token_info: dict = Depends(introspect_dependency)) -> dict:
             # token_info is already validated (active, not expired) by the
             # injected dependency. Now the authorization check:
-            if not user_has_any_role(token_info, allowed_roles):
+            if not user_has_any_role(token_info, allowed_roles, use_client):
                 # 403, not 401: the caller IS authenticated, just not permitted.
                 # We name the required role(s) so an operator debugging a denied
                 # request knows what's missing — but reveal nothing about the

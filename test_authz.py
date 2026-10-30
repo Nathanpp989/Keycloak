@@ -44,6 +44,63 @@ def test_require_role_needs_at_least_one():
         factory()  # no roles given
 
 
+# ── client-aware role scoping (finding #3) ──────────────────────────────────
+def test_extract_roles_client_scoped_ignores_other_clients():
+    ti = {"realm_access": {"roles": ["realmrole"]},
+          "resource_access": {"app": {"roles": ["admin"]},
+                              "other": {"roles": ["admin"]}}}
+    # realm roles + ONLY the named client's roles; 'other' is ignored
+    assert authz.extract_roles(ti, client="app") == {"realmrole", "admin"}
+    # the 'other' client's identically-named role does not sneak in via a
+    # different client block
+    no_app = {"resource_access": {"other": {"roles": ["admin"]}}}
+    assert authz.extract_roles(no_app, client="app") == set()
+
+def test_extract_roles_client_accepts_iterable():
+    ti = {"resource_access": {"a": {"roles": ["ra"]}, "b": {"roles": ["rb"]},
+                              "c": {"roles": ["rc"]}}}
+    assert authz.extract_roles(ti, client=["a", "c"]) == {"ra", "rc"}
+
+def test_user_has_any_role_client_scoped():
+    ti = {"resource_access": {"app": {"roles": ["x"]}, "other": {"roles": ["y"]}}}
+    assert authz.user_has_any_role(ti, ["x"], client="app")
+    assert not authz.user_has_any_role(ti, ["y"], client="app")   # other ignored
+
+def test_require_role_client_aware_rejects_cross_client_role():
+    from fastapi import HTTPException
+    factory = authz.make_require_role(lambda: {}, default_client="app")
+    dep = factory("admin")
+    # role granted only on a DIFFERENT client -> denied
+    cross = {"resource_access": {"other": {"roles": ["admin"]}}}
+    with pytest.raises(HTTPException) as ei:
+        dep(token_info=cross)
+    assert ei.value.status_code == 403
+    # same role on the app's own client -> allowed
+    ok = {"resource_access": {"app": {"roles": ["admin"]}}}
+    assert dep(token_info=ok) is ok
+    # a realm role always counts, regardless of client scoping
+    realm = {"realm_access": {"roles": ["admin"]}}
+    assert dep(token_info=realm) is realm
+
+def test_require_role_flatten_default_preserves_backcompat():
+    # default_client=None (the shipped default) keeps the flatten-all behaviour:
+    # a role on ANY client still authorizes.
+    factory = authz.make_require_role(lambda: {})
+    dep = factory("admin")
+    cross = {"resource_access": {"whatever": {"roles": ["admin"]}}}
+    assert dep(token_info=cross) is cross
+
+def test_require_role_per_call_client_overrides_default():
+    from fastapi import HTTPException
+    factory = authz.make_require_role(lambda: {}, default_client="app")
+    dep = factory("admin", client="special")   # override to a different client
+    ok = {"resource_access": {"special": {"roles": ["admin"]}}}
+    assert dep(token_info=ok) is ok
+    # the factory default 'app' no longer applies to this dep
+    with pytest.raises(HTTPException):
+        dep(token_info={"resource_access": {"app": {"roles": ["admin"]}}})
+
+
 # ── Integration: enforcement through the real app ───────────────────────────
 @pytest.fixture
 def client(monkeypatch):

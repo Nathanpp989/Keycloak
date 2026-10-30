@@ -2804,3 +2804,29 @@ def test_auth0_user_id_cache_is_bounded():
         assert len(um._uid_cache) == 1  # only the fresh entry survives
     finally:
         auth0_type.UserManager._UID_CACHE_MAX = orig_max
+
+
+# ──────────────────────────────────────────────
+# path-segment encoding: a crafted id must not restructure the request
+# ──────────────────────────────────────────────
+def test_seg_encodes_path_separators():
+    from auth0_talk import _seg
+    assert _seg("auth0|1") == "auth0%7C1"                    # valid id, '|' encoded
+    out = _seg("auth0|x/../../tenants/evil?leak=1")
+    assert "/" not in out and "?" not in out                 # stays one segment
+
+
+@responses.activate
+def test_auth0_user_id_contained_to_users_path():
+    # get_user_roles with a crafted id must stay under /api/v2/users/, not escape
+    # onto /api/v2/tenants/... via '/','..','?' in the id (path injection).
+    responses.add(responses.POST, f"https://{DOMAIN}/oauth/token",
+                  json={"access_token": "t", "expires_in": 999}, status=200)
+    responses.add(responses.GET, re.compile(rf"https://{re.escape(DOMAIN)}/api/v2/.*"),
+                  json=[], status=200)
+    api = Auth0UsersAPI(Auth0Connect(DOMAIN, "cid", "sec"))
+    api.get_user_roles("auth0|x/../../tenants/evil?leak=1")
+    sent = responses.calls[-1].request.url
+    assert sent.startswith(f"https://{DOMAIN}/api/v2/users/")   # stayed under /users/
+    assert "/tenants/" not in sent                              # no resource escape
+    assert "leak=1" not in sent                                 # no query injection

@@ -740,3 +740,26 @@ def test_get_secret_wrapped_raises_if_not_wrapped():
     import pytest
     with pytest.raises(ob.OpenBaoError):
         s.get_secret_wrapped("mysecret")
+
+
+def test_openbaosecrets_follows_approle_token_refresh(monkeypatch):
+    """A client built WITHOUT an explicit token must resolve the auth token
+    live on each use, so a long-lived instance (e.g. the api-key store held by
+    the singleton APIKeyManager) follows AppRole refresh instead of pinning the
+    construction-time token (which expires and then 403s)."""
+    current = {"t": "tok-A"}
+    monkeypatch.setattr(ob, "_get_auth_token", lambda: current["t"])
+    s = ob.OpenBaoSecrets(addr=ADDR)          # no explicit token
+    assert s.token == "tok-A"
+    current["t"] = "tok-B"                     # AppRole token rotates
+    assert s.token == "tok-B"                  # picked up live, not pinned
+
+
+def test_openbaosecrets_explicit_token_is_pinned(monkeypatch):
+    """An explicitly supplied token stays fixed regardless of the auth provider."""
+    monkeypatch.setattr(ob, "_get_auth_token", lambda: "provider-token")
+    s = ob.OpenBaoSecrets(addr=ADDR, token="root")
+    assert s.token == "root"
+    # an empty explicit token falls through to the provider (original semantics)
+    s2 = ob.OpenBaoSecrets(addr=ADDR, token="")
+    assert s2.token == "provider-token"

@@ -15,8 +15,21 @@ import logging
 import os
 import re
 import time
+from urllib.parse import quote
 
 import requests
+
+
+def _seg(value) -> str:
+    """Percent-encode a value for safe use as a SINGLE URL path segment.
+
+    Identifiers interpolated into Management-API paths (Auth0 user ids like
+    'auth0|abc', Keycloak ids, role/group names) must not be able to restructure
+    the request: an id containing '/', '?', '#' or '..' would otherwise point the
+    call at a DIFFERENT resource (e.g. 'auth0|x/../../tenants/evil?y=1' ->
+    /api/v2/tenants/evil). safe='' encodes the separators too, so the value stays
+    one segment. Valid ids/UUIDs are unchanged (requests already encodes '|')."""
+    return quote(str(value), safe="")
 
 # Shared session so sequential calls (e.g. pagination) reuse the TCP+TLS
 # connection to Keycloak/Auth0 instead of dialing a new one each time.
@@ -91,7 +104,7 @@ class KeycloakAdminAPI:
 
     def _users_url(self, user_id: str | None = None) -> str:
         url = f"{self.base}/admin/realms/{self.realm}/users"
-        return f"{url}/{user_id}" if user_id else url
+        return f"{url}/{_seg(user_id)}" if user_id else url
 
     def list_users(self, first: int = 0, max_results: int = 100) -> list:
         """
@@ -169,7 +182,7 @@ class KeycloakAdminAPI:
         Keycloak group paths look like "/parent/child"; a path with more than one
         segment means the group is a subgroup.
         """
-        url = f"{self.base}/admin/realms/{self.realm}/users/{user_id}/groups"
+        url = f"{self.base}/admin/realms/{self.realm}/users/{_seg(user_id)}/groups"
         resp = _SESSION.get(url, headers=self.headers, timeout=10)
         resp.raise_for_status()
         groups = []
@@ -189,7 +202,7 @@ class KeycloakAdminAPI:
         Return a Keycloak user's effective realm and client role names:
             {"realm": [...], "client": [...]}
         """
-        base = f"{self.base}/admin/realms/{self.realm}/users/{user_id}/role-mappings"
+        base = f"{self.base}/admin/realms/{self.realm}/users/{_seg(user_id)}/role-mappings"
         # Realm roles
         realm_resp = _SESSION.get(f"{base}/realm", headers=self.headers, timeout=10)
         realm_resp.raise_for_status()
@@ -205,7 +218,7 @@ class KeycloakAdminAPI:
 
     def get_realm_role(self, role_name: str) -> dict | None:
         """Fetch a realm role's full representation (needed for assignment)."""
-        url = f"{self.base}/admin/realms/{self.realm}/roles/{role_name}"
+        url = f"{self.base}/admin/realms/{self.realm}/roles/{_seg(role_name)}"
         resp = _SESSION.get(url, headers=self.headers, timeout=10)
         if resp.status_code == 404:
             return None
@@ -221,7 +234,7 @@ class KeycloakAdminAPI:
         role = self.get_realm_role(role_name)
         if role is None:
             raise ValueError(f"Keycloak realm role '{role_name}' not found")
-        url = f"{self.base}/admin/realms/{self.realm}/users/{user_id}/role-mappings/realm"
+        url = f"{self.base}/admin/realms/{self.realm}/users/{_seg(user_id)}/role-mappings/realm"
         resp = _SESSION.post(url, headers=self.headers, json=[role], timeout=10)
         if resp.status_code in (204, 201):
             logger.info("Assigned realm role '%s' to user %s", role_name, user_id)
@@ -237,7 +250,7 @@ class KeycloakAdminAPI:
         role = self.get_realm_role(role_name)
         if role is None:
             raise ValueError(f"Keycloak realm role '{role_name}' not found")
-        url = f"{self.base}/admin/realms/{self.realm}/users/{user_id}/role-mappings/realm"
+        url = f"{self.base}/admin/realms/{self.realm}/users/{_seg(user_id)}/role-mappings/realm"
         resp = _SESSION.delete(url, headers=self.headers, json=[role], timeout=10)
         if resp.status_code in (204, 404):
             logger.info("Revoked realm role '%s' from user %s", role_name, user_id)
@@ -317,7 +330,7 @@ class KeycloakAdminAPI:
     # ── group management ───────────────────────────────────────
     def _groups_url(self, group_id: str | None = None) -> str:
         url = f"{self.base}/admin/realms/{self.realm}/groups"
-        return f"{url}/{group_id}" if group_id else url
+        return f"{url}/{_seg(group_id)}" if group_id else url
 
     def list_groups(self) -> list[dict]:
         """
@@ -442,7 +455,7 @@ class KeycloakAdminAPI:
 
     def add_user_to_group(self, user_id: str, group_id: str) -> None:
         """Add a Keycloak user to a group (idempotent)."""
-        url = f"{self._users_url(user_id)}/groups/{group_id}"
+        url = f"{self._users_url(user_id)}/groups/{_seg(group_id)}"
         resp = _SESSION.put(url, headers=self.headers, timeout=10)
         if resp.status_code in (201, 204):
             logger.info("Added Keycloak user %s to group %s", user_id, group_id)
@@ -452,7 +465,7 @@ class KeycloakAdminAPI:
 
     def remove_user_from_group(self, user_id: str, group_id: str) -> None:
         """Revoke a Keycloak user's membership in a group (idempotent)."""
-        url = f"{self._users_url(user_id)}/groups/{group_id}"
+        url = f"{self._users_url(user_id)}/groups/{_seg(group_id)}"
         resp = _SESSION.delete(url, headers=self.headers, timeout=10)
         if resp.status_code in (204, 404):
             logger.info("Removed Keycloak user %s from group %s", user_id, group_id)
@@ -529,7 +542,7 @@ class Auth0UsersAPI:
         return {}
 
     def update_user(self, user_id: str, **fields) -> dict:
-        resp = requests.patch(f"{self.base}/{user_id}", headers=self.headers, json=fields, timeout=10)
+        resp = requests.patch(f"{self.base}/{_seg(user_id)}", headers=self.headers, json=fields, timeout=10)
         _explain_403(resp, "update:users")
         if resp.status_code == 200:
             logger.info("Auth0 user %s updated", user_id)
@@ -539,7 +552,7 @@ class Auth0UsersAPI:
         return {}
 
     def delete_user(self, user_id: str) -> None:
-        resp = _SESSION.delete(f"{self.base}/{user_id}", headers=self.headers, timeout=10)
+        resp = _SESSION.delete(f"{self.base}/{_seg(user_id)}", headers=self.headers, timeout=10)
         _explain_403(resp, "delete:users")
         if resp.status_code == 204:
             logger.info("Auth0 user %s deleted", user_id)
@@ -552,7 +565,7 @@ class Auth0UsersAPI:
         Return the names of Auth0 Authorization Core roles assigned to a user.
         Requires the 'read:roles' scope on the M2M application.
         """
-        url = f"{self.base}/{user_id}/roles"
+        url = f"{self.base}/{_seg(user_id)}/roles"
         resp = _SESSION.get(url, headers=self.headers, timeout=10)
         _explain_403(resp, "read:roles")
         resp.raise_for_status()
@@ -585,7 +598,7 @@ class Auth0UsersAPI:
         role = self.get_role_by_name(role_name)
         if role is None:
             raise ValueError(f"Auth0 role '{role_name}' not found")
-        url = f"{self.base}/{user_id}/roles"
+        url = f"{self.base}/{_seg(user_id)}/roles"
         resp = _SESSION.post(url, headers=self.headers,
                             json={"roles": [role["id"]]}, timeout=10)
         _explain_403(resp, "update:users")
@@ -600,7 +613,7 @@ class Auth0UsersAPI:
         role = self.get_role_by_name(role_name)
         if role is None:
             raise ValueError(f"Auth0 role '{role_name}' not found")
-        url = f"{self.base}/{user_id}/roles"
+        url = f"{self.base}/{_seg(user_id)}/roles"
         resp = _SESSION.delete(url, headers=self.headers,
                               json={"roles": [role["id"]]}, timeout=10)
         _explain_403(resp, "update:users")
@@ -617,7 +630,7 @@ class Auth0UsersAPI:
 
     def get_user(self, user_id: str) -> dict:
         """Fetch a single Auth0 user. Requires 'read:users'."""
-        resp = _SESSION.get(f"{self.base}/{user_id}", headers=self.headers, timeout=10)
+        resp = _SESSION.get(f"{self.base}/{_seg(user_id)}", headers=self.headers, timeout=10)
         _explain_403(resp, "read:users")
         resp.raise_for_status()
         return resp.json()
@@ -679,7 +692,7 @@ class Auth0UsersAPI:
 
     def delete_sessions(self, user_id: str) -> None:
         """Delete the user's Auth0 sessions. Requires 'delete:sessions'."""
-        url = f"{self.base}/{user_id}/sessions"
+        url = f"{self.base}/{_seg(user_id)}/sessions"
         resp = _SESSION.delete(url, headers=self.headers, timeout=10)
         _explain_403(resp, "delete:sessions")
         if resp.status_code not in (200, 202, 204):
@@ -724,7 +737,7 @@ class Auth0OrganizationsAPI:
         return _as_list(resp.json(), "organizations")
 
     def get_organization(self, org_id: str) -> dict:
-        resp = _SESSION.get(f"{self.base}/{org_id}", headers=self.headers, timeout=10)
+        resp = _SESSION.get(f"{self.base}/{_seg(org_id)}", headers=self.headers, timeout=10)
         _explain_403(resp, "read:organizations")
         resp.raise_for_status()
         return resp.json()
@@ -790,7 +803,7 @@ class Auth0OrganizationsAPI:
 
     def update_organization(self, org_id: str, **fields) -> dict:
         """Update an organization (e.g. display_name, branding, metadata)."""
-        resp = requests.patch(f"{self.base}/{org_id}", headers=self.headers,
+        resp = requests.patch(f"{self.base}/{_seg(org_id)}", headers=self.headers,
                              json=fields, timeout=10)
         _explain_403(resp, "update:organizations")
         if resp.status_code == 200:
@@ -802,7 +815,7 @@ class Auth0OrganizationsAPI:
 
     def delete_organization(self, org_id: str) -> None:
         """Delete an organization. Idempotent: a 404 is treated as already gone."""
-        resp = _SESSION.delete(f"{self.base}/{org_id}", headers=self.headers, timeout=10)
+        resp = _SESSION.delete(f"{self.base}/{_seg(org_id)}", headers=self.headers, timeout=10)
         _explain_403(resp, "delete:organizations")
         if resp.status_code in (204, 404):
             logger.info("Deleted Auth0 organization %s", org_id)
@@ -812,7 +825,7 @@ class Auth0OrganizationsAPI:
 
     # ── members ────────────────────────────────────────────────
     def list_members(self, org_id: str, page: int = 0, per_page: int = 50) -> list:
-        resp = _SESSION.get(f"{self.base}/{org_id}/members", headers=self.headers,
+        resp = _SESSION.get(f"{self.base}/{_seg(org_id)}/members", headers=self.headers,
                             params={"page": page, "per_page": per_page}, timeout=10)
         _explain_403(resp, "read:organization_members")
         resp.raise_for_status()
@@ -827,7 +840,7 @@ class Auth0OrganizationsAPI:
         """
         try:
             base = self.base.rsplit("/organizations", 1)[0]
-            resp = _SESSION.get(f"{base}/users/{user_id}/organizations",
+            resp = _SESSION.get(f"{base}/users/{_seg(user_id)}/organizations",
                                 headers=self.headers,
                                 params={"per_page": 100}, timeout=10)
             if resp.status_code != 200:
@@ -838,7 +851,7 @@ class Auth0OrganizationsAPI:
 
     def add_members(self, org_id: str, user_ids: list[str]) -> None:
         """Add one or more users to an organization."""
-        resp = _SESSION.post(f"{self.base}/{org_id}/members", headers=self.headers,
+        resp = _SESSION.post(f"{self.base}/{_seg(org_id)}/members", headers=self.headers,
                             json={"members": user_ids}, timeout=10)
         _explain_403(resp, "create:organization_members")
         if resp.status_code in (200, 204):
@@ -849,7 +862,7 @@ class Auth0OrganizationsAPI:
 
     def remove_members(self, org_id: str, user_ids: list[str]) -> None:
         """Remove one or more users from an organization. Idempotent."""
-        resp = _SESSION.delete(f"{self.base}/{org_id}/members", headers=self.headers,
+        resp = _SESSION.delete(f"{self.base}/{_seg(org_id)}/members", headers=self.headers,
                              json={"members": user_ids}, timeout=10)
         _explain_403(resp, "delete:organization_members")
         if resp.status_code in (200, 204, 404):
@@ -918,7 +931,7 @@ class Auth0AuthzExtensionAPI:
             "Content-Type":  "application/json",
             "Authorization": f"Bearer {self._token()}",
         }
-        url = f"{self.base}/users/{user_id}/groups"
+        url = f"{self.base}/users/{_seg(user_id)}/groups"
         try:
             resp = _SESSION.get(url, headers=headers, timeout=10)
         except requests.RequestException as exc:
@@ -999,13 +1012,13 @@ class Auth0AuthzExtensionAPI:
 
     def add_user_to_group(self, group_id: str, user_id: str) -> None:
         """Add a user to an Authorization Extension group (members endpoint)."""
-        resp = self._ext_request("PATCH", f"groups/{group_id}/members", json=[user_id])
+        resp = self._ext_request("PATCH", f"groups/{_seg(group_id)}/members", json=[user_id])
         resp.raise_for_status()
         logger.info("Added user %s to Authz Extension group %s", user_id, group_id)
 
     def remove_user_from_group(self, group_id: str, user_id: str) -> None:
         """Revoke a user's membership in an Authorization Extension group."""
-        resp = self._ext_request("DELETE", f"groups/{group_id}/members", json=[user_id])
+        resp = self._ext_request("DELETE", f"groups/{_seg(group_id)}/members", json=[user_id])
         if resp.status_code not in (200, 204):
             resp.raise_for_status()
         logger.info("Removed user %s from Authz Extension group %s", user_id, group_id)
@@ -1018,14 +1031,14 @@ class Auth0AuthzExtensionAPI:
             body["name"] = name
         if description is not None:
             body["description"] = description
-        resp = self._ext_request("PUT", f"groups/{group_id}", json=body)
+        resp = self._ext_request("PUT", f"groups/{_seg(group_id)}", json=body)
         resp.raise_for_status()
         logger.info("Updated Authz Extension group %s", group_id)
         return resp.json() if resp.text else {}
 
     def delete_group(self, group_id: str) -> None:
         """Delete an Authorization Extension group. Idempotent on 404."""
-        resp = self._ext_request("DELETE", f"groups/{group_id}")
+        resp = self._ext_request("DELETE", f"groups/{_seg(group_id)}")
         if resp.status_code not in (200, 204, 404):
             resp.raise_for_status()
         logger.info("Deleted Authz Extension group %s", group_id)
